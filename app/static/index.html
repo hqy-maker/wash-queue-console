@@ -12,7 +12,7 @@
     <link rel="manifest" href="/static/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/static/icon-192.png" />
     <link rel="icon" type="image/png" href="/static/icon-192.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=28" />
+    <link rel="stylesheet" href="/static/styles.css?v=30" />
   </head>
   <body>
     <div class="app-shell">
@@ -30,7 +30,10 @@
 
         <div class="sidebar-section-head">
           <span class="sidebar-section-label">镜头列表</span>
-          <button id="newSceneBtn" class="btn btn-secondary btn-xs" type="button" title="新建一个场次文件夹">+ 新建场</button>
+          <div class="sidebar-head-actions">
+            <button id="exportSettingsNavBtn" class="btn btn-secondary btn-xs" type="button" title="设置本地成片同步目录与一键导出">📁 目录</button>
+            <button id="newSceneBtn" class="btn btn-secondary btn-xs" type="button" title="新建一个场次文件夹">+ 新建场</button>
+          </div>
         </div>
         <div id="shotList" class="shot-list"></div>
       </aside>
@@ -39,6 +42,7 @@
         <header class="topbar">
           <div class="topbar-left">
             <span id="topbarTitle" class="topbar-title">新建排片</span>
+            <button id="topbarShotTitleBtn" class="pill pill-muted topbar-scene-btn hidden" type="button" title="点击修改镜头名称（自动用于重命名下载与本地目录文件）"></button>
             <button id="topbarScenePill" class="pill pill-muted topbar-scene-btn hidden" type="button" title="点击修改所属场号"></button>
             <span id="topbarStatusPill" class="pill pill-muted hidden"></span>
           </div>
@@ -185,6 +189,89 @@
       </div>
     </div>
 
+    <!-- 镜头命名与下载重命名弹窗 -->
+    <div id="renameShotModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="renameModalTitle">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h3 id="renameModalTitle">镜头命名与下载重命名</h3>
+          <button id="closeRenameModalBtn" class="icon-btn" type="button" aria-label="关闭重命名窗口">✕</button>
+        </div>
+        <form id="renameShotForm" class="modal-body">
+          <div id="renameShotMeta" class="confirm-meta-box"></div>
+          <label class="field">
+            <span>镜头名称 / 画面内容简称</span>
+            <input
+              id="renameShotTitleInput"
+              type="text"
+              placeholder="例如：室内对峙全景（留空则仅用镜头编号）"
+            />
+          </label>
+          <div class="rename-preview-box">
+            <div class="rename-preview-row">
+              <span>1080P 文件名</span>
+              <code id="renamePreview1080"></code>
+            </div>
+            <div class="rename-preview-row">
+              <span>480P 文件名</span>
+              <code id="renamePreview480"></code>
+            </div>
+          </div>
+          <label class="export-check-row">
+            <input id="renameSyncLocalCheck" type="checkbox" checked />
+            <span>若已同步到本地成片目录，保存时同步重命名并更新本地文件（不留旧名重复文件）</span>
+          </label>
+          <div class="modal-actions">
+            <div class="modal-actions-spacer"></div>
+            <button id="cancelRenameBtn" class="btn btn-secondary" type="button">取消</button>
+            <button id="saveRenameOnlyBtn" class="btn btn-secondary" type="submit">保存命名</button>
+            <button id="saveAndDownloadBtn" class="btn btn-primary hidden" type="button">保存并立即下载</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- 本地成片同步目录配置弹窗 -->
+    <div id="exportConfigModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="exportConfigModalTitle">
+      <div class="modal-card modal-card-wide export-modal-card">
+        <div class="modal-head">
+          <h3 id="exportConfigModalTitle">本地成片目录与 1080P 自动同步</h3>
+          <button id="closeExportConfigModalBtn" class="icon-btn" type="button" aria-label="关闭同步目录设置">✕</button>
+        </div>
+        <form id="exportConfigForm" class="modal-body">
+          <div class="export-intro">
+            绑定本地交付目录后，单个镜头修改、替换或重转出新版 <strong>1080P</strong> 时，会自动按
+            <code>镜头号_名称_1080p.mp4</code> 覆盖写入目标文件夹（不会产生 <code>(1)</code> 重复文件）。
+          </div>
+          <div class="field">
+            <span>全局默认成片目录（未单独绑定目录的场次自动使用此目录）</span>
+            <div class="export-dir-row">
+              <input
+                id="exportDefaultDirInput"
+                type="text"
+                placeholder="例如：/Users/.../Desktop/视频/成片汇总（留空表示不启用默认目录）"
+              />
+              <button id="pickDefaultExportDirBtn" class="btn btn-secondary btn-sm" type="button">选择文件夹…</button>
+              <button id="clearDefaultExportDirBtn" class="btn btn-secondary btn-sm" type="button">清空</button>
+            </div>
+          </div>
+          <label class="export-check-row">
+            <input id="exportAutoSyncCheck" type="checkbox" checked />
+            <span>单个镜头 1080P 画面修改 / 重转出片 / 重命名时自动覆盖更新本地文件</span>
+          </label>
+          <div class="field">
+            <span>各场次专属导出目录（可选，优先于全局默认目录）</span>
+            <div id="exportSceneDirsList" class="export-scene-list"></div>
+          </div>
+          <div class="modal-actions">
+            <button id="exportSyncAllBtn" class="btn btn-secondary" type="button" title="按当前填写并保存的目录设置，立即批量同步全部已有 1080P 正片">↻ 保存并同步全部 1080P</button>
+            <div class="modal-actions-spacer"></div>
+            <button id="cancelExportConfigBtn" class="btn btn-secondary" type="button">取消</button>
+            <button id="saveExportConfigBtn" class="btn btn-primary" type="submit">保存设置</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
     <!-- 图片预览 / 手涂涂白画板 Lightbox -->
     <div id="lightboxModal" class="lightbox-backdrop hidden" role="dialog" aria-modal="true">
       <div class="lightbox-inner" id="lightboxInner">
@@ -238,6 +325,6 @@
     <datalist id="sceneDatalist"></datalist>
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=27" type="module"></script>
+    <script src="/static/app.js?v=30" type="module"></script>
   </body>
 </html>

@@ -1187,6 +1187,18 @@ button {
   gap: 12px;
 }
 
+.form-row-3 {
+  display: grid;
+  grid-template-columns: 128px 1.35fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 720px) {
+  .form-row-3 {
+    grid-template-columns: 1fr;
+  }
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -2856,6 +2868,198 @@ button {
   opacity: 1;
   background: var(--red-soft);
   color: var(--red);
+}
+
+.sidebar-section-head {
+  white-space: nowrap;
+}
+
+.sidebar-section-label {
+  white-space: nowrap;
+}
+
+.sidebar-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.sidebar-head-actions .btn {
+  white-space: nowrap;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.scene-folder-export-btn {
+  width: 20px;
+  height: 18px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.45;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.scene-folder-export-btn.is-bound {
+  opacity: 0.95;
+  background: rgba(16, 185, 129, 0.14);
+}
+
+.scene-folder-header:hover .scene-folder-export-btn,
+.scene-folder-header.selected .scene-folder-export-btn {
+  opacity: 0.95;
+}
+
+.scene-folder-export-btn:hover {
+  opacity: 1;
+  background: var(--blue-soft);
+}
+
+.btn.is-synced {
+  border-color: rgba(16, 185, 129, 0.4);
+  color: #047857;
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.local-sync-status-line {
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 6px 10px;
+  border-radius: 8px;
+  margin-top: 6px;
+  word-break: break-all;
+}
+
+.local-sync-status-line.is-synced {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.09);
+  border: 1px solid rgba(16, 185, 129, 0.28);
+}
+
+.local-sync-status-line.is-needs-sync {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.34);
+}
+
+.rename-preview-box {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.rename-preview-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.rename-preview-row span {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.rename-preview-row code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text);
+  word-break: break-all;
+  text-align: right;
+}
+
+.export-modal-card {
+  max-width: 660px;
+}
+
+.export-intro {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
+}
+
+.export-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.export-check-row input[type="checkbox"] {
+  margin-top: 2px;
+}
+
+.export-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.export-dir-row input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.export-scene-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.export-scene-row {
+  display: grid;
+  grid-template-columns: 96px 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.export-scene-row.is-focused {
+  background: var(--blue-tint-bg);
+  border: 1px solid var(--blue-border);
+  border-radius: 8px;
+  padding: 5px 6px;
+}
+
+.export-scene-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.export-scene-row input[type="text"] {
+  min-width: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+  padding: 6px 9px;
+  font-size: 12px;
 }
 
 .scene-folder-children {

@@ -488,6 +488,33 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
             draft_path = target
             watermark_used = existing_draft.get("watermark")
 
+    final_path: Path | None = None
+    remote_final_url = ""
+    final_watermark: bool | None = None
+    final_node_key = str(shot.get("libtvFinalNodeKey") or "").strip()
+    if final_node_key:
+        try:
+            fnode_data = inspect_node(final_node_key, project_uuid=project_uuid, group_ref=group_ref)
+            fdata = fnode_data.get("data", {})
+            furls = fdata.get("url") or []
+            remote_final_url = furls[0] if isinstance(furls, list) and furls else ""
+            existing_final = shot.get("finalVideo") or {}
+            ftarget = shot_dir / "final_1080p.mp4"
+            if remote_final_url:
+                if not ftarget.is_file() or existing_final.get("remoteUrl") != remote_final_url:
+                    final_path, final_watermark = download_node_video(
+                        fnode_data.get("nodeKey") or final_node_key,
+                        ftarget,
+                        project_uuid=project_uuid,
+                        group_ref=group_ref if not fnode_data.get("nodeKey") else None,
+                    )
+                else:
+                    final_path = ftarget
+                    final_watermark = existing_final.get("watermark")
+            final_node_key = fnode_data.get("nodeKey") or final_node_key
+        except Exception:
+            pass
+
     return {
         "nodeKey": node_data.get("nodeKey") or node_ref,
         "loading": bool(task_info.get("loading")),
@@ -497,4 +524,8 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
         "mixedOrder": mixed_order or None,
         "draftPath": draft_path,
         "watermark": watermark_used,
+        "finalPath": final_path,
+        "finalRemoteUrl": remote_final_url,
+        "finalWatermark": final_watermark,
+        "finalNodeKey": final_node_key,
     }

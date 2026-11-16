@@ -106,6 +106,15 @@ const state = {
     open: false,
     onConfirm: null,
   },
+  renameModal: {
+    open: false,
+    shotId: null,
+    downloadVerAfter: null,
+  },
+  exportConfigModal: {
+    open: false,
+    focusScene: "",
+  },
   shotMoreOpen: false,
   shotChatMenuOpen: false,
   shotChatBusy: false,
@@ -131,6 +140,7 @@ const state = {
   builder: {
     shotId: "",
     shotIdTouched: false,
+    title: "",
     scene: "",
     sceneTouched: false,
     userPrompt: "",
@@ -195,7 +205,38 @@ function mediaDisplayName(obj, fallback = "") {
   return obj.label || fallback;
 }
 
+function sanitizeDownloadStem(raw, shotId = "") {
+  let txt = String(raw || "").trim();
+  if (!txt) return "";
+  txt = txt.replace(/\.(mp4|mov|mkv|webm)$/i, "").trim();
+  if (shotId) {
+    const escaped = String(shotId).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    txt = txt.replace(new RegExp(`^${escaped}[\\s_\\-]+`, "i"), "").trim();
+  }
+  txt = txt.replace(/[\s_\-]*(?:1080p|480p|正片|样片)$/i, "").trim();
+  return txt
+    .replace(/[\\/:*?"<>|\x00-\x1f\s]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .slice(0, 80);
+}
+
+function buildClientDownloadFilename(shot, kind = "1080p", customTitle = null) {
+  const sid = String(shot?.id || "shot").trim() || "shot";
+  const cleanKind = String(kind).toLowerCase() === "final" || String(kind).toLowerCase() === "1080p" ? "1080p" : "480p";
+  if (customTitle === null) {
+    if (cleanKind === "1080p" && shot?.downloadName1080p) return shot.downloadName1080p;
+    if (cleanKind === "480p" && shot?.downloadName480p) return shot.downloadName480p;
+  }
+  const rawTitle = customTitle === null ? shot?.title || "" : customTitle;
+  const stem = sanitizeDownloadStem(rawTitle, sid);
+  return stem ? `${sid}_${stem}_${cleanKind}.mp4` : `${sid}_${cleanKind}.mp4`;
+}
+
 function shotMediaSubtitle(s) {
+  if ((s?.title || "").trim()) {
+    return String(s.title).trim();
+  }
   if (s.sourceVideo?.mediaUrl || s.sourceVideo?.filePath) {
     return mediaDisplayName(s.sourceVideo, "原片视频");
   }
@@ -2856,6 +2897,7 @@ function renderTopBar() {
 
   const badgeEl = document.getElementById("projectNameBadge");
   const titleEl = document.getElementById("topbarTitle");
+  const shotTitleBtn = document.getElementById("topbarShotTitleBtn");
   const scenePillEl = document.getElementById("topbarScenePill");
   const statusPillEl = document.getElementById("topbarStatusPill");
   const moreWrap = document.getElementById("shotMoreWrap");
@@ -2884,6 +2926,7 @@ function renderTopBar() {
 
   if (state.view === "builder") {
     titleEl.textContent = "新建排片";
+    shotTitleBtn?.classList.add("hidden");
     scenePillEl.classList.add("hidden");
     statusPillEl?.classList.add("hidden");
     moreWrap?.classList.add("hidden");
@@ -2895,6 +2938,11 @@ function renderTopBar() {
     const shot = (d.shots || []).find((s) => s.id === state.selectedShotId);
     titleEl.textContent = shot ? shot.id : "镜头";
     if (shot) {
+      if (shotTitleBtn) {
+        const cleanShotTitle = (shot.title || "").trim();
+        shotTitleBtn.textContent = cleanShotTitle ? `🏷 ${cleanShotTitle}` : "+ 命名镜头";
+        shotTitleBtn.classList.remove("hidden");
+      }
       const sceneText = (shot.scene || "").trim();
       scenePillEl.textContent = sceneText || "未分场";
       scenePillEl.classList.remove("hidden");
@@ -2912,6 +2960,7 @@ function renderTopBar() {
       delBtn?.classList.remove("hidden");
       moreWrap?.classList.remove("hidden");
     } else {
+      shotTitleBtn?.classList.add("hidden");
       scenePillEl.classList.add("hidden");
       statusPillEl?.classList.add("hidden");
       moreWrap?.classList.add("hidden");
@@ -3109,6 +3158,10 @@ function renderSidebar() {
         group.name !== "未分场" && !isEditing
           ? `<button type="button" class="scene-folder-delete-btn" data-delete-folder="${escapeHtml(group.name)}" title="删除场次（镜头将移回未分场）" aria-label="删除场次 ${escapeHtml(group.name)}">×</button>`
           : "";
+      const boundExportDir = (state.data?.sceneExportDirs || {})[group.name] || "";
+      const folderExportBtnHtml = !isEditing
+        ? `<button type="button" class="scene-folder-export-btn ${boundExportDir ? "is-bound" : ""}" data-folder-export="${escapeHtml(group.name)}" title="${escapeHtml(boundExportDir ? `已绑定本地成片目录：${boundExportDir}（点击管理或同步）` : `为「${group.name}」绑定本地成片同步目录`)}" aria-label="设置场次 ${escapeHtml(group.name)} 导出目录">📁</button>`
+        : "";
 
       return `
         <div class="scene-folder ${isExpanded ? "" : "collapsed"}" data-scene-folder="${escapeHtml(group.name)}">
@@ -3122,6 +3175,7 @@ function renderSidebar() {
             <span class="scene-folder-icon">${isExpanded ? "📂" : "📁"}</span>
             ${nameHtml}
             <span class="scene-folder-count">${group.shots.length}</span>
+            ${folderExportBtnHtml}
             ${deleteBtnHtml}
           </div>
           <div class="scene-folder-children">${childrenHtml}</div>
@@ -3295,10 +3349,14 @@ function renderBuilderView() {
   main.innerHTML = `
     <div class="stack-lg is-builder">
       <section class="card">
-        <div class="form-row-2">
+        <div class="form-row-3">
           <label class="field">
             <span>镜头编号 *</span>
             <input id="builderShotId" type="text" value="${escapeHtml(b.shotId)}" placeholder="如 S02" />
+          </label>
+          <label class="field">
+            <span>镜头名称（可选，用于下载命名）</span>
+            <input id="builderTitle" type="text" value="${escapeHtml(b.title || "")}" placeholder="如：室内对峙全景" />
           </label>
           <label class="field">
             <span>所属场号</span>
@@ -3439,6 +3497,7 @@ function bindBuilderEvents() {
   clearMentionCleanups();
 
   const shotIdEl = document.getElementById("builderShotId");
+  const titleInputEl = document.getElementById("builderTitle");
   const sceneEl = document.getElementById("builderScene");
   const promptEl = document.getElementById("builderPrompt");
   const videoDropEl = document.getElementById("videoDropzone");
@@ -3450,6 +3509,10 @@ function bindBuilderEvents() {
     const raw = shotIdEl.value;
     state.builder.shotId = raw;
     state.builder.shotIdTouched = Boolean(raw.trim());
+  });
+
+  titleInputEl?.addEventListener("input", () => {
+    state.builder.title = titleInputEl.value;
   });
 
   const refreshBuilderPresetDom = () => {
@@ -3690,6 +3753,7 @@ function clearBuilderDraft() {
   state.builder = {
     shotId: suggestNextShotId(state.data?.shots || []),
     shotIdTouched: false,
+    title: "",
     scene: defaultFolder,
     sceneTouched: false,
     userPrompt: "",
@@ -3737,6 +3801,7 @@ async function submitBuilderShot(forceOverwrite = false) {
     const fd = new FormData();
     const activeCtx = getActiveCanvasContext();
     fd.append("shot_id", shotId);
+    fd.append("title", (b.title || "").trim());
     fd.append("scene", (b.scene || "").trim());
     fd.append("platform", activeCtx.platform);
     fd.append("project_uuid", activeCtx.uuid || "");
@@ -4250,7 +4315,32 @@ function renderVideoReviewCard(shot) {
       !passed &&
       (!finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)))
   );
-  const downloadName = `${shot.id}_${activeVer === "final" ? "1080p" : "480p"}.mp4`;
+  const downloadName =
+    activeVer === "final"
+      ? shot.downloadName1080p || buildClientDownloadFilename(shot, "1080p")
+      : shot.downloadName480p || buildClientDownloadFilename(shot, "480p");
+  const downloadHref = `${activeVid.mediaUrl}${
+    String(activeVid.mediaUrl || "").includes("?") ? "&" : "?"
+  }download_name=${encodeURIComponent(downloadName)}`;
+  const syncStatus = shot.exportSyncStatus1080p || (finalVid ? "unbound" : "no_final");
+  const syncTargetDir = (shot.resolvedExportDir || "").trim();
+  const syncedFilePath = shot.localExports?.["1080p"]?.filePath || "";
+  const localSyncBtnHtml = finalVid
+    ? syncStatus === "synced"
+      ? `<button id="syncLocalExportBtn" class="btn btn-secondary btn-sm is-synced" type="button" title="已自动覆盖同步到本地目录：${escapeHtml(syncedFilePath || `${syncTargetDir}/${shot.downloadName1080p}`)}（点击可手动重刷校验）">✓ 已同步本地 1080P</button>`
+      : syncStatus === "needs_sync"
+      ? `<button id="syncLocalExportBtn" class="btn btn-primary btn-sm" type="button" title="检测到 1080P 画面或名称有更新，点击立即覆盖写入 ${escapeHtml(`${syncTargetDir}/${shot.downloadName1080p || downloadName}`)}">↻ 更新本地 1080P</button>`
+      : `<button id="syncLocalExportBtn" class="btn btn-secondary btn-sm" type="button" title="绑定本地场次或默认成片目录，后续修改或重转 1080P 将自动覆盖更新">📁 同步到文件夹</button>`
+    : "";
+  const replaceFinalBtnHtml = finalVid
+    ? `<button id="replaceFinalVideoBtn" class="btn btn-secondary btn-sm" type="button" title="选择本机修改过的新 1080P 视频替换当前正片，并自动覆盖同步到本地目录">↑ 替换 1080P</button><input id="replaceFinalVideoInput" type="file" accept="video/*" hidden />`
+    : "";
+  const localSyncBannerHtml =
+    finalVid && syncStatus === "synced" && syncedFilePath
+      ? `<div class="local-sync-status-line is-synced">📁 本地同步目录已就绪：<code>${escapeHtml(syncedFilePath)}</code></div>`
+      : finalVid && syncStatus === "needs_sync" && syncTargetDir
+      ? `<div class="local-sync-status-line is-needs-sync">⚠ 本地成片待同步更新：<code>${escapeHtml(syncTargetDir)}/${escapeHtml(shot.downloadName1080p || downloadName)}</code></div>`
+      : "";
   const finalProgressBannerHtml = finalInProgress
     ? `<div class="final-progress-banner">⏳ <strong>正在转为 1080P 正片</strong>：${escapeHtml(shot.agentSummary || "已提交转正片队列，完成后将自动归档并标为「已过条」，无需重复点击。")}</div>`
     : "";
@@ -4313,6 +4403,7 @@ function renderVideoReviewCard(shot) {
       </div>
 
       ${!isComparing && metaStr ? `<div class="video-review-meta">${escapeHtml(metaStr)}</div>` : ""}
+      ${localSyncBannerHtml}
       ${passedBannerHtml}
       ${summaryHtml}
 
@@ -4328,7 +4419,10 @@ function renderVideoReviewCard(shot) {
               ? `<button id="syncPlayCompareBtn" class="btn btn-secondary btn-sm" type="button">▶ 同步播放</button>`
               : ""
           }
-          <a class="btn btn-secondary btn-sm" href="${escapeHtml(activeVid.mediaUrl)}" download="${escapeHtml(downloadName)}">↓ 下载</a>
+          <a id="downloadActiveVideoBtn" class="btn btn-secondary btn-sm" href="${escapeHtml(downloadHref)}" download="${escapeHtml(downloadName)}" title="保存为 ${escapeHtml(downloadName)}">↓ 下载</a>
+          <button id="renameDownloadShotBtn" class="btn btn-secondary btn-sm" type="button" data-download-ver="${escapeHtml(activeVer)}" title="设置或修改镜头名称（自动应用到下载文件名与本地目录文件）">✎ 重命名</button>
+          ${localSyncBtnHtml}
+          ${replaceFinalBtnHtml}
         </div>
         ${finalActionHtml}
       </div>
@@ -4667,7 +4761,9 @@ function bindDetailEvents(shot) {
     try {
       const platLabel = getPlatformLabel(shot.platform);
       const res = await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/sync-canvas`, { method: "POST" });
-      if (res.libtv?.hasRemoteDraft) {
+      if (res.libtv?.hasRemoteFinal) {
+        showToast(`已从 ${platLabel} 同步最新 1080P 正片并更新本地状态`);
+      } else if (res.libtv?.hasRemoteDraft) {
         showToast(`已将 ${platLabel} 成片下载到本地，可在右侧直接观看`);
       } else if (res.libtv?.loading) {
         showToast(`${platLabel} 云端仍在生成中，请稍后再拉取`);
@@ -4684,6 +4780,85 @@ function bindDetailEvents(shot) {
     }
   };
   document.getElementById("syncLibtvBtn")?.addEventListener("click", (e) => handleSyncLibtv(e.currentTarget));
+
+  document.getElementById("renameDownloadShotBtn")?.addEventListener("click", (e) => {
+    const ver = e.currentTarget.dataset.downloadVer || "final";
+    openRenameShotModal(shot, { downloadVerAfter: ver });
+  });
+
+  document.getElementById("syncLocalExportBtn")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    if (!shot.resolvedExportDir) {
+      openExportConfigModal(getShotFolderName(shot));
+      return;
+    }
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "同步中…";
+    try {
+      const res = await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/export-local`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: "1080p" }),
+      });
+      const r = res.syncResult || {};
+      showToast(
+        r.renamedFrom
+          ? `已同步覆盖并将旧文件重命名为：${r.fileName}`
+          : r.unchanged
+          ? `本地 1080P 已是最新版本：${r.fileName}`
+          : `已同步最新 1080P 到：${r.filePath}`
+      );
+      await refreshState();
+    } catch (err) {
+      showToast(err.message || "同步本地成片失败");
+      btn.disabled = false;
+      btn.textContent = prevText;
+    }
+  });
+
+  const replaceFinalInput = document.getElementById("replaceFinalVideoInput");
+  document.getElementById("replaceFinalVideoBtn")?.addEventListener("click", () => {
+    replaceFinalInput?.click();
+  });
+  replaceFinalInput?.addEventListener("change", async () => {
+    const file = replaceFinalInput.files?.[0];
+    replaceFinalInput.value = "";
+    if (!file) return;
+    const btn = document.getElementById("replaceFinalVideoBtn");
+    const prevText = btn ? btn.textContent : "";
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "上传更新中…";
+    }
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("syncLocal", "true");
+      const res = await fetch(`/api/shots/${encodeURIComponent(shot.id)}/replace-final`, {
+        method: "POST",
+        body: fd,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `替换 1080P 失败 (${res.status})`);
+      }
+      const sr = data.syncResult;
+      state.detailDraft.previewVersion = "final";
+      showToast(
+        sr?.synced
+          ? `已替换 1080P 并自动同步到：${sr.filePath}`
+          : `已替换更新 ${shot.id} 的 1080P 正片画面`
+      );
+      await refreshState();
+    } catch (err) {
+      showToast(err.message || "替换 1080P 失败");
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prevText;
+      }
+    }
+  });
 
   document.getElementById("openShotChatMainBtn")?.addEventListener("click", (e) => {
     const btn = e.currentTarget;
@@ -4961,6 +5136,171 @@ function closeConfirmModal() {
   const modal = document.getElementById("confirmModal");
   if (modal) modal.classList.add("hidden");
   state.confirmDialog = { open: false, onConfirm: null };
+}
+
+function updateRenameModalPreview(shot, draftTitle) {
+  const prev1080 = document.getElementById("renamePreview1080");
+  const prev480 = document.getElementById("renamePreview480");
+  if (prev1080) prev1080.textContent = buildClientDownloadFilename(shot, "1080p", draftTitle);
+  if (prev480) prev480.textContent = buildClientDownloadFilename(shot, "480p", draftTitle);
+}
+
+function openRenameShotModal(shot, { downloadVerAfter = null } = {}) {
+  if (!shot) return;
+  closeShotMoreMenu();
+  closeShotChatMenu();
+  state.renameModal = {
+    open: true,
+    shotId: shot.id,
+    downloadVerAfter,
+  };
+  const modal = document.getElementById("renameShotModal");
+  const metaEl = document.getElementById("renameShotMeta");
+  const inp = document.getElementById("renameShotTitleInput");
+  const dlBtn = document.getElementById("saveAndDownloadBtn");
+  const syncChk = document.getElementById("renameSyncLocalCheck");
+  const sceneLabel = (shot.scene || "").trim() || "未分场";
+  if (metaEl) {
+    metaEl.textContent = `镜头：${shot.id} · 所属场次：${sceneLabel}${shot.resolvedExportDir ? ` · 绑定目录：${shot.resolvedExportDir}` : ""}`;
+  }
+  if (inp) inp.value = shot.title || "";
+  if (syncChk) syncChk.checked = true;
+  if (dlBtn) {
+    const canDownload = Boolean(
+      (downloadVerAfter === "final" && shot.finalVideo?.mediaUrl) ||
+        (downloadVerAfter && (shot.finalVideo?.mediaUrl || shot.draftVideo?.mediaUrl))
+    );
+    dlBtn.classList.toggle("hidden", !canDownload);
+  }
+  updateRenameModalPreview(shot, shot.title || "");
+  modal?.classList.remove("hidden");
+  setTimeout(() => {
+    inp?.focus();
+    inp?.select();
+  }, 10);
+}
+
+function closeRenameShotModal() {
+  document.getElementById("renameShotModal")?.classList.add("hidden");
+  state.renameModal = { open: false, shotId: null, downloadVerAfter: null };
+}
+
+function triggerBrowserMediaDownload(shot, ver = "final") {
+  if (!shot) return;
+  const isFinal = ver === "final" && Boolean(shot.finalVideo?.mediaUrl);
+  const targetVid = isFinal ? shot.finalVideo : shot.draftVideo || shot.finalVideo;
+  if (!targetVid?.mediaUrl) return;
+  const dlName = isFinal
+    ? shot.downloadName1080p || buildClientDownloadFilename(shot, "1080p")
+    : shot.downloadName480p || buildClientDownloadFilename(shot, "480p");
+  const href = `${targetVid.mediaUrl}${String(targetVid.mediaUrl).includes("?") ? "&" : "?"}download_name=${encodeURIComponent(dlName)}`;
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = dlName;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function collectExportSceneNames(focusScene = "") {
+  const names = new Set();
+  for (const sc of state.data?.scenes || []) {
+    const clean = String(sc || "").trim();
+    if (clean) names.add(clean);
+  }
+  for (const s of state.data?.shots || []) {
+    names.add(getShotFolderName(s));
+  }
+  for (const k of Object.keys(state.data?.sceneExportDirs || {})) {
+    if (String(k || "").trim()) names.add(String(k).trim());
+  }
+  if (focusScene) names.add(focusScene);
+  return [...names];
+}
+
+function renderExportSceneRows(focusScene = "") {
+  const wrap = document.getElementById("exportSceneDirsList");
+  if (!wrap) return;
+  const sceneMap = state.data?.sceneExportDirs || {};
+  const sceneNames = collectExportSceneNames(focusScene);
+  if (!sceneNames.length) {
+    wrap.innerHTML = `<div style="font-size:12px;color:var(--text-muted);padding:4px 0;">暂无场次（可先配置上方全局默认目录，或先新建场次）</div>`;
+    return;
+  }
+  wrap.innerHTML = sceneNames
+    .map((scName) => {
+      const val = sceneMap[scName] || "";
+      const focusedCls = focusScene && focusScene === scName ? " is-focused" : "";
+      return `
+        <div class="export-scene-row${focusedCls}" data-scene-dir-row="${escapeHtml(scName)}">
+          <span class="export-scene-label" title="${escapeHtml(scName)}">${escapeHtml(scName)}</span>
+          <input type="text" data-scene-dir-input="${escapeHtml(scName)}" value="${escapeHtml(val)}" placeholder="留空则跟随全局默认目录" />
+          <button type="button" class="btn btn-secondary btn-sm" data-pick-scene-folder="${escapeHtml(scName)}">选择…</button>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function openExportConfigModal(focusScene = "") {
+  closeShotMoreMenu();
+  closeShotChatMenu();
+  state.exportConfigModal = { open: true, focusScene: focusScene || "" };
+  const defInp = document.getElementById("exportDefaultDirInput");
+  const autoChk = document.getElementById("exportAutoSyncCheck");
+  if (defInp) defInp.value = state.data?.defaultExportDir || "";
+  if (autoChk) autoChk.checked = state.data?.autoSyncExport !== false;
+  renderExportSceneRows(focusScene);
+  document.getElementById("exportConfigModal")?.classList.remove("hidden");
+  if (focusScene) {
+    setTimeout(() => {
+      const targetInp = document.querySelector(`[data-scene-dir-input="${CSS.escape(focusScene)}"]`);
+      targetInp?.focus();
+    }, 10);
+  }
+}
+
+function closeExportConfigModal() {
+  document.getElementById("exportConfigModal")?.classList.add("hidden");
+  state.exportConfigModal = { open: false, focusScene: "" };
+}
+
+async function pickFolderIntoInput(inputEl, promptTitle) {
+  if (!inputEl) return;
+  try {
+    const res = await apiJson("/api/system/pick-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        initialDir: inputEl.value.trim(),
+        prompt: promptTitle || "选择成片同步导出文件夹",
+      }),
+    });
+    if (res.cancelled) return;
+    if (res.unsupported) {
+      showToast(res.detail || "当前系统请直接输入文件夹绝对路径");
+      return;
+    }
+    if (res.path) {
+      inputEl.value = res.path;
+      showToast(`已选择目录：${res.path}`);
+    }
+  } catch (err) {
+    showToast(err.message || "打开目录选择器失败");
+  }
+}
+
+function readExportConfigFormValues() {
+  const defaultExportDir = document.getElementById("exportDefaultDirInput")?.value.trim() || "";
+  const autoSyncExport = Boolean(document.getElementById("exportAutoSyncCheck")?.checked);
+  const sceneExportDirs = {};
+  document.querySelectorAll("[data-scene-dir-input]").forEach((inp) => {
+    const sc = inp.dataset.sceneDirInput;
+    const val = inp.value.trim();
+    if (sc && val) sceneExportDirs[sc] = val;
+  });
+  return { defaultExportDir, sceneExportDirs, autoSyncExport };
 }
 
 /* Standalone Version History & Rollback Modal */
@@ -5392,6 +5732,16 @@ function bindGlobalEvents() {
     if (pane) pane.scrollTop = 0;
   });
 
+  document.getElementById("exportSettingsNavBtn")?.addEventListener("click", () => {
+    const focusSc = state.selectedSceneFolder || "";
+    openExportConfigModal(focusSc);
+  });
+
+  document.getElementById("topbarShotTitleBtn")?.addEventListener("click", () => {
+    const shot = (state.data?.shots || []).find((s) => s.id === state.selectedShotId);
+    if (shot) openRenameShotModal(shot);
+  });
+
   document.getElementById("newSceneBtn")?.addEventListener("click", () => {
     state.editingFolderName = null;
     state.creatingFolder = true;
@@ -5401,6 +5751,13 @@ function bindGlobalEvents() {
   const shotListEl = document.getElementById("shotList");
   shotListEl.addEventListener("click", async (e) => {
     if (e.target.closest("[data-rename-folder-input], [data-create-folder-input]")) return;
+
+    const folderExportBtn = e.target.closest("[data-folder-export]");
+    if (folderExportBtn) {
+      e.stopPropagation();
+      openExportConfigModal(folderExportBtn.dataset.folderExport || "");
+      return;
+    }
 
     const delFolderBtn = e.target.closest("[data-delete-folder]");
     if (delFolderBtn) {
@@ -5808,6 +6165,128 @@ function bindGlobalEvents() {
     }
   });
 
+  // Rename Shot Modal
+  document.getElementById("closeRenameModalBtn")?.addEventListener("click", closeRenameShotModal);
+  document.getElementById("cancelRenameBtn")?.addEventListener("click", closeRenameShotModal);
+  document.getElementById("renameShotModal")?.addEventListener("click", (e) => {
+    if (e.target.id === "renameShotModal") closeRenameShotModal();
+  });
+  document.getElementById("renameShotTitleInput")?.addEventListener("input", (e) => {
+    const shot = (state.data?.shots || []).find((s) => s.id === state.renameModal.shotId);
+    if (shot) updateRenameModalPreview(shot, e.target.value);
+  });
+
+  const handleSaveShotRename = async ({ downloadAfter = false } = {}) => {
+    const sid = state.renameModal.shotId;
+    const dlVer = state.renameModal.downloadVerAfter || "final";
+    if (!sid) return;
+    const nextTitle = document.getElementById("renameShotTitleInput")?.value.trim() || "";
+    const syncLocal = Boolean(document.getElementById("renameSyncLocalCheck")?.checked);
+    const saveBtn = document.getElementById("saveRenameOnlyBtn");
+    const dlBtn = document.getElementById("saveAndDownloadBtn");
+    if (saveBtn) saveBtn.disabled = true;
+    if (dlBtn) dlBtn.disabled = true;
+    try {
+      const res = await apiJson(`/api/shots/${encodeURIComponent(sid)}/meta`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: nextTitle, syncLocal }),
+      });
+      const updatedShot = res.shot;
+      const syncedList = res.syncedExports || [];
+      closeRenameShotModal();
+      if (syncedList.length) {
+        const first = syncedList[0];
+        showToast(
+          first.renamedFrom
+            ? `已重命名并同步更新本地文件为：${first.fileName}`
+            : `已保存命名并同步本地目录：${first.fileName}`
+        );
+      } else {
+        showToast(nextTitle ? `已命名为「${nextTitle}」` : `已重置 ${sid} 为默认编号命名`);
+      }
+      await refreshState();
+      if (downloadAfter && updatedShot) {
+        triggerBrowserMediaDownload(updatedShot, dlVer);
+      }
+    } catch (err) {
+      showToast(err.message || "保存镜头命名失败");
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
+      if (dlBtn) dlBtn.disabled = false;
+    }
+  };
+  document.getElementById("renameShotForm")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    handleSaveShotRename({ downloadAfter: false });
+  });
+  document.getElementById("saveAndDownloadBtn")?.addEventListener("click", () => {
+    handleSaveShotRename({ downloadAfter: true });
+  });
+
+  // Export Dir Config Modal
+  document.getElementById("closeExportConfigModalBtn")?.addEventListener("click", closeExportConfigModal);
+  document.getElementById("cancelExportConfigBtn")?.addEventListener("click", closeExportConfigModal);
+  document.getElementById("exportConfigModal")?.addEventListener("click", (e) => {
+    if (e.target.id === "exportConfigModal") closeExportConfigModal();
+  });
+  document.getElementById("pickDefaultExportDirBtn")?.addEventListener("click", () => {
+    pickFolderIntoInput(document.getElementById("exportDefaultDirInput"), "选择全局默认成片同步目录");
+  });
+  document.getElementById("clearDefaultExportDirBtn")?.addEventListener("click", () => {
+    const inp = document.getElementById("exportDefaultDirInput");
+    if (inp) inp.value = "";
+  });
+  document.getElementById("exportSceneDirsList")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-pick-scene-folder]");
+    if (!btn) return;
+    const sc = btn.dataset.pickSceneFolder;
+    const row = btn.closest("[data-scene-dir-row]");
+    const inp = row?.querySelector("[data-scene-dir-input]");
+    pickFolderIntoInput(inp, `选择「${sc}」成片同步目录`);
+  });
+
+  const saveExportConfig = async ({ syncAllAfter = false } = {}) => {
+    const saveBtn = document.getElementById("saveExportConfigBtn");
+    const syncBtn = document.getElementById("exportSyncAllBtn");
+    if (saveBtn) saveBtn.disabled = true;
+    if (syncBtn) syncBtn.disabled = true;
+    try {
+      const cfgPayload = readExportConfigFormValues();
+      await apiJson("/api/config/export-dirs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cfgPayload),
+      });
+      if (syncAllAfter) {
+        const res = await apiJson("/api/exports/sync-all", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scene: "", role: "1080p" }),
+        });
+        showToast(
+          `已保存设置，同步 ${res.syncedCount || 0} 个 1080P 成片（其中新写入/更新 ${res.updatedCount || 0} 个）`
+        );
+      } else {
+        showToast("已保存本地成片同步目录设置");
+      }
+      closeExportConfigModal();
+      await refreshState();
+    } catch (err) {
+      showToast(err.message || "保存同步目录设置失败");
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
+      if (syncBtn) syncBtn.disabled = false;
+    }
+  };
+  document.getElementById("exportConfigForm")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    saveExportConfig({ syncAllAfter: false });
+  });
+  document.getElementById("exportSyncAllBtn")?.addEventListener("click", () => {
+    saveExportConfig({ syncAllAfter: true });
+  });
+
   // Lightbox & Paint Canvas modal
   bindPaintModalEvents();
   document.getElementById("closeLightboxBtn").addEventListener("click", closeLightbox);
@@ -5820,6 +6299,14 @@ function bindGlobalEvents() {
     if (e.key === "Escape") {
       if (state.confirmDialog?.open) {
         closeConfirmModal();
+        return;
+      }
+      if (state.renameModal?.open) {
+        closeRenameShotModal();
+        return;
+      }
+      if (state.exportConfigModal?.open) {
+        closeExportConfigModal();
         return;
       }
       if (!document.getElementById("lightboxModal")?.classList.contains("hidden")) {

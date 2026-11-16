@@ -13,6 +13,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -513,11 +514,17 @@ def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 262144)
             yield chunk
 
 
-def _stream_media_file(request: Request, target: Path) -> Response:
+def _stream_media_file(request: Request, target: Path, *, download_name: str = "") -> Response:
     size = target.stat().st_size
     mime = _guess_mime(target)
     range_header = request.headers.get("range")
-    base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-cache"}
+    base_headers: dict[str, str] = {"Accept-Ranges": "bytes", "Cache-Control": "no-cache"}
+    clean_dl = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", Path(download_name or "").name).strip()
+    if clean_dl:
+        ascii_fallback = re.sub(r"[^\x20-\x7e]+", "_", clean_dl).strip("._") or target.name
+        base_headers["Content-Disposition"] = (
+            f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quote(clean_dl)}'
+        )
 
     if not range_header or size == 0:
         return FileResponse(target, media_type=mime, headers=base_headers)
@@ -623,6 +630,33 @@ class SceneCreateReq(BaseModel):
 class SceneRenameReq(BaseModel):
     oldName: str = ""
     newName: str = ""
+
+
+class ShotMetaReq(BaseModel):
+    title: str | None = None
+    syncLocal: bool = True
+
+
+class ExportConfigReq(BaseModel):
+    defaultExportDir: str | None = None
+    sceneExportDirs: dict[str, str] | None = None
+    autoSyncExport: bool | None = None
+
+
+class ShotExportLocalReq(BaseModel):
+    role: str = "1080p"
+    exportDir: str = ""
+    title: str | None = None
+
+
+class BatchExportReq(BaseModel):
+    scene: str = ""
+    role: str = "1080p"
+
+
+class PickFolderReq(BaseModel):
+    initialDir: str = ""
+    prompt: str = "选择成片同步导出文件夹"
 
 
 class ErrorRecoverReq(BaseModel):
@@ -764,13 +798,75 @@ def open_antigravity_window(req: OpenAppReq | None = None) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.post("/api/system/pick-folder")
+def pick_local_folder(req: PickFolderReq | None = None) -> dict[str, Any]:
+    body = req or PickFolderReq()
+    if sys.platform != "darwin":
+        return {"ok": False, "unsupported": True, "path": "", "detail": "非 macOS 环境请直接输入文件夹绝对路径"}
+    script = "\n".join(
+        [
+            "on run argv",
+            "  set promptText to item 1 of argv",
+            '  if (count of argv) >= 2 and (item 2 of argv) is not "" then',
+            "    try",
+            "      set startPath to POSIX file (item 2 of argv)",
+            "      return POSIX path of (choose folder with prompt promptText default location startPath)",
+            "    on error",
+            "      return POSIX path of (choose folder with prompt promptText)",
+            "    end try",
+            "  else",
+            "    return POSIX path of (choose folder with prompt promptText)",
+            "  end if",
+            "end run",
+        ]
+    )
+    args = ["/usr/bin/osascript", "-", body.prompt or "选择成片同步导出文件夹"]
+    init_dir = str(body.initialDir or "").strip()
+    if init_dir and Path(init_dir).expanduser().is_dir():
+        args.append(str(Path(init_dir).expanduser().resolve()))
+    try:
+        proc = subprocess.run(args, input=script, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=408, detail="选择文件夹超时") from exc
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        if "(-128)" in err or "User canceled" in err:
+            return {"ok": False, "cancelled": True, "path": ""}
+        raise HTTPException(status_code=400, detail=err or "打开 Finder 选择文件夹失败")
+    chosen = proc.stdout.strip().rstrip("/") or "/"
+    return {"ok": True, "cancelled": False, "path": chosen}
+
+
+@app.post("/api/config/export-dirs")
+def update_export_dirs(req: ExportConfigReq) -> dict[str, Any]:
+    try:
+        cfg = store.set_export_config(
+            default_export_dir=req.defaultExportDir,
+            scene_export_dirs=req.sceneExportDirs,
+            auto_sync_export=req.autoSyncExport,
+        )
+        return {"ok": True, **cfg}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/exports/sync-all")
+def sync_all_local_exports(req: BatchExportReq | None = None) -> dict[str, Any]:
+    body = req or BatchExportReq()
+    try:
+        res = store.sync_all_local_exports(scene=body.scene, role=body.role)
+        return {"ok": True, **res}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/media/{rel_path:path}")
-def serve_media(rel_path: str, request: Request) -> Response:
+def serve_media(rel_path: str, request: Request, download_name: str = Query(default="")) -> Response:
     target = (DATA_ROOT / rel_path).resolve()
     root = DATA_ROOT.resolve()
     if root not in target.parents or not target.is_file():
         raise HTTPException(status_code=404, detail="媒体文件不存在")
-    return _stream_media_file(request, target)
+    return _stream_media_file(request, target, download_name=download_name)
 
 
 @app.get("/api/state")
@@ -1083,6 +1179,7 @@ async def preflight_upload(file: UploadFile = File(...)) -> dict[str, Any]:
 async def create_shot(
     shot_id: str = Form(...),
     scene: str = Form(default=""),
+    title: str = Form(default=""),
     platform: str = Form(default=""),
     project_uuid: str = Form(default=""),
     project_name: str = Form(default=""),
@@ -1124,6 +1221,7 @@ async def create_shot(
         shot = store.create_or_replace_shot(
             shot_id=shot_id,
             scene=scene,
+            title=title,
             platform=platform.strip(),
             project_uuid=project_uuid.strip(),
             project_name=project_name.strip(),
@@ -1392,6 +1490,55 @@ def update_shot_scene(shot_id: str, req: ShotSceneReq) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.patch("/api/shots/{shot_id}/meta")
+def update_shot_meta(shot_id: str, req: ShotMetaReq) -> dict[str, Any]:
+    try:
+        res = store.update_shot_meta(shot_id, title=req.title, sync_local=bool(req.syncLocal))
+        return {"ok": True, **res}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/export-local")
+def export_shot_local(shot_id: str, req: ShotExportLocalReq | None = None) -> dict[str, Any]:
+    body = req or ShotExportLocalReq()
+    try:
+        res = store.sync_shot_local_export(
+            shot_id,
+            role=body.role,
+            export_dir=body.exportDir,
+            title=body.title,
+        )
+        return {"ok": True, **res}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/replace-final")
+async def replace_shot_final(
+    shot_id: str,
+    file: UploadFile = File(...),
+    syncLocal: str = Form(default="true"),
+) -> dict[str, Any]:
+    raw = await file.read()
+    try:
+        res = store.replace_shot_final_video(
+            shot_id,
+            filename=sanitize_filename(file.filename or "final_1080p.mp4", "final_1080p.mp4"),
+            raw_bytes=raw,
+            sync_local=(syncLocal.lower() != "false"),
+        )
+        return {"ok": True, **res}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/scenes")
 def create_scene(req: SceneCreateReq) -> dict[str, Any]:
     try:
@@ -1451,6 +1598,11 @@ def sync_libtv(shot_id: str) -> dict[str, Any]:
         watermark=info.get("watermark"),
         node_key=info.get("nodeKey"),
         resource_id=str(info.get("resourceId") or ""),
+        final_path=info.get("finalPath"),
+        remote_final_url=info.get("finalRemoteUrl") or "",
+        final_watermark=info.get("finalWatermark"),
+        final_node_key=info.get("finalNodeKey"),
+        final_resource_id=str(info.get("finalResourceId") or ""),
     )
     return {
         "ok": True,
@@ -1458,9 +1610,11 @@ def sync_libtv(shot_id: str) -> dict[str, Any]:
         "shot": updated,
         "libtv": {
             "nodeKey": info.get("nodeKey"),
+            "finalNodeKey": info.get("finalNodeKey"),
             "loading": info.get("loading"),
             "taskStatus": info.get("taskStatus"),
             "hasRemoteDraft": bool(info.get("remoteUrl") or info.get("draftPath")),
+            "hasRemoteFinal": bool(info.get("finalRemoteUrl") or info.get("finalPath")),
         },
     }
 

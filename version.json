@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.4",
+  "version": "2026.11.16.5",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T18:56:28+08:00",
-  "changelog": "移除对话实时监听，改由 4 路并发后台桥接全权接单；新增单镜「接手原对话 / 前台开聊」终端接管与 Antigravity 桌面端上下文交接。",
+  "publishedAt": "2026-11-16T19:43:54+08:00",
+  "changelog": "新增镜头命名与下载重命名、本地成片目录绑定；单镜修改/重转/画布同步或替换 1080P 时自动覆盖更新本地目录成片（无重复副本）。",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

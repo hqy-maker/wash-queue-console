@@ -325,6 +325,95 @@ def sanitize_filename(name: str, fallback: str = "file") -> str:
     return cleaned or fallback
 
 
+def sanitize_download_stem(name: str, shot_id: str = "") -> str:
+    """Clean a user-supplied shot title / download alias for macOS & Windows filenames."""
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"\.mp4$|\.mov$|\.mkv$|\.webm$", "", raw, flags=re.IGNORECASE).strip()
+    if shot_id:
+        esc_id = re.escape(shot_id.strip())
+        raw = re.sub(rf"^{esc_id}[\s_\-]+", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"[\s_\-]*(?:1080p|480p|正片|样片)$", "", raw, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f\s]+', "_", raw)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("._-")
+    return cleaned[:80]
+
+
+def build_shot_download_filename(
+    shot: dict[str, Any],
+    *,
+    kind: str = "1080p",
+    custom_title: str | None = None,
+) -> str:
+    """Build canonical `<shot_id>_<clean_title>_<1080p|480p>.mp4` (or `<shot_id>_<kind>.mp4`)."""
+    sid = sanitize_shot_id(str(shot.get("id") or "")) or "shot"
+    clean_kind = "1080p" if str(kind or "").strip().lower() in {"1080", "1080p", "final"} else "480p"
+    raw_title = str(shot.get("title") or "") if custom_title is None else str(custom_title or "")
+    stem = sanitize_download_stem(raw_title, sid)
+    if stem:
+        return f"{sid}_{stem}_{clean_kind}.mp4"
+    return f"{sid}_{clean_kind}.mp4"
+
+
+def _extract_export_config(q: dict[str, Any]) -> dict[str, Any]:
+    raw_dirs = q.get("sceneExportDirs")
+    scene_dirs = (
+        {str(k).strip(): str(v).strip() for k, v in raw_dirs.items() if str(k).strip() and str(v).strip()}
+        if isinstance(raw_dirs, dict)
+        else {}
+    )
+    return {
+        "defaultExportDir": str(q.get("defaultExportDir") or "").strip(),
+        "sceneExportDirs": scene_dirs,
+        "autoSyncExport": bool(q.get("autoSyncExport", True)),
+    }
+
+
+def _resolve_shot_export_dir(export_cfg: dict[str, Any] | None, shot: dict[str, Any]) -> str:
+    cfg = export_cfg or {}
+    scene = str(shot.get("scene") or "").strip()
+    scene_dirs = cfg.get("sceneExportDirs") or {}
+    if isinstance(scene_dirs, dict):
+        if scene and scene_dirs.get(scene):
+            return str(scene_dirs[scene]).strip()
+        if not scene and (scene_dirs.get("未分场") or scene_dirs.get("__unassigned__")):
+            return str(scene_dirs.get("未分场") or scene_dirs.get("__unassigned__")).strip()
+    default_dir = str(cfg.get("defaultExportDir") or "").strip()
+    if default_dir:
+        return default_dir
+    prev_export = ((shot.get("localExports") or {}).get("1080p") or {}).get("exportDir")
+    return str(prev_export or "").strip()
+
+
+def _validate_export_dir_path(raw_path: str, *, create: bool = True) -> str:
+    text = str(raw_path or "").strip()
+    if not text:
+        return ""
+    p = Path(text).expanduser()
+    if not p.is_absolute():
+        raise ValueError(f"导出目录必须是绝对路径：{text}")
+    resolved = p.resolve()
+    home_resolved = Path.home().resolve()
+    if resolved == Path("/") or resolved == home_resolved or resolved in home_resolved.parents:
+        raise ValueError(f"不能直接使用系统根目录或用户主目录作为同步文件夹：{resolved}")
+    if resolved.exists():
+        if not resolved.is_dir():
+            raise ValueError(f"指定路径不是文件夹：{resolved}")
+    elif create:
+        if not resolved.parent.exists():
+            raise ValueError(f"上级目录不存在，请检查路径是否正确：{resolved.parent}")
+        try:
+            resolved.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"无法创建导出目录 {resolved}: {exc}") from exc
+    else:
+        raise ValueError(f"导出目录不存在：{resolved}")
+    if not os.access(resolved, os.W_OK):
+        raise ValueError(f"导出目录没有写入权限：{resolved}")
+    return str(resolved)
+
+
 def to_media_url(path: Path) -> str:
     rel = path.resolve().relative_to(DATA_ROOT.resolve())
     return "/media/" + rel.as_posix()
@@ -350,8 +439,9 @@ def _file_stat_sig(file_path: str | None) -> str:
     if not file_path:
         return ""
     try:
-        st = Path(file_path).stat()
-        return f"{file_path}|{st.st_size}|{st.st_mtime_ns}"
+        resolved = Path(file_path).expanduser().resolve()
+        st = resolved.stat()
+        return f"{resolved}|{st.st_size}|{st.st_mtime_ns}"
     except OSError:
         return str(file_path)
 
@@ -411,8 +501,13 @@ def compute_generation_fingerprint(shot: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def _decorate_shot_payload(shot: dict[str, Any]) -> dict[str, Any]:
+def _decorate_shot_payload(
+    shot: dict[str, Any],
+    *,
+    export_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     out = copy.deepcopy(shot)
+    out["title"] = str(out.get("title") or "").strip()
     plat = normalize_platform(out.get("platform"))
     out["platform"] = plat
     out["platformLabel"] = get_platform_label(plat)
@@ -475,6 +570,45 @@ def _decorate_shot_payload(shot: dict[str, Any]) -> dict[str, Any]:
     cli_conv_id = resolve_cli_conversation_id(out)
     out["cliConversationId"] = cli_conv_id
     out["canResumeCliChat"] = bool(cli_conv_id)
+
+    dl_480 = build_shot_download_filename(out, kind="480p")
+    dl_1080 = build_shot_download_filename(out, kind="1080p")
+    resolved_dir = _resolve_shot_export_dir(export_config, out)
+    local_exports = out.get("localExports") if isinstance(out.get("localExports"), dict) else {}
+    rec_1080 = local_exports.get("1080p") if isinstance(local_exports.get("1080p"), dict) else {}
+    fin_vid = out.get("finalVideo") if isinstance(out.get("finalVideo"), dict) else {}
+    fin_file_str = str(fin_vid.get("filePath") or "").strip()
+    fin_exists = bool(fin_file_str and Path(fin_file_str).is_file())
+    if not fin_exists:
+        sync_status = "no_final"
+        sync_msg = "尚未生成 1080P 正片"
+    elif not resolved_dir:
+        sync_status = "unbound"
+        sync_msg = "尚未绑定本地成片导出目录"
+    else:
+        expected_target = Path(resolved_dir).expanduser().resolve() / dl_1080
+        cur_sig = _file_stat_sig(fin_file_str)
+        try:
+            target_size_ok = expected_target.is_file() and expected_target.stat().st_size == Path(fin_file_str).stat().st_size
+        except OSError:
+            target_size_ok = False
+        if (
+            target_size_ok
+            and str(rec_1080.get("filePath") or "") == str(expected_target)
+            and str(rec_1080.get("sourceSig") or "") == cur_sig
+        ):
+            sync_status = "synced"
+            sync_msg = f"已同步至 {expected_target}"
+        else:
+            sync_status = "needs_sync"
+            sync_msg = f"本地成片待更新为 {dl_1080}"
+
+    out["downloadName480p"] = dl_480
+    out["downloadName1080p"] = dl_1080
+    out["resolvedExportDir"] = resolved_dir
+    out["localExports"] = copy.deepcopy(local_exports)
+    out["exportSyncStatus1080p"] = sync_status
+    out["exportSyncMessage1080p"] = sync_msg
     return out
 
 
@@ -987,11 +1121,117 @@ class QueueStore:
         q["platformDefaults"] = pdefs
         return pdefs
 
+    def _ensure_export_config(self, q: dict[str, Any]) -> dict[str, Any]:
+        cfg = _extract_export_config(q)
+        q["defaultExportDir"] = cfg["defaultExportDir"]
+        q["sceneExportDirs"] = cfg["sceneExportDirs"]
+        q["autoSyncExport"] = cfg["autoSyncExport"]
+        return cfg
+
+    @staticmethod
+    def _decorate_shot(q: dict[str, Any], shot: dict[str, Any]) -> dict[str, Any]:
+        return _decorate_shot_payload(shot, export_config=_extract_export_config(q))
+
+    def _sync_shot_export_locked(
+        self,
+        q: dict[str, Any],
+        shot: dict[str, Any],
+        *,
+        role: str = "1080p",
+        export_dir_override: str = "",
+        create_dir: bool = False,
+    ) -> dict[str, Any]:
+        clean_role = "1080p" if str(role or "").strip().lower() in {"1080", "1080p", "final"} else "480p"
+        vid_obj = shot.get("finalVideo") if clean_role == "1080p" else shot.get("draftVideo")
+        src_path_raw = str((vid_obj or {}).get("filePath") or "").strip() if isinstance(vid_obj, dict) else ""
+        if not src_path_raw:
+            return {"synced": False, "role": clean_role, "reason": "no_video"}
+        src_path = resolve_media_path(src_path_raw)
+        if not src_path.is_file():
+            return {"synced": False, "role": clean_role, "reason": "source_missing"}
+
+        cfg = self._ensure_export_config(q)
+        if export_dir_override.strip():
+            target_dir_str = _validate_export_dir_path(export_dir_override, create=create_dir)
+        else:
+            target_dir_str = _resolve_shot_export_dir(cfg, shot)
+            if not target_dir_str:
+                return {"synced": False, "role": clean_role, "reason": "unbound"}
+            target_dir_p = Path(target_dir_str).expanduser()
+            if create_dir and not target_dir_p.exists() and target_dir_p.parent.exists():
+                target_dir_p.mkdir(parents=True, exist_ok=True)
+            if not target_dir_p.is_dir():
+                return {"synced": False, "role": clean_role, "reason": "dir_missing", "exportDir": target_dir_str}
+            target_dir_str = str(target_dir_p.resolve())
+
+        target_dir = Path(target_dir_str)
+        target_name = build_shot_download_filename(shot, kind=clean_role)
+        target_path = target_dir / target_name
+
+        local_exports = shot.setdefault("localExports", {})
+        if not isinstance(local_exports, dict):
+            local_exports = {}
+            shot["localExports"] = local_exports
+        prev_rec = local_exports.get(clean_role) if isinstance(local_exports.get(clean_role), dict) else {}
+        prev_path_str = str(prev_rec.get("filePath") or "").strip()
+
+        src_sig = _file_stat_sig(str(src_path))
+        already_current = (
+            target_path.is_file()
+            and prev_path_str == str(target_path)
+            and str(prev_rec.get("sourceSig") or "") == src_sig
+            and target_path.stat().st_size == src_path.stat().st_size
+        )
+        renamed_from = ""
+        if not already_current:
+            tmp_target = target_dir / f".tmp_{shot['id']}_{clean_role}_{uuid.uuid4().hex[:8]}.mp4"
+            try:
+                shutil.copy2(src_path, tmp_target)
+                os.replace(tmp_target, target_path)
+            finally:
+                if tmp_target.exists():
+                    tmp_target.unlink(missing_ok=True)
+
+            if prev_path_str and prev_path_str != str(target_path):
+                prev_path = Path(prev_path_str)
+                expected_prev_name = str(prev_rec.get("fileName") or "").strip()
+                expected_prev_dir = str(prev_rec.get("exportDir") or "").strip()
+                if (
+                    prev_path.is_file()
+                    and expected_prev_name
+                    and prev_path.name == expected_prev_name
+                    and (not expected_prev_dir or str(prev_path.parent.resolve()) == str(Path(expected_prev_dir).resolve()))
+                ):
+                    try:
+                        prev_path.unlink(missing_ok=True)
+                        renamed_from = expected_prev_name
+                    except OSError:
+                        pass
+
+        rec_now = {
+            "filePath": str(target_path),
+            "fileName": target_name,
+            "exportDir": str(target_dir),
+            "sourceSig": src_sig,
+            "syncedAt": now_iso(),
+        }
+        local_exports[clean_role] = rec_now
+        return {
+            "synced": True,
+            "role": clean_role,
+            "filePath": str(target_path),
+            "fileName": target_name,
+            "exportDir": str(target_dir),
+            "renamedFrom": renamed_from,
+            "unchanged": already_current,
+        }
+
     def get_state(self) -> dict[str, Any]:
         with self._lock:
             q = self._load_queue()
             p = self._load_presets()
             pdefs = self._ensure_platform_defaults(q)
+            export_cfg = self._ensure_export_config(q)
             default_plat = q["defaultPlatform"]
             active_def = pdefs[default_plat]
             return {
@@ -1003,11 +1243,14 @@ class QueueStore:
                 "defaultProjectUuid": q.get("defaultProjectUuid") or active_def.get("projectUuid", DEFAULT_PROJECT_UUID),
                 "defaultProjectName": q.get("defaultProjectName") or active_def.get("projectName", DEFAULT_PROJECT_NAME),
                 "defaultWorkspaceId": q.get("defaultWorkspaceId", active_def.get("workspaceId", DEFAULT_WORKSPACE_ID)),
+                "defaultExportDir": export_cfg["defaultExportDir"],
+                "sceneExportDirs": export_cfg["sceneExportDirs"],
+                "autoSyncExport": export_cfg["autoSyncExport"],
                 "eventSeq": q.get("eventSeq", 1),
                 "events": q.get("events", [])[-20:],
                 "scenes": q.get("scenes", []),
                 "presets": p.get("presets", []),
-                "shots": [_decorate_shot_payload(s) for s in q.get("shots", [])],
+                "shots": [_decorate_shot_payload(s, export_config=export_cfg) for s in q.get("shots", [])],
             }
 
     def create_scene(self, name: str) -> dict[str, Any]:
@@ -1070,6 +1313,12 @@ class QueueStore:
             if not replaced and new_clean not in new_scenes:
                 new_scenes.append(new_clean)
             q["scenes"] = new_scenes
+
+            scene_dirs = q.get("sceneExportDirs")
+            if isinstance(scene_dirs, dict) and old_clean and old_clean in scene_dirs:
+                bound_dir = scene_dirs.pop(old_clean)
+                if bound_dir and not scene_dirs.get(new_clean):
+                    scene_dirs[new_clean] = bound_dir
 
             self._save_queue(
                 q,
@@ -1329,6 +1578,7 @@ class QueueStore:
         notes: str,
         user_prompt: str,
         scene: str = "",
+        title: str = "",
         platform: str = "",
         canvas_url: str = "",
         source_filename: str = "",
@@ -1422,6 +1672,7 @@ class QueueStore:
             status = "queued" if auto_confirm else "drafting"
             shot = {
                 "id": sid,
+                "title": (title or "").strip(),
                 "scene": scene.strip(),
                 "status": status,
                 "platform": eff_platform,
@@ -1447,6 +1698,7 @@ class QueueStore:
                 "jimengMeta": {},
                 "draftVideo": None,
                 "finalVideo": None,
+                "localExports": {},
                 "confirmationRequest": None,
                 "confirmationHistory": [],
                 "feedbacks": [],
@@ -1492,7 +1744,7 @@ class QueueStore:
                 q["shots"].append(shot)
 
             self._save_queue(q, {"type": "shot_created", "shotId": sid, "status": status})
-            return _decorate_shot_payload(shot)
+            return self._decorate_shot(q, shot)
 
     def get_shot(self, shot_id: str) -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
@@ -1500,7 +1752,7 @@ class QueueStore:
             q = self._load_queue()
             for shot in q["shots"]:
                 if shot["id"] == sid:
-                    return _decorate_shot_payload(shot)
+                    return self._decorate_shot(q, shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
     def confirm_shot(self, shot_id: str) -> dict[str, Any]:
@@ -1518,7 +1770,7 @@ class QueueStore:
                         {"at": now_iso(), "actor": "user", "summary": "点击确认，镜头进入待处理队列"}
                     )
                     self._save_queue(q, {"type": "shot_confirmed", "shotId": sid, "status": "queued"})
-                    return _decorate_shot_payload(shot)
+                    return self._decorate_shot(q, shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
     def submit_feedback(
@@ -1973,7 +2225,7 @@ class QueueStore:
                         {"at": now_iso(), "actor": "user", "summary": "确认满意，请求转 1080P 正片"}
                     )
                     self._save_queue(q, {"type": "final_requested", "shotId": sid, "status": "final_requested"})
-                    return _decorate_shot_payload(shot)
+                    return self._decorate_shot(q, shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
     def reprocess_shot(
@@ -2047,11 +2299,322 @@ class QueueStore:
                 shot.setdefault("revisions", []).append(
                     {"at": now_iso(), "actor": "user", "summary": f"归类到场号：{clean_scene or '未分场'}"}
                 )
+                if q.get("autoSyncExport", True) and (shot.get("finalVideo") or {}).get("filePath"):
+                    try:
+                        sync_res = self._sync_shot_export_locked(q, shot, role="1080p")
+                        if sync_res.get("synced") and not sync_res.get("unchanged"):
+                            shot.setdefault("revisions", []).append(
+                                {
+                                    "at": now_iso(),
+                                    "actor": "system",
+                                    "summary": f"切场后已同步本地 1080P 至 {sync_res['filePath']}",
+                                }
+                            )
+                    except (OSError, ValueError):
+                        pass
                 self._save_queue(
                     q,
                     {"type": "shot_scene_updated", "shotId": sid, "scene": clean_scene},
                 )
-                return _decorate_shot_payload(shot)
+                return self._decorate_shot(q, shot)
+        raise KeyError(f"镜头不存在: {shot_id}")
+
+    def set_export_config(
+        self,
+        *,
+        default_export_dir: str | None = None,
+        scene_export_dirs: dict[str, str] | None = None,
+        auto_sync_export: bool | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            q = self._load_queue()
+            self._ensure_export_config(q)
+            if default_export_dir is not None:
+                q["defaultExportDir"] = _validate_export_dir_path(default_export_dir, create=True)
+            if scene_export_dirs is not None:
+                next_map: dict[str, str] = {}
+                for k, v in scene_export_dirs.items():
+                    sc = str(k or "").strip()
+                    if not sc:
+                        continue
+                    cleaned_v = _validate_export_dir_path(str(v or ""), create=True)
+                    if cleaned_v:
+                        next_map[sc] = cleaned_v
+                q["sceneExportDirs"] = next_map
+            if auto_sync_export is not None:
+                q["autoSyncExport"] = bool(auto_sync_export)
+            cfg = self._ensure_export_config(q)
+            self._save_queue(q, {"type": "export_config_updated"})
+            return cfg
+
+    def update_shot_meta(
+        self,
+        shot_id: str,
+        *,
+        title: str | None = None,
+        sync_local: bool = True,
+    ) -> dict[str, Any]:
+        sid = sanitize_shot_id(shot_id)
+        with self._lock:
+            q = self._load_queue()
+            self._ensure_export_config(q)
+            for shot in q["shots"]:
+                if shot["id"] != sid:
+                    continue
+                old_title = str(shot.get("title") or "").strip()
+                new_title = old_title if title is None else str(title or "").strip()
+                title_changed = new_title != old_title
+                shot["title"] = new_title
+                if title_changed:
+                    shot["updatedAt"] = now_iso()
+                    shot.setdefault("revisions", []).append(
+                        {
+                            "at": now_iso(),
+                            "actor": "user",
+                            "summary": f"镜头重命名：{old_title or '(未命名)'} → {new_title or '(已清空名称)'}",
+                        }
+                    )
+
+                synced_results: list[dict[str, Any]] = []
+                if sync_local:
+                    roles_to_sync: list[str] = []
+                    lex = shot.get("localExports") or {}
+                    if isinstance(lex, dict):
+                        for r in ("1080p", "480p"):
+                            if r in lex and isinstance(lex[r], dict) and lex[r].get("filePath"):
+                                roles_to_sync.append(r)
+                    if (
+                        "1080p" not in roles_to_sync
+                        and q.get("autoSyncExport", True)
+                        and (shot.get("finalVideo") or {}).get("filePath")
+                        and _resolve_shot_export_dir(q, shot)
+                    ):
+                        roles_to_sync.append("1080p")
+                    for role in roles_to_sync:
+                        try:
+                            sres = self._sync_shot_export_locked(q, shot, role=role)
+                            if sres.get("synced"):
+                                synced_results.append(sres)
+                        except (OSError, ValueError):
+                            pass
+
+                self._save_queue(
+                    q,
+                    {
+                        "type": "shot_meta_updated",
+                        "shotId": sid,
+                        "title": new_title,
+                        "syncedCount": len(synced_results),
+                    },
+                )
+                return {
+                    "shot": self._decorate_shot(q, shot),
+                    "syncedExports": synced_results,
+                }
+        raise KeyError(f"镜头不存在: {shot_id}")
+
+    def sync_shot_local_export(
+        self,
+        shot_id: str,
+        *,
+        role: str = "1080p",
+        export_dir: str = "",
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        sid = sanitize_shot_id(shot_id)
+        with self._lock:
+            q = self._load_queue()
+            self._ensure_export_config(q)
+            for shot in q["shots"]:
+                if shot["id"] != sid:
+                    continue
+                if title is not None:
+                    old_title = str(shot.get("title") or "").strip()
+                    new_title = str(title or "").strip()
+                    if new_title != old_title:
+                        shot["title"] = new_title
+                        shot.setdefault("revisions", []).append(
+                            {
+                                "at": now_iso(),
+                                "actor": "user",
+                                "summary": f"下载重命名：{old_title or '(未命名)'} → {new_title or '(已清空名称)'}",
+                            }
+                        )
+                res = self._sync_shot_export_locked(
+                    q,
+                    shot,
+                    role=role,
+                    export_dir_override=export_dir,
+                    create_dir=True,
+                )
+                if not res.get("synced"):
+                    reason = res.get("reason")
+                    if reason == "unbound":
+                        raise ValueError("尚未绑定本场或全局默认成片导出目录")
+                    if reason in {"no_video", "source_missing"}:
+                        raise ValueError(f"当前镜头尚无可用的 {role.upper()} 本地视频文件")
+                    raise ValueError(f"同步导出失败: {reason}")
+                shot["updatedAt"] = now_iso()
+                if not res.get("unchanged"):
+                    shot.setdefault("revisions", []).append(
+                        {
+                            "at": now_iso(),
+                            "actor": "user",
+                            "summary": f"已同步 {res['role'].upper()} 成片至本地目录：{res['filePath']}",
+                        }
+                    )
+                self._save_queue(
+                    q,
+                    {
+                        "type": "shot_export_synced",
+                        "shotId": sid,
+                        "role": res["role"],
+                        "filePath": res["filePath"],
+                    },
+                )
+                return {"shot": self._decorate_shot(q, shot), "syncResult": res}
+        raise KeyError(f"镜头不存在: {shot_id}")
+
+    def sync_all_local_exports(
+        self,
+        *,
+        scene: str = "",
+        role: str = "1080p",
+    ) -> dict[str, Any]:
+        clean_scene = (scene or "").strip()
+        with self._lock:
+            q = self._load_queue()
+            self._ensure_export_config(q)
+            synced_items: list[dict[str, Any]] = []
+            skipped_unbound: list[str] = []
+            skipped_no_video: list[str] = []
+            errors: list[dict[str, str]] = []
+            changed = False
+
+            for shot in q["shots"]:
+                sc = (shot.get("scene") or "").strip()
+                if clean_scene:
+                    if clean_scene == "未分场":
+                        if sc:
+                            continue
+                    elif sc != clean_scene:
+                        continue
+                try:
+                    res = self._sync_shot_export_locked(q, shot, role=role, create_dir=True)
+                except (OSError, ValueError) as exc:
+                    errors.append({"shotId": shot["id"], "error": str(exc)})
+                    continue
+                if res.get("synced"):
+                    synced_items.append({"shotId": shot["id"], **res})
+                    if not res.get("unchanged"):
+                        changed = True
+                elif res.get("reason") == "unbound":
+                    skipped_unbound.append(shot["id"])
+                else:
+                    skipped_no_video.append(shot["id"])
+
+            if changed:
+                self._save_queue(
+                    q,
+                    {
+                        "type": "batch_export_synced",
+                        "scene": clean_scene,
+                        "syncedCount": len(synced_items),
+                    },
+                )
+            return {
+                "synced": synced_items,
+                "syncedCount": len(synced_items),
+                "updatedCount": sum(1 for item in synced_items if not item.get("unchanged")),
+                "skippedUnbound": skipped_unbound,
+                "skippedNoVideo": skipped_no_video,
+                "errors": errors,
+            }
+
+    def replace_shot_final_video(
+        self,
+        shot_id: str,
+        *,
+        filename: str,
+        raw_bytes: bytes,
+        sync_local: bool = True,
+    ) -> dict[str, Any]:
+        if not raw_bytes:
+            raise ValueError("上传的 1080P 视频文件为空")
+        sid = sanitize_shot_id(shot_id)
+        ext = Path(filename or "final.mp4").suffix.lower() or ".mp4"
+        if ext not in preflight_check.VIDEO_EXTS:
+            raise ValueError(f"不支持的视频格式：{ext}（请上传 mp4/mov 等视频文件）")
+        with self._lock:
+            q = self._load_queue()
+            self._ensure_export_config(q)
+            for shot in q["shots"]:
+                if shot["id"] != sid:
+                    continue
+                shot_dir = SHOTS_DIR / sid
+                shot_dir.mkdir(parents=True, exist_ok=True)
+                dest = shot_dir / "final_1080p.mp4"
+                tmp_dest = shot_dir / f".final_1080p_{uuid.uuid4().hex[:8]}{ext}"
+                tmp_dest.write_bytes(raw_bytes)
+                meta = run_preflight(tmp_dest)
+                if not meta or int(meta.get("width") or 0) <= 0 or int(meta.get("height") or 0) <= 0:
+                    issues = "；".join((meta or {}).get("issues") or []) or "无法解码视频画面，请确认上传了有效的视频文件"
+                    tmp_dest.unlink(missing_ok=True)
+                    raise ValueError(issues)
+                if ext != ".mp4":
+                    target_name = f"final_1080p{ext}"
+                    dest = shot_dir / target_name
+                os.replace(tmp_dest, dest)
+                meta["path"] = str(dest)
+                vobj = {
+                    "filePath": str(dest),
+                    "mediaUrl": to_media_url(dest),
+                    "watermark": False,
+                    "downloadedAt": now_iso(),
+                    "sourceSig": _file_stat_sig(str(dest)),
+                    "meta": meta,
+                    "source": "manual_replace",
+                }
+                shot["finalVideo"] = vobj
+                shot["finalModifiedReopened"] = False
+                shot["draftUpdatedSinceFinalReopen"] = False
+                self._clear_claim_fields(shot)
+                self._clear_error_fields(shot)
+                if shot.get("status") != "processing":
+                    shot["status"] = "final_ready"
+                shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
+                shot["lastGeneratedAt"] = now_iso()
+                shot["updatedAt"] = now_iso()
+                shot["agentSummary"] = "已替换更新本地 1080P 正片画面。"
+                shot.setdefault("revisions", []).append(
+                    {"at": now_iso(), "actor": "user", "summary": f"手动替换更新 1080P 正片（{filename}）"}
+                )
+                sync_res: dict[str, Any] | None = None
+                if sync_local and q.get("autoSyncExport", True):
+                    try:
+                        sync_res = self._sync_shot_export_locked(q, shot, role="1080p", create_dir=True)
+                        if sync_res.get("synced"):
+                            shot.setdefault("revisions", []).append(
+                                {
+                                    "at": now_iso(),
+                                    "actor": "system",
+                                    "summary": f"已自动覆盖更新本地目录 1080P：{sync_res['filePath']}",
+                                }
+                            )
+                    except (OSError, ValueError):
+                        sync_res = None
+                self._append_version_snapshot(
+                    shot,
+                    kind="run_completed",
+                    actor="user",
+                    title="手动更新 1080P 正片画面",
+                    prompt_text=(shot.get("promptText") or "").strip(),
+                    revision_direction=f"上传替换 1080P 正片（{filename}）",
+                    draft_video_url=vobj["mediaUrl"],
+                    draft_downloaded_at=vobj["downloadedAt"],
+                )
+                self._save_queue(q, {"type": "final_replaced", "shotId": sid, "status": shot["status"]})
+                return {"shot": self._decorate_shot(q, shot), "syncResult": sync_res}
         raise KeyError(f"镜头不存在: {shot_id}")
 
     @staticmethod
@@ -2358,17 +2921,58 @@ class QueueStore:
                     shot["shotConversationId"] = conv_id
 
                 updated_result_video = None
+                final_video_updated = False
                 for vid_field in ("draftVideo", "finalVideo"):
                     if vid_field in payload and payload[vid_field] is not None:
                         vobj = dict(payload[vid_field])
-                        if vobj.get("filePath") and not vobj.get("mediaUrl"):
+                        if vobj.get("filePath"):
                             resolved = resolve_media_path(vobj["filePath"])
                             if resolved.is_file() and DATA_ROOT.resolve() in resolved.parents:
-                                vobj["mediaUrl"] = to_media_url(resolved)
-                                vobj.setdefault("meta", run_preflight(resolved))
+                                vobj["filePath"] = str(resolved)
+                                vobj["mediaUrl"] = vobj.get("mediaUrl") or to_media_url(resolved)
+                                vobj["meta"] = run_preflight(resolved)
                         vobj.setdefault("downloadedAt", now_iso())
                         shot[vid_field] = vobj
                         updated_result_video = copy.deepcopy(vobj)
+                        if vid_field == "finalVideo":
+                            final_video_updated = True
+
+                if not final_video_updated and shot.get("status") in {"final_ready", "final_done"}:
+                    existing_fv = shot.get("finalVideo") if isinstance(shot.get("finalVideo"), dict) else {}
+                    cand_path_raw = str(existing_fv.get("filePath") or (SHOTS_DIR / sid / "final_1080p.mp4"))
+                    cand_resolved = resolve_media_path(cand_path_raw)
+                    if cand_resolved.is_file() and DATA_ROOT.resolve() in cand_resolved.parents:
+                        cur_disk_sig = _file_stat_sig(str(cand_resolved))
+                        recorded_sig = str(
+                            ((shot.get("localExports") or {}).get("1080p") or {}).get("sourceSig")
+                            or existing_fv.get("sourceSig")
+                            or ""
+                        )
+                        if not existing_fv or cur_disk_sig != recorded_sig:
+                            refreshed_fv = dict(existing_fv)
+                            refreshed_fv["filePath"] = str(cand_resolved)
+                            refreshed_fv["mediaUrl"] = to_media_url(cand_resolved)
+                            refreshed_fv["meta"] = run_preflight(cand_resolved)
+                            refreshed_fv["downloadedAt"] = refreshed_fv.get("downloadedAt") or now_iso()
+                            refreshed_fv["sourceSig"] = cur_disk_sig
+                            shot["finalVideo"] = refreshed_fv
+                            final_video_updated = True
+
+                if final_video_updated and isinstance(shot.get("finalVideo"), dict) and shot["finalVideo"].get("filePath"):
+                    shot["finalVideo"]["sourceSig"] = _file_stat_sig(str(shot["finalVideo"]["filePath"]))
+                    if q.get("autoSyncExport", True):
+                        try:
+                            sync_res = self._sync_shot_export_locked(q, shot, role="1080p")
+                            if sync_res.get("synced") and not sync_res.get("unchanged"):
+                                shot.setdefault("revisions", []).append(
+                                    {
+                                        "at": now_iso(),
+                                        "actor": "system",
+                                        "summary": f"1080P 更新后已自动同步本地目录：{sync_res['filePath']}",
+                                    }
+                                )
+                        except (OSError, ValueError):
+                            pass
 
                 if payload.get("finalVideo") is not None or (
                     shot.get("status") in {"final_ready", "final_done"} and prev_task == "final_requested"
@@ -2541,7 +3145,7 @@ class QueueStore:
                     q,
                     {"type": "agent_updated", "shotId": sid, "status": shot["status"]},
                 )
-                return _decorate_shot_payload(shot)
+                return self._decorate_shot(q, shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
     def update_shot_from_libtv_sync(
@@ -2554,10 +3158,16 @@ class QueueStore:
         watermark: bool | None = None,
         node_key: str | None = None,
         resource_id: str = "",
+        final_path: Path | None = None,
+        remote_final_url: str = "",
+        final_watermark: bool | None = None,
+        final_node_key: str | None = None,
+        final_resource_id: str = "",
     ) -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
         with self._lock:
             q = self._load_queue()
+            self._ensure_export_config(q)
             for shot in q["shots"]:
                 if shot["id"] != sid:
                     continue
@@ -2569,6 +3179,8 @@ class QueueStore:
                     shot["libtvMixedOrder"] = mixed_order
                 if node_key:
                     shot["libtvSampleNodeKey"] = node_key
+                if final_node_key:
+                    shot["libtvFinalNodeKey"] = final_node_key
                 new_media_url = ""
                 if draft_path is not None and draft_path.is_file():
                     new_media_url = to_media_url(draft_path)
@@ -2596,9 +3208,70 @@ class QueueStore:
                     shot.setdefault("revisions", []).append(
                         {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布拉取 480P 样片完成"}
                     )
+
+                final_synced_new = False
+                if final_path is not None and final_path.is_file():
+                    old_fv = shot.get("finalVideo") if isinstance(shot.get("finalVideo"), dict) else {}
+                    old_fv_sig = str(old_fv.get("sourceSig") or _file_stat_sig(old_fv.get("filePath")))
+                    new_fv_sig = _file_stat_sig(str(final_path))
+                    url_changed = bool(remote_final_url and remote_final_url != old_fv.get("remoteUrl"))
+                    res_changed = bool(final_resource_id and final_resource_id != (shot.get("jimengMeta") or {}).get("downloadedFinalResourceId"))
+                    if not old_fv or new_fv_sig != old_fv_sig or url_changed or res_changed:
+                        final_synced_new = True
+                        if final_resource_id:
+                            jm = shot.setdefault("jimengMeta", {})
+                            if isinstance(jm, dict):
+                                jm["downloadedFinalResourceId"] = final_resource_id
+                        shot["finalVideo"] = {
+                            "filePath": str(final_path),
+                            "mediaUrl": to_media_url(final_path),
+                            "remoteUrl": remote_final_url,
+                            "watermark": final_watermark,
+                            "resourceId": final_resource_id,
+                            "meta": run_preflight(final_path),
+                            "downloadedAt": now_iso(),
+                            "sourceSig": new_fv_sig,
+                        }
+                        shot["finalModifiedReopened"] = False
+                        shot["draftUpdatedSinceFinalReopen"] = False
+                        if shot["status"] != "processing":
+                            self._clear_claim_fields(shot)
+                            shot["status"] = "final_ready"
+                            shot["agentSummary"] = f"已从 {plat_label} 画布同步最新 1080P 正片并归档。"
+                        shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
+                        shot["lastGeneratedAt"] = now_iso()
+                        shot.setdefault("revisions", []).append(
+                            {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布同步更新 1080P 正片"}
+                        )
+                        if q.get("autoSyncExport", True):
+                            try:
+                                sync_res = self._sync_shot_export_locked(q, shot, role="1080p")
+                                if sync_res.get("synced") and not sync_res.get("unchanged"):
+                                    shot.setdefault("revisions", []).append(
+                                        {
+                                            "at": now_iso(),
+                                            "actor": "system",
+                                            "summary": f"同步画布 1080P 后已自动更新本地目录：{sync_res['filePath']}",
+                                        }
+                                    )
+                            except (OSError, ValueError):
+                                pass
+
                 cur_prompt = (shot.get("promptText") or "").strip()
                 last_snap = (shot.get("versionHistory") or [{}])[-1]
-                if new_media_url and last_snap.get("draftVideoUrl") != new_media_url:
+                if final_synced_new:
+                    fv_now = shot.get("finalVideo") or {}
+                    self._append_version_snapshot(
+                        shot,
+                        kind="run_completed",
+                        actor="sync",
+                        title=f"从 {plat_label} 同步更新 1080P 正片",
+                        prompt_text=cur_prompt,
+                        revision_direction="从画布拉取并同步最新 1080P 正片画面。",
+                        draft_video_url=str(fv_now.get("mediaUrl") or ""),
+                        draft_downloaded_at=str(fv_now.get("downloadedAt") or now_iso()),
+                    )
+                elif new_media_url and last_snap.get("draftVideoUrl") != new_media_url:
                     self._append_version_snapshot(
                         shot,
                         kind="run_completed",
@@ -2621,7 +3294,7 @@ class QueueStore:
                     )
                 shot["updatedAt"] = now_iso()
                 self._save_queue(q, {"type": "libtv_synced", "shotId": sid, "status": shot["status"]})
-                return _decorate_shot_payload(shot)
+                return self._decorate_shot(q, shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
     def rollback_shot(self, shot_id: str, version_id: str, sync_to_canvas: bool = True) -> dict[str, Any]:
@@ -2699,7 +3372,7 @@ class QueueStore:
                         "status": shot["status"],
                     },
                 )
-                return _decorate_shot_payload(shot)
+                return self._decorate_shot(q, shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
     def delete_shot(self, shot_id: str) -> None:

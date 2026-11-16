@@ -484,14 +484,8 @@ def download_resource(resource_id: str, dest_file: Path, project_uuid: str | Non
         return dest_file
 
 
-def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
-    """Inspect a Dreamina Canvas node and pull its latest completed video asset if supported."""
-    node_ref = str(shot.get("libtvSampleNodeKey") or "").strip()
-    project_uuid = str(shot.get("projectUuid") or "").strip()
-    if not node_ref or not project_uuid:
-        raise ValueError("当前镜头尚未绑定即梦画布或视频节点 ID，无法拉取节点状态")
-
-    proc = _run_dreamina(["node", "show", "--node-id", node_ref, "--project-id", project_uuid], timeout=25)
+def _inspect_dreamina_node_raw(node_id: str, project_uuid: str) -> dict[str, Any]:
+    proc = _run_dreamina(["node", "show", "--node-id", node_id, "--project-id", project_uuid], timeout=25)
     try:
         payload = _extract_json(proc)
     except Exception:
@@ -501,14 +495,25 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
         if _is_auth_error(proc, payload):
             invalidate_auth_cache()
             raise JimengAuthRequiredError("即梦官网尚未登录授权")
-        raise RuntimeError(_extract_error_msg(payload, proc.stderr.strip() or f"读取即梦节点失败: {node_ref}"))
+        raise RuntimeError(_extract_error_msg(payload, proc.stderr.strip() or f"读取即梦节点失败: {node_id}"))
 
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     nodes = data.get("nodes") or []
     first_item = nodes[0] if nodes and isinstance(nodes[0], dict) else {}
     node = first_item.get("node") if isinstance(first_item.get("node"), dict) else {}
     if not node:
-        raise RuntimeError(f"即梦画布中未找到节点 {node_ref}（result={first_item.get('result') or 'unknown'}）")
+        raise RuntimeError(f"即梦画布中未找到节点 {node_id}（result={first_item.get('result') or 'unknown'}）")
+    return node
+
+
+def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
+    """Inspect a Dreamina Canvas node (sample & optional 1080P final) and pull latest completed assets."""
+    node_ref = str(shot.get("libtvSampleNodeKey") or "").strip()
+    project_uuid = str(shot.get("projectUuid") or "").strip()
+    if not node_ref or not project_uuid:
+        raise ValueError("当前镜头尚未绑定即梦画布或视频节点 ID，无法拉取节点状态")
+
+    node = _inspect_dreamina_node_raw(node_ref, project_uuid)
 
     gen = node.get("generation") if isinstance(node.get("generation"), dict) else {}
     resources = [r for r in (node.get("resources") or []) if isinstance(r, dict)]
@@ -533,7 +538,8 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
 
     draft_path: Path | None = None
     download_warning = ""
-    existing_dl_res = str((shot.get("jimengMeta") or {}).get("downloadedResourceId") or "").strip()
+    jm = shot.get("jimengMeta") or {}
+    existing_dl_res = str(jm.get("downloadedResourceId") or "").strip()
     target = shot_dir / "draft_480p.mp4"
     if resource_id and succeeded:
         if not target.is_file() or existing_dl_res != resource_id:
@@ -548,6 +554,30 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
         else:
             draft_path = target
 
+    final_path: Path | None = None
+    final_res_id = ""
+    final_node_key = str(jm.get("finalNodeId") or jm.get("upscaleNodeId") or shot.get("libtvFinalNodeKey") or "").strip()
+    if final_node_key:
+        try:
+            fnode = _inspect_dreamina_node_raw(final_node_key, project_uuid)
+            fresources = [r for r in (fnode.get("resources") or []) if isinstance(r, dict)]
+            fsuc = [r for r in fresources if str(r.get("status") or "").lower() in {"succeeded", "success", "completed"}]
+            if fsuc:
+                final_res_id = str(fsuc[0].get("resourceId") or "").strip()
+            existing_final_res = str(jm.get("downloadedFinalResourceId") or "").strip()
+            ftarget = shot_dir / "final_1080p.mp4"
+            if final_res_id and fsuc:
+                if not ftarget.is_file() or existing_final_res != final_res_id:
+                    final_path = download_resource(final_res_id, ftarget, project_uuid=project_uuid)
+                else:
+                    final_path = ftarget
+            final_node_key = str(fnode.get("nodeId") or final_node_key)
+        except JimengAuthRequiredError:
+            raise
+        except Exception as fin_exc:
+            if not download_warning:
+                download_warning = str(fin_exc)
+
     return {
         "nodeKey": str(node.get("nodeId") or node_ref),
         "loading": node_status in {"running", "pending", "queued", "generating", "processing"},
@@ -559,4 +589,7 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
         "draftPath": draft_path,
         "watermark": False,
         "downloadWarning": download_warning,
+        "finalPath": final_path,
+        "finalResourceId": final_res_id,
+        "finalNodeKey": final_node_key,
     }
