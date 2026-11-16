@@ -64,8 +64,32 @@ function guardPassedFinalAction(
   });
 }
 
+const ERROR_CODE_LABELS = {
+  model_conflict: "参数冲突",
+  stalled: "卡住中断",
+  interrupted: "进程中断",
+  timeout: "运行超时",
+  rate_limit: "配额/限流",
+  network_error: "网络中断",
+  auth_expired: "登录失效",
+  credits_insufficient: "积分不足",
+  moderation: "内容拦截",
+  asset_missing: "素材缺失",
+  unknown_error: "执行异常",
+};
+
+function getShotErrorTag(shot) {
+  if (!shot || shot.status !== "error") return "";
+  if ((shot.errorTag || "").trim()) return shot.errorTag.trim();
+  return ERROR_CODE_LABELS[shot.errorCode || ""] || "执行异常";
+}
+
 function getDisplayStatusMeta(shot) {
   if (!shot) return { label: "", cls: "pill-muted" };
+  if (shot.status === "error") {
+    const errTag = getShotErrorTag(shot);
+    return { label: errTag ? `出错 · ${errTag}` : "出错", cls: "pill-red" };
+  }
   if (isFinalInProgress(shot)) {
     if (shot.status === "needs_confirmation") {
       return { label: "正片·待确认", cls: "pill-orange" };
@@ -3299,6 +3323,7 @@ function renderTopBar() {
         const sm = getDisplayStatusMeta(shot);
         statusPillEl.className = `pill ${sm.cls}`;
         statusPillEl.textContent = sm.label;
+        statusPillEl.title = shot.status === "error" ? (shot.errorReason || getShotErrorTag(shot)) : "";
       }
       const isPendingRecheck = shot.status === "recheck_requested";
       if (reprocessBtn) {
@@ -3490,7 +3515,7 @@ function renderSidebar() {
                       <span class="shot-item-id">${escapeHtml(s.id)}</span>
                       ${normalizePlatform(s.platform) === "jimeng" ? `<span class="shot-platform-tag">即梦</span>` : ""}
                     </div>
-                    <span class="pill ${sm.cls}">${escapeHtml(sm.label)}</span>
+                    <span class="pill ${sm.cls}"${s.status === "error" ? ` title="${escapeHtml(s.errorReason || getShotErrorTag(s))}"` : ""}>${escapeHtml(sm.label)}</span>
                   </div>
                   <div class="shot-item-sub">${escapeHtml(vidName)}</div>
                 </div>
@@ -4301,6 +4326,9 @@ function renderConfirmationBanner(shot) {
 
 function renderErrorBanner(shot) {
   if (!shot || shot.status !== "error") return "";
+  const errTag = getShotErrorTag(shot);
+  const errCodeAttr = shot.errorCode ? `错误代码：${shot.errorCode}` : "执行异常";
+  const errTypePill = `<span class="pill pill-err-tag" title="${escapeHtml(errCodeAttr)}">🏷 ${escapeHtml(errTag)}</span>`;
   const taskTag = shot.lastFailedTaskLabel
     ? `<span class="pill pill-red">失败环节：${escapeHtml(shot.lastFailedTaskLabel)}</span>`
     : `<span class="pill pill-red">需要处理</span>`;
@@ -4313,7 +4341,10 @@ function renderErrorBanner(shot) {
   return `
     <section class="error-banner" role="alert">
       <div class="error-banner-head">
-        <strong>❌ 执行出错</strong>
+        <div class="error-banner-title-group">
+          <strong>❌ 执行出错</strong>
+          ${errTypePill}
+        </div>
         ${taskTag}
       </div>
       <div class="error-banner-row"><span class="error-banner-label">错误原因：</span>${escapeHtml(reason)}</div>

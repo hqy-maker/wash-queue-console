@@ -19,8 +19,17 @@ import shlex
 import shutil
 import subprocess
 import time
+import warnings
+import wave
 from pathlib import Path
 from typing import Any
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    try:
+        import audioop  # type: ignore
+    except Exception:
+        audioop = None  # type: ignore
 
 import httpx
 
@@ -56,24 +65,45 @@ def render_source_keyframes(source_path: Path, out_jpg: Path, cols: int = 3, row
         return None
 
     target_count = max(1, cols * rows)
+    cell_w = 420
+    cell_h = 240
     frames_with_ts: list[tuple[float, Any]] = []
     try:
         with av.open(str(source_path)) as container:
             vstream = next((s for s in container.streams if s.type == "video"), None)
             if vstream is None:
                 return None
+            try:
+                vstream.codec_context.thread_type = "AUTO"
+            except Exception:
+                pass
+            if vstream.width and vstream.height:
+                aspect = max(0.3, min(3.0, vstream.height / max(1, vstream.width)))
+                cell_h = max(120, int(round(cell_w * aspect)))
             dur = float(vstream.duration * vstream.time_base) if vstream.duration and vstream.time_base else 0.0
             if dur <= 0.0 and container.duration:
                 dur = float(container.duration) / float(av.time_base)
-            # Sample timestamps evenly inside [0.05s, dur - 0.1s]
+            # Multi-threaded decode + direct C-level libswscale downscale to thumbnail size
             all_decoded: list[tuple[float, Any]] = []
             approx_total = int(vstream.frames or 0)
-            step = max(1, approx_total // max(target_count * 2, 18)) if approx_total > 0 else 1
+            target_set = (
+                {round(k * (approx_total - 1) / max(1, target_count - 1)) for k in range(target_count)}
+                if approx_total > target_count
+                else None
+            )
+            step = max(1, approx_total // max(target_count * 2, 18)) if (approx_total > 0 and target_set is None) else 1
             for idx, frame in enumerate(container.decode(video=0)):
-                if step > 1 and (idx % step) != 0 and idx != 0:
+                if target_set is not None:
+                    if idx not in target_set:
+                        continue
+                elif step > 1 and (idx % step) != 0 and idx != 0:
                     continue
                 t_sec = float(frame.pts * frame.time_base) if frame.pts is not None and frame.time_base else (idx / 24.0)
-                all_decoded.append((t_sec, frame.to_image()))
+                if vstream.width and vstream.height:
+                    pil_thumb = frame.reformat(width=cell_w, height=cell_h, format="rgb24").to_image()
+                else:
+                    pil_thumb = frame.to_image()
+                all_decoded.append((t_sec, pil_thumb))
             if not all_decoded:
                 return None
             if len(all_decoded) <= target_count:
@@ -88,10 +118,10 @@ def render_source_keyframes(source_path: Path, out_jpg: Path, cols: int = 3, row
     if not frames_with_ts:
         return None
 
-    cell_w = 420
     first_img = frames_with_ts[0][1]
-    aspect = max(0.3, min(3.0, first_img.height / max(1, first_img.width)))
-    cell_h = max(120, int(round(cell_w * aspect)))
+    if first_img.size != (cell_w, cell_h):
+        aspect = max(0.3, min(3.0, first_img.height / max(1, first_img.width)))
+        cell_h = max(120, int(round(cell_w * aspect)))
     pad = 8
     actual_cols = min(cols, len(frames_with_ts))
     actual_rows = math.ceil(len(frames_with_ts) / max(1, actual_cols))
@@ -105,7 +135,7 @@ def render_source_keyframes(source_path: Path, out_jpg: Path, cols: int = 3, row
         c_idx = idx % actual_cols
         x0 = pad + c_idx * (cell_w + pad)
         y0 = pad + r_idx * (cell_h + pad)
-        thumb = pil_img.convert("RGB").resize((cell_w, cell_h), Image.Resampling.BILINEAR)
+        thumb = pil_img if (pil_img.mode == "RGB" and pil_img.size == (cell_w, cell_h)) else pil_img.convert("RGB").resize((cell_w, cell_h), Image.Resampling.BILINEAR)
         sheet.paste(thumb, (x0, y0))
         if draw is not None:
             tag = f"#{idx + 1} {t_sec:.2f}s"
@@ -119,8 +149,12 @@ def render_source_keyframes(source_path: Path, out_jpg: Path, cols: int = 3, row
     return out_jpg
 
 
-def analyze_source_audio(source_path: Path, out_json: Path) -> dict[str, Any]:
-    """Scan audio stream energy in 0.25s buckets using PyAV to flag active SFX/dialogue windows."""
+def analyze_source_audio(
+    source_path: Path,
+    out_json: Path,
+    out_wav: Path | None = None,
+) -> dict[str, Any]:
+    """Scan audio energy in C-speed 0.25s buckets and optionally export lightweight 16kHz mono WAV."""
     if not source_path.is_file():
         return {"hasAudioTrack": False}
     try:
@@ -128,7 +162,13 @@ def analyze_source_audio(source_path: Path, out_json: Path) -> dict[str, Any]:
         if out_json.is_file() and out_json.stat().st_mtime >= src_mtime:
             cached = json.loads(out_json.read_text(encoding="utf-8"))
             if isinstance(cached, dict):
-                return cached
+                wav_ready = (
+                    out_wav is None
+                    or not cached.get("hasAudioTrack")
+                    or (out_wav.is_file() and out_wav.stat().st_mtime >= src_mtime)
+                )
+                if wav_ready:
+                    return cached
     except Exception:
         pass
 
@@ -138,6 +178,7 @@ def analyze_source_audio(source_path: Path, out_json: Path) -> dict[str, Any]:
         "peakRmsDb": -96.0,
         "meanRmsDb": -96.0,
         "activeAudioWindows": [],
+        "audioFilePath": "",
         "hint": "无音轨或未安装音频解码器",
     }
     if av is None:
@@ -153,42 +194,60 @@ def analyze_source_audio(source_path: Path, out_json: Path) -> dict[str, Any]:
 
             summary["hasAudioTrack"] = True
             resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
-            bucket_samples = 4000  # 0.25s at 16kHz
-            sum_sq = 0
-            max_abs = 0
-            count = 0
-            bucket_idx = 0
+            bucket_bytes_target = 4000 * 2  # 0.25s at 16kHz 16-bit mono
+            pcm_buf = bytearray()
+            wav_chunks: list[bytes] | None = [] if out_wav is not None else None
             bucket_dbs: list[tuple[int, float, float]] = []
-            total_sum_sq = 0
+            bucket_idx = 0
+            total_sum_sq = 0.0
             total_samples = 0
+
+            def _score_bucket(chunk: bytes, idx: int) -> None:
+                nonlocal total_sum_sq, total_samples
+                ns = len(chunk) // 2
+                if ns <= 0:
+                    return
+                if audioop is not None:
+                    rms_val = audioop.rms(chunk, 2)
+                    pk_val = audioop.max(chunk, 2)
+                    total_sum_sq += float(rms_val * rms_val) * ns
+                else:
+                    pcm = memoryview(chunk).cast("h")
+                    s_sq = sum(int(x) * int(x) for x in pcm)
+                    pk_val = max((abs(int(x)) for x in pcm), default=0)
+                    rms_val = math.sqrt(s_sq / ns)
+                    total_sum_sq += s_sq
+                total_samples += ns
+                rms_db = 20.0 * math.log10(max(rms_val / 32768.0, 1e-5))
+                pk_db = 20.0 * math.log10(max(pk_val / 32768.0, 1e-5))
+                bucket_dbs.append((idx, round(rms_db, 1), round(pk_db, 1)))
 
             for frame in container.decode(audio=0):
                 for out_frame in resampler.resample(frame):
-                    pcm = memoryview(out_frame.planes[0]).cast("h")
-                    for sample in pcm:
-                        asmp = abs(int(sample))
-                        sq = asmp * asmp
-                        sum_sq += sq
-                        if asmp > max_abs:
-                            max_abs = asmp
-                        count += 1
-                        total_sum_sq += sq
-                        total_samples += 1
-                        if count >= bucket_samples:
-                            rms = math.sqrt(sum_sq / count) / 32768.0
-                            rms_db = 20.0 * math.log10(max(rms, 1e-5))
-                            pk_db = 20.0 * math.log10(max(max_abs / 32768.0, 1e-5))
-                            bucket_dbs.append((bucket_idx, round(rms_db, 1), round(pk_db, 1)))
-                            bucket_idx += 1
-                            sum_sq = 0
-                            max_abs = 0
-                            count = 0
+                    raw_bytes = bytes(out_frame.planes[0])
+                    if wav_chunks is not None:
+                        wav_chunks.append(raw_bytes)
+                    pcm_buf.extend(raw_bytes)
+                    while len(pcm_buf) >= bucket_bytes_target:
+                        _score_bucket(bytes(pcm_buf[:bucket_bytes_target]), bucket_idx)
+                        del pcm_buf[:bucket_bytes_target]
+                        bucket_idx += 1
 
-            if count > 0:
-                rms = math.sqrt(sum_sq / count) / 32768.0
-                rms_db = 20.0 * math.log10(max(rms, 1e-5))
-                pk_db = 20.0 * math.log10(max(max_abs / 32768.0, 1e-5))
-                bucket_dbs.append((bucket_idx, round(rms_db, 1), round(pk_db, 1)))
+            if len(pcm_buf) >= 2:
+                if len(pcm_buf) % 2:
+                    pcm_buf.pop()
+                _score_bucket(bytes(pcm_buf), bucket_idx)
+
+            if out_wav is not None and wav_chunks:
+                out_wav.parent.mkdir(parents=True, exist_ok=True)
+                tmp_wav = out_wav.with_name(f".{out_wav.name}.tmp")
+                with wave.open(str(tmp_wav), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(b"".join(wav_chunks))
+                tmp_wav.replace(out_wav)
+                summary["audioFilePath"] = str(out_wav)
 
             if total_samples > 0:
                 summary["durationSec"] = round(total_samples / 16000.0, 2)
@@ -219,12 +278,14 @@ def analyze_source_audio(source_path: Path, out_json: Path) -> dict[str, Any]:
             summary["activeAudioWindows"] = [
                 f"{s:.2f}-{e:.2f}s (peak {p:.1f} dBFS)" for s, e, p in active_spans[:12]
             ]
+            wav_kb = round(out_wav.stat().st_size / 1024, 1) if (out_wav and out_wav.is_file()) else 0.0
+            audio_note = f"可直接用 read_file 听极轻量的 {out_wav.name}（{wav_kb} KB，云端直听）" if wav_kb else "用 read_file 听原片"
             if not active_spans:
-                summary["hint"] = "音轨能量全程低于 -42 dBFS（极静或无明显人声），仍请快速核对是否只有轻微环境音。"
+                summary["hint"] = "音轨能量全程低于 -42 dBFS（极静或无明显人声），按轻环境音处理即可；严禁跑本地 Whisper/ASR。"
             else:
                 summary["hint"] = (
                     f"检测到 {len(active_spans)} 段有效声波窗口（峰值 {summary['peakRmsDb']} dBFS），"
-                    "请用 read_file 听原片确认其中是动作 SFX 还是清晰对白。"
+                    f"请{audio_note}确认其中是动作 SFX 还是清晰对白；严禁跑本地 faster-whisper/PyTorch。"
                 )
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -416,8 +477,14 @@ def prepare_shot_artifacts(
         kf_path = render_source_keyframes(src_path, shot_dir / "source_keyframes.jpg")
         if kf_path is not None:
             out["sourceKeyframesPath"] = str(kf_path)
-        audio_info = analyze_source_audio(src_path, shot_dir / "source_audio_summary.json")
+        audio_info = analyze_source_audio(
+            src_path,
+            shot_dir / "source_audio_summary.json",
+            out_wav=shot_dir / "source_audio.wav",
+        )
         out["sourceAudioSummary"] = audio_info
+        if audio_info.get("audioFilePath"):
+            out["sourceAudioPath"] = audio_info["audioFilePath"]
 
     task_type = str(shot.get("processingTaskType") or shot.get("status") or "")
     if str(shot.get("platform") or "").lower() == "jimeng" and task_type in {"queued", "recheck_requested"}:

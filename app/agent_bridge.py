@@ -21,11 +21,13 @@ Performance & safety features:
 from __future__ import annotations
 
 import argparse
+import codecs
 from concurrent.futures import Future, ThreadPoolExecutor
 import fcntl
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -96,6 +98,10 @@ def _load_bridge_settings() -> dict[str, Any]:
     return {
         "workers": _int_opt("workers", "WASH_BRIDGE_WORKERS", 4, 1, 6),
         "timeoutSec": _int_opt("timeoutSec", "WASH_BRIDGE_AGY_TIMEOUT", 1500, 120, 3600),
+        "idleTimeoutSec": _int_opt("idleTimeoutSec", "WASH_BRIDGE_IDLE_TIMEOUT", 300, 60, 1200),
+        "heavyIdleTimeoutSec": _int_opt("heavyIdleTimeoutSec", "WASH_BRIDGE_HEAVY_IDLE_TIMEOUT", 540, 120, 1500),
+        "orphanIdleSec": _int_opt("orphanIdleSec", "WASH_BRIDGE_ORPHAN_IDLE", 65, 30, 600),
+        "autoRecoverStalls": _bool_opt("autoRecoverStalls", "WASH_BRIDGE_AUTO_RECOVER", True),
         "resumeByShot": _bool_opt("resumeByShot", "WASH_BRIDGE_RESUME_SHOT", True),
         "fastPathEnabled": _bool_opt("fastPathEnabled", "WASH_BRIDGE_FASTPATH", True),
         "prePrepEnabled": _bool_opt("prePrepEnabled", "WASH_BRIDGE_PREPREP", True),
@@ -340,6 +346,13 @@ def _build_worker_prompt(
         "若收到 HTTP 409 Conflict 说明任务已被用户新操作取代，立刻停止。\n"
     )
 
+    lightweight_rule = (
+        "6. **严禁空转与消耗本机算力（极重要）**：\n"
+        "   - 听音辨别对白或 SFX 时，优先直接用 `read_file` 读取极轻量的 `prepped.sourceAudioPath`（16kHz 单声道短 WAV，走云端多模态听音，零本机算力）；**严禁在本机调用 `faster-whisper` / `Whisper` / `PyTorch` / `Silero VAD` 或任何离线语音模型**！\n"
+        "   - 看画面直接读取 `prepped.sourceKeyframesPath` 关键帧拼图（如需微查再读 `sourceVideo`），**禁止手写 Python/ffmpeg/PyAV 脚本重新大批量抽原片帧**；\n"
+        "   - **禁止**翻读 `server.py`、`store.py`、`jimeng_bridge.py` 等控制台底层源码，所有可用字段已完整在下方 JSON 与 `wash-queue-console` / `dreamina-canvas --format json schema` 中给出。\n\n"
+    )
+
     if is_jimeng:
         skill_list = "（`dreamina-canvas-cli`、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`）"
         exec_rules = (
@@ -347,7 +360,8 @@ def _build_worker_prompt(
             f"2. {chrome_lock_rule}"
             "3. 若需积分确认请严格遵循 `credits-and-hitl.md`，并将 `nodeId` / `submitId` / `selectedResourceId`（严禁保存 token 或凭据）写入 `jimengMeta`；向用户交付样片时须明确提醒最长存储 7 天。\n"
             f"4. {callback_rule}"
-            "5. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n\n"
+            "5. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n"
+            f"{lightweight_rule}"
         )
     else:
         skill_list = "（`libtv-seedance-batch`、`seedance-video-recreation`、`seedance-video-prompts`、`libtv-cli`）"
@@ -355,7 +369,8 @@ def _build_worker_prompt(
             "1. 多路并行时严禁调用 `libtv group use`，所有 `libtv` 命令显式传 `-p <projectUuid>`（与 `-g <groupKey>`）。\n"
             f"2. {chrome_lock_rule}"
             f"3. {callback_rule}"
-            "4. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n\n"
+            "4. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n"
+            f"{lightweight_rule}"
         )
 
     if is_resume:
@@ -437,8 +452,37 @@ def _describe_stream_event(evt: dict[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
+SAFE_AUTO_RETRY_TASKS = {"queued", "feedback_queued", "recheck_requested", "prompt_update_requested"}
+
+
+def _is_auto_retryable_issue(err_msg: str) -> bool:
+    low = (err_msg or "").lower()
+    if not low:
+        return False
+    # Never auto-retry policy/auth/credits/model errors or manual cancels
+    if any(k in low for k in ("已被用户手动中止", "invalid model", "401", "403", "unauthorized", "login", "insufficient", "credit", "safety", "policy")):
+        return False
+    return any(
+        k in low
+        for k in (
+            "idle_stall",
+            "print timeout",
+            "执行超时",
+            "timeout",
+            "timed out",
+            "econnreset",
+            "connection",
+            "network",
+            "502",
+            "503",
+            "504",
+            "agy exited with code",
+        )
+    )
+
+
 class BridgeRuntime:
-    """Coordinates per-shot telemetry, sessions, fast-paths & parallel `agy -p` execution."""
+    """Coordinates per-shot telemetry, sessions, fast-paths, watchdogs & parallel `agy -p` execution."""
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url
@@ -446,8 +490,9 @@ class BridgeRuntime:
         self._conv_lock = threading.Lock()
         self._active: dict[str, Future[None]] = {}
         self._worker_states: dict[str, dict[str, Any]] = {}
-        self._worker_procs: dict[str, subprocess.Popen[str]] = {}
+        self._worker_procs: dict[str, subprocess.Popen[Any]] = {}
         self._cancelled_tokens: set[str] = set()
+        self._auto_retried_counts: dict[str, int] = {}
         self._last_conv_id = ""
         self._last_run_at = ""
         self._last_error = ""
@@ -606,6 +651,76 @@ class BridgeRuntime:
         except Exception:
             return False
 
+    def _release_owner_lock(self, owner: str, lock_name: str = "chrome_ui") -> None:
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=5.0) as client:
+                client.post(f"/api/agent/locks/{lock_name}/release-owner", json={"owner": owner})
+        except Exception:
+            pass
+
+    def _report_progress_note(self, shot_id: str, claim_token: str, summary: str) -> None:
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=6.0) as client:
+                client.post(
+                    f"/api/shots/{shot_id}/agent-update",
+                    json={"claimToken": claim_token, "agentSummary": summary},
+                )
+        except Exception:
+            pass
+
+    def _rescue_orphaned_shot(self, client: httpx.Client, shot: dict[str, Any], runtime: dict[str, Any]) -> None:
+        sid = str(shot.get("id") or "")
+        claim_token = str(shot.get("claimToken") or "")
+        task_type = str(shot.get("processingTaskType") or "")
+        if not sid or not claim_token:
+            return
+        self._release_owner_lock(sid)
+        with self._lock:
+            retried = self._auto_retried_counts.get(sid, 0)
+        can_auto_retry = (
+            bool(SETTINGS["autoRecoverStalls"])
+            and task_type in SAFE_AUTO_RETRY_TASKS
+            and retried < 1
+        )
+        if can_auto_retry:
+            with self._lock:
+                self._auto_retried_counts[sid] = retried + 1
+            self._clear_shot_conversation_id(sid)
+            _log(f"orphan watchdog auto-retrying {sid} (task={task_type}, idle={runtime.get('idleSec')}s)")
+            client.post(
+                f"/api/shots/{sid}/retry-processing",
+                json={
+                    "mode": "retry",
+                    "actor": "system",
+                    "reason": (
+                        f"检测到后台 Worker 已失联（静止 {runtime.get('idleSec', 0)} 秒无存活子进程），"
+                        "已自动清理锁并重新入队恢复（自动干预 1/1）…"
+                    ),
+                },
+                timeout=8.0,
+            )
+            return
+
+        _log(f"orphan watchdog marking interrupted {sid} (task={task_type}, idle={runtime.get('idleSec')}s)")
+        diag = diagnose_error(
+            "interrupted: 检测到后台 Worker 进程已中断（无活跃子进程认领），已自动退出假死状态。",
+            failed_task=task_type,
+            platform=str(shot.get("platform") or ""),
+        )
+        client.post(
+            f"/api/shots/{sid}/agent-update",
+            json={
+                "claimToken": claim_token,
+                "status": "error",
+                "errorReason": diag["errorReason"],
+                "errorSolution": diag["errorSolution"],
+                "errorDetail": diag["errorDetail"],
+                "agentSummary": diag["errorReason"],
+                "revisionSummary": f"系统自动干预：检测到无活跃 Worker 孤儿状态（静止 {runtime.get('idleSec', 0)}s），已退出假死并标为「进程中断」",
+            },
+            timeout=8.0,
+        )
+
     def _ensure_not_stuck_processing(self, shot_id: str, claim_token: str, reason: str) -> None:
         try:
             with httpx.Client(base_url=self.base_url, timeout=10.0) as client:
@@ -672,8 +787,10 @@ class BridgeRuntime:
         conv_id = ""
         err_msg = ""
         last_status = ""
-        proc: subprocess.Popen[str] | None = None
+        proc: subprocess.Popen[Any] | None = None
         last_step_append_ts = 0.0
+        task_type = str(shot.get("processingTaskType") or "")
+        current_phase = "启动 agy 进程"
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -682,34 +799,34 @@ class BridgeRuntime:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                text=False,
+                bufsize=0,
             )
             with self._lock:
                 self._worker_procs[shot_id] = proc
             self._update_worker(
                 shot_id,
                 agyPid=proc.pid,
-                phase="启动 agy 进程",
+                phase=current_phase,
                 lastNote=f"已拉起后台 Worker (PID {proc.pid})",
                 step_note=f"启动 agy 进程 (PID {proc.pid}, model={model or 'default'})",
             )
-            deadline = time.monotonic() + AGY_TIMEOUT_SEC + 60.0
+            start_m = time.monotonic()
+            last_output_m = start_m
+            deadline = start_m + AGY_TIMEOUT_SEC + 60.0
             assert proc.stdout is not None
-            for raw_line in proc.stdout:
-                with self._lock:
-                    cancelled = bool(claim_token and claim_token in self._cancelled_tokens)
-                if cancelled:
-                    err_msg = "已被用户手动中止重置"
-                    _terminate_proc_silently(proc)
-                    break
-                line = raw_line.strip()
+            fd = proc.stdout.fileno()
+            os.set_blocking(fd, False)
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            line_buf = ""
+            sel = selectors.DefaultSelector()
+            sel.register(fd, selectors.EVENT_READ)
+
+            def _consume_line(raw_text: str) -> None:
+                nonlocal conv_id, err_msg, last_status, last_step_append_ts, current_phase
+                line = raw_text.strip()
                 if not line:
-                    continue
-                if time.monotonic() > deadline:
-                    err_msg = f"执行超时（超过 {AGY_TIMEOUT_SEC}s）"
-                    _terminate_proc_silently(proc)
-                    break
+                    return
                 if line.startswith("{"):
                     try:
                         evt = json.loads(line)
@@ -721,6 +838,8 @@ class BridgeRuntime:
                             self._update_worker(shot_id, conversationId=conv_id)
                             _log(f"{shot_id} agy conversation_id={conv_id} (resumed={bool(resume_conv_id)})")
                         phase_str, note_str = _describe_stream_event(evt)
+                        if phase_str:
+                            current_phase = phase_str
                         if phase_str or note_str:
                             now_m = time.monotonic()
                             su = evt.get("step_update") if isinstance(evt.get("step_update"), dict) else {}
@@ -748,6 +867,63 @@ class BridgeRuntime:
                         self._update_worker(shot_id, lastNote=line[:90])
                 else:
                     self._update_worker(shot_id, lastNote=line[:90])
+
+            try:
+                eof_reached = False
+                while not eof_reached:
+                    if _STOP_EVENT.is_set():
+                        err_msg = "后台桥接服务正在停止"
+                        _terminate_proc_silently(proc)
+                        break
+                    with self._lock:
+                        cancelled = bool(claim_token and claim_token in self._cancelled_tokens)
+                    if cancelled:
+                        err_msg = "已被用户手动中止重置"
+                        _terminate_proc_silently(proc)
+                        break
+
+                    now_m = time.monotonic()
+                    if now_m > deadline:
+                        err_msg = f"执行超时（超过 {AGY_TIMEOUT_SEC}s）"
+                        _terminate_proc_silently(proc)
+                        break
+
+                    idle_elapsed = now_m - last_output_m
+                    idle_limit = (
+                        SETTINGS["heavyIdleTimeoutSec"]
+                        if (task_type in {"run_requested", "final_requested"} and current_phase == "执行工具")
+                        else SETTINGS["idleTimeoutSec"]
+                    )
+                    if idle_elapsed >= idle_limit:
+                        _log(f"{shot_id} idle watchdog triggered after {int(idle_elapsed)}s without output (phase={current_phase}); terminating")
+                        err_msg = f"idle_stall: 超过 {int(idle_elapsed)} 秒无新动作输出（阶段：{current_phase}），已由卡住看门狗自动中止"
+                        _terminate_proc_silently(proc)
+                        break
+
+                    events = sel.select(timeout=2.0)
+                    if not events:
+                        if proc.poll() is not None and (time.monotonic() - last_output_m) >= 3.0:
+                            eof_reached = True
+                        continue
+
+                    while True:
+                        try:
+                            chunk = os.read(fd, 65536)
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            eof_reached = True
+                            break
+                        last_output_m = time.monotonic()
+                        line_buf += decoder.decode(chunk, final=False)
+                        while "\n" in line_buf:
+                            raw_line, line_buf = line_buf.split("\n", 1)
+                            _consume_line(raw_line)
+                line_buf += decoder.decode(b"", final=True)
+                if line_buf.strip():
+                    _consume_line(line_buf)
+            finally:
+                sel.close()
             ret = proc.wait(timeout=15)
             with self._lock:
                 if claim_token and claim_token in self._cancelled_tokens and not err_msg:
@@ -857,6 +1033,44 @@ class BridgeRuntime:
                         resume_conv_id="",
                         claim_token=claim_token,
                     )
+            else:
+                with self._lock:
+                    user_cancelled = claim_token in self._cancelled_tokens
+                    auto_retried = self._auto_retried_counts.get(shot_id, 0)
+                if (
+                    not user_cancelled
+                    and not resume_id
+                    and SETTINGS["autoRecoverStalls"]
+                    and task_type in SAFE_AUTO_RETRY_TASKS
+                    and auto_retried < 1
+                    and (err_msg or (last_status and last_status != "SUCCESS"))
+                    and _is_auto_retryable_issue(err_msg or last_status)
+                    and self._claim_still_ours(shot_id, claim_token)
+                ):
+                    with self._lock:
+                        self._auto_retried_counts[shot_id] = auto_retried + 1
+                    _log(f"{shot_id} transient stall/failure ({err_msg or last_status}); auto-intervening once with clean session")
+                    self._release_owner_lock(shot_id)
+                    self._clear_shot_conversation_id(shot_id)
+                    msg_auto = f"检测到卡住或异常中断（{err_msg or last_status}），已自动清理锁并切换干净会话重试（自动干预 1/1）…"
+                    self._report_progress_note(shot_id, claim_token, msg_auto)
+                    self._update_worker(
+                        shot_id,
+                        phase="自动干预重试",
+                        resumed=False,
+                        lastNote="检测到卡住/瞬时异常，已自动释放锁并重开会话重试（1/1）…",
+                        step_note=f"触发自动干预重试（原因：{(err_msg or last_status)[:60]}）",
+                    )
+                    retry_prompt = _build_worker_prompt(shot, self.base_url, prepped=prepped, is_resume=False)
+                    conv_id, err_msg, last_status = self._invoke_agy_once(
+                        shot,
+                        retry_prompt,
+                        agy_bin=agy_bin,
+                        model=model,
+                        effort=effort,
+                        resume_conv_id="",
+                        claim_token=claim_token,
+                    )
         except Exception as exc:
             err_msg = str(exc)
         finally:
@@ -871,6 +1085,10 @@ class BridgeRuntime:
                     self._last_conv_id = conv_id
                 if not was_cancelled:
                     self._last_error = err_msg
+                if not (err_msg or (last_status and last_status != "SUCCESS")):
+                    self._auto_retried_counts.pop(shot_id, None)
+            if was_cancelled or err_msg or (last_status and last_status != "SUCCESS"):
+                self._release_owner_lock(shot_id)
             if was_cancelled:
                 _log(f"worker cancelled by user reset shot={shot_id}")
             elif err_msg or (last_status and last_status != "SUCCESS"):
@@ -895,6 +1113,8 @@ class BridgeRuntime:
         hb_thread.start()
 
         since_seq = 0
+        started_m = time.monotonic()
+        last_orphan_scan_m = 0.0
         try:
             with httpx.Client(base_url=self.base_url, timeout=30.0) as client:
                 while not _STOP_EVENT.is_set():
@@ -907,6 +1127,31 @@ class BridgeRuntime:
                         if st.get("bridgePaused"):
                             _STOP_EVENT.wait(2.0)
                             continue
+
+                        now_scan_m = time.monotonic()
+                        if (now_scan_m - started_m) >= 30.0 and (now_scan_m - last_orphan_scan_m) >= 15.0:
+                            last_orphan_scan_m = now_scan_m
+                            proc_ids = [str(x) for x in (st.get("processingShotIds") or [])]
+                            active_now = set(self.active_ids())
+                            for psid in proc_ids:
+                                if psid in active_now:
+                                    continue
+                                try:
+                                    r_rt = client.get(f"/api/shots/{psid}/agent-status", timeout=5.0)
+                                    if r_rt.status_code != 200:
+                                        continue
+                                    rt_data = r_rt.json()
+                                    rt_info = rt_data.get("runtime") or {}
+                                    rt_shot = rt_data.get("shot") or {}
+                                    if (
+                                        rt_info.get("status") == "processing"
+                                        and int(rt_info.get("bridgePid") or 0) == os.getpid()
+                                        and rt_info.get("agyPidAlive") is not True
+                                        and int(rt_info.get("idleSec") or 0) >= SETTINGS["orphanIdleSec"]
+                                    ):
+                                        self._rescue_orphaned_shot(client, rt_shot, rt_info)
+                                except Exception as exc:
+                                    _log(f"orphan check error for {psid}: {exc}")
 
                         with self._lock:
                             running_count = len(self._active)

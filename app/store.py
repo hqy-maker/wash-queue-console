@@ -121,18 +121,56 @@ TASK_TYPE_LABELS: dict[str, str] = {
     "processing": "后台队列处理",
 }
 
+ERROR_TAG_LABELS: dict[str, str] = {
+    "model_conflict": "参数冲突",
+    "stalled": "卡住中断",
+    "interrupted": "进程中断",
+    "timeout": "运行超时",
+    "rate_limit": "配额/限流",
+    "network_error": "网络中断",
+    "auth_expired": "登录失效",
+    "credits_insufficient": "积分不足",
+    "moderation": "内容拦截",
+    "asset_missing": "素材缺失",
+    "unknown_error": "执行异常",
+}
+
 ERROR_DIAGNOSIS_RULES: tuple[tuple[str, tuple[str, ...], str, str], ...] = (
     (
-        "network_error",
-        ("network issue", "connection", "connect", "econnreset", "timed out", "502", "503", "504", "internal (code 500)", "internal error"),
-        "与后台 AI 服务或目标平台（{platform}）的网络连接临时中断（未造成额外扣分，提示词、涂白与已出样片均保留完好）。",
-        "① 直接点击下方「↻ 重试刚才操作」重新入队执行；② 若连续两次报相同网络错误，请检查网络/代理连接状态或重启桌面端后再试。",
+        "model_conflict",
+        ("invalid model selection", "conflicts with --effort", "conflicts with"),
+        "后台 CLI 选用的模型名与推理档位参数不兼容（{platform} 未消耗积分，请升级或重试自检）。",
+        "① 请点击下方「🛠 重新自检修复」或「↻ 重试刚才操作」；② 若刚手动改过 ~/.wash_console/bridge.json 模型配置，请核对型号后缀与 effort 档位。",
+    ),
+    (
+        "stalled",
+        ("idle_stall", "卡住看门狗", "无新动作", "疑似卡住", "疑似卡死", "stalled"),
+        "Worker 在执行过程中长时间无任何新响应（可能卡在浏览器弹窗、网络流阻塞或平台无响应），已被自动看门狗安全中止。",
+        "① 若此前已提交生成，可先点顶部「↓ 同步成片」确认云端状态；② 随后点下方「↻ 重试刚才操作」或「🛠 重新自检修复」继续执行。",
+    ),
+    (
+        "interrupted",
+        ("interrupted", "未检测到活跃 worker", "进程中断", "孤儿", "409 conflict"),
+        "后台处理进程在回写结果前被外部中断、重叠覆盖或因服务重启与任务脱钩（已有本地成片与提示词均保留完整）。",
+        "① 若是转 1080P 或生图环节，先点击「↓ 同步成片」或查看本地目录确认是否其实已下载；② 再点「↻ 重试刚才操作」或「🛠 重新自检修复」。",
     ),
     (
         "timeout",
         ("print timeout", "15m0s", "执行超时", "timeout"),
         "本轮后台处理耗时超过单次等待上限（云端生成任务可能仍在排队或其实已出片）。",
         "① 若此前已点过生成，可先点击「↓ 同步成片」拉取最新状态；② 再点击下方「↻ 重试刚才操作」（支持按原任务 ID 续查进度，不会重复扣分）。",
+    ),
+    (
+        "rate_limit",
+        ("429", "rate limit", "too many requests", "quota", "exhausted", "capacity"),
+        "当前大模型账号或 {platform} 接口触发并发配额/频率限制，临时无法继续响应。",
+        "① 建议稍等 1–2 分钟或点击右上角 AI 状态切换并发节奏；② 恢复后点击下方「↻ 重试刚才操作」继续执行。",
+    ),
+    (
+        "network_error",
+        ("network issue", "connection", "connect", "econnreset", "timed out", "502", "503", "504", "internal (code 500)", "internal error"),
+        "与后台 AI 服务或目标平台（{platform}）的网络连接临时中断（未造成额外扣分，提示词、涂白与已出样片均保留完好）。",
+        "① 直接点击下方「↻ 重试刚才操作」重新入队执行；② 若连续两次报相同网络错误，请检查网络/代理连接状态或重启桌面端后再试。",
     ),
     (
         "auth_expired",
@@ -167,7 +205,7 @@ def diagnose_error(
     failed_task: str = "",
     platform: str = "",
 ) -> dict[str, str]:
-    """Classify raw worker/CLI errors into concise cause + actionable recovery guidance."""
+    """Classify raw worker/CLI errors into concise cause, tag label, and recovery guidance."""
     raw = (raw_message or "").strip()
     lower = raw.lower()
     plat_label = get_platform_label(platform) if platform else "目标平台"
@@ -193,6 +231,7 @@ def diagnose_error(
 
     return {
         "errorCode": code,
+        "errorTag": ERROR_TAG_LABELS.get(code, "执行异常"),
         "errorReason": reason,
         "errorSolution": solution,
         "errorDetail": raw,
@@ -556,14 +595,30 @@ def _decorate_shot_payload(
             failed_task = "feedback_queued"
         raw_detail = str(out.get("errorDetail") or out.get("agentSummary") or "").strip()
         diag = diagnose_error(raw_detail, failed_task=failed_task, platform=plat)
-        out["errorCode"] = str(out.get("errorCode") or diag["errorCode"])
+        saved_code = str(out.get("errorCode") or "").strip()
+        resolved_code = (
+            diag["errorCode"]
+            if (not saved_code or (saved_code == "unknown_error" and diag["errorCode"] != "unknown_error"))
+            else saved_code
+        )
+        out["errorCode"] = resolved_code
+        if saved_code == "unknown_error" and resolved_code != "unknown_error":
+            out["errorTag"] = ERROR_TAG_LABELS.get(resolved_code, diag["errorTag"])
+            out["errorReason"] = diag["errorReason"]
+            out["errorSolution"] = diag["errorSolution"]
+        else:
+            out["errorTag"] = (
+                str(out.get("errorTag") or "").strip()
+                or ERROR_TAG_LABELS.get(resolved_code, diag["errorTag"])
+            )
+            out["errorReason"] = str(out.get("errorReason") or "").strip() or diag["errorReason"]
+            out["errorSolution"] = str(out.get("errorSolution") or "").strip() or diag["errorSolution"]
         out["errorDetail"] = raw_detail or diag["errorDetail"]
-        out["errorReason"] = str(out.get("errorReason") or "").strip() or diag["errorReason"]
-        out["errorSolution"] = str(out.get("errorSolution") or "").strip() or diag["errorSolution"]
         out["lastFailedTask"] = failed_task
         out["lastFailedTaskLabel"] = TASK_TYPE_LABELS.get(failed_task, "重检同步" if not failed_task else failed_task)
     else:
         out["errorCode"] = ""
+        out["errorTag"] = ""
         out["errorReason"] = ""
         out["errorSolution"] = ""
         out["errorDetail"] = ""
@@ -2634,7 +2689,7 @@ class QueueStore:
 
     @staticmethod
     def _clear_error_fields(shot: dict[str, Any]) -> None:
-        for k in ("errorCode", "errorReason", "errorSolution", "errorDetail", "lastFailedTask"):
+        for k in ("errorCode", "errorTag", "errorReason", "errorSolution", "errorDetail", "lastFailedTask"):
             shot.pop(k, None)
 
     @staticmethod
@@ -2708,10 +2763,19 @@ class QueueStore:
                 return _decorate_shot_payload(shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
-    def reset_stuck_shot(self, shot_id: str, *, mode: str = "retry") -> dict[str, Any]:
+    def reset_stuck_shot(
+        self,
+        shot_id: str,
+        *,
+        mode: str = "retry",
+        reason: str = "",
+        actor: str = "user",
+    ) -> dict[str, Any]:
         """Abort/unstick a processing or stalled queued shot and re-queue or restore safely."""
         sid = sanitize_shot_id(shot_id)
         clean_mode = (mode or "retry").strip().lower()
+        clean_actor = "system" if (actor or "").strip().lower() == "system" else "user"
+        clean_reason = (reason or "").strip()
         if clean_mode not in {"retry", "recheck", "restore"}:
             clean_mode = "retry"
         with self._lock:
@@ -2760,11 +2824,12 @@ class QueueStore:
 
                 self._clear_claim_fields(shot)
                 self._clear_error_fields(shot)
+                final_summary = clean_reason or summary
                 shot["status"] = target_status
-                shot["agentSummary"] = summary
+                shot["agentSummary"] = final_summary
                 shot["updatedAt"] = now_iso()
                 shot.setdefault("revisions", []).append(
-                    {"at": now_iso(), "actor": "user", "summary": summary}
+                    {"at": now_iso(), "actor": clean_actor, "summary": final_summary}
                 )
                 self._save_queue(
                     q,
@@ -3115,6 +3180,7 @@ class QueueStore:
                     diag = diagnose_error(raw_detail, failed_task=failed_task, platform=shot.get("platform") or "")
                     shot["lastFailedTask"] = failed_task
                     shot["errorCode"] = diag["errorCode"]
+                    shot["errorTag"] = diag["errorTag"]
                     shot["errorDetail"] = str(payload.get("errorDetail") or diag["errorDetail"] or raw_detail)
                     shot["errorReason"] = str(payload.get("errorReason") or "").strip() or diag["errorReason"]
                     shot["errorSolution"] = str(payload.get("errorSolution") or "").strip() or diag["errorSolution"]

@@ -3863,3 +3863,17 @@ button {
 .update-repo-link:hover {
   text-decoration: underline;
 }
+
+.error-banner-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pill-err-tag {
+  background: var(--red-soft);
+  color: var(--red);
+  border: 1px solid rgba(239, 68, 68, 0.42);
+  font-weight: 700;
+}

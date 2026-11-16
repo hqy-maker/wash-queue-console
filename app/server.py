@@ -684,6 +684,22 @@ class ResourceLockManager:
             self._cv.notify_all()
             return {"ok": True, "released": True, "lock": key}
 
+    def release_by_owner(self, lock_name: str, owner: str) -> dict[str, Any]:
+        """Release `lock_name` only if currently held by `owner` (used on abort/stall cleanup)."""
+        key = self._clean_name(lock_name)
+        clean_owner = (owner or "").strip()[:80]
+        if not clean_owner:
+            return {"ok": True, "released": False, "lock": key, "reason": "empty_owner"}
+        with self._cv:
+            now = time.monotonic()
+            self._evict_expired_locked(now)
+            existing = self._locks.get(key)
+            if existing is None or existing.get("owner") != clean_owner:
+                return {"ok": True, "released": False, "lock": key, "reason": "not_held_by_owner"}
+            self._locks.pop(key, None)
+            self._cv.notify_all()
+            return {"ok": True, "released": True, "lock": key, "owner": clean_owner}
+
     def list_active(self) -> list[dict[str, Any]]:
         with self._cv:
             now = time.monotonic()
@@ -958,6 +974,10 @@ class LockReleaseReq(BaseModel):
     token: str = ""
 
 
+class LockOwnerReleaseReq(BaseModel):
+    owner: str = ""
+
+
 class HeartbeatReq(BaseModel):
     watcherId: str = "agy_bridge"
     mode: str = "bridge"
@@ -973,6 +993,8 @@ class HeartbeatReq(BaseModel):
 
 class RetryProcessingReq(BaseModel):
     mode: str = "retry"
+    reason: str = ""
+    actor: str = "user"
 
 
 class OpenShotChatReq(BaseModel):
@@ -1947,8 +1969,14 @@ def retry_processing_shot(shot_id: str, req: RetryProcessingReq | None = None) -
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     old_token = str(before_shot.get("claimToken") or "").strip()
     cancel_info = agent_presence.request_cancel(before_shot["id"], old_token)
+    resource_locks.release_by_owner("chrome_ui", before_shot["id"])
     try:
-        res = store.reset_stuck_shot(before_shot["id"], mode=body.mode)
+        res = store.reset_stuck_shot(
+            before_shot["id"],
+            mode=body.mode,
+            reason=body.reason,
+            actor=body.actor,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     updated_shot = res["shot"]
@@ -2029,6 +2057,16 @@ def release_agent_lock(lock_name: str, req: LockReleaseReq | None = None) -> Res
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if res.get("conflict"):
         return JSONResponse(status_code=409, content=res)
+    return JSONResponse(status_code=200, content=res)
+
+
+@app.post("/api/agent/locks/{lock_name}/release-owner")
+def release_agent_lock_by_owner(lock_name: str, req: LockOwnerReleaseReq | None = None) -> Response:
+    body = req or LockOwnerReleaseReq()
+    try:
+        res = resource_locks.release_by_owner(lock_name, owner=body.owner)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(status_code=200, content=res)
 
 
