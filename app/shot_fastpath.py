@@ -825,6 +825,24 @@ def inspect_dreamina_canvas_context(
     return result
 
 
+def _normalize_target_duration(raw: Any) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    s = str(raw).strip().lower()
+    for suffix in ("s", "秒"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    if s in {"", "auto", "none", "null", "0"}:
+        return None
+    try:
+        val = int(round(float(s)))
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    return max(4, min(30, val))
+
+
 def prepare_shot_artifacts(
     shot: dict[str, Any],
     *,
@@ -837,6 +855,9 @@ def prepare_shot_artifacts(
     shot_dir = SHOTS_DIR / sid
     shot_dir.mkdir(parents=True, exist_ok=True)
     out: dict[str, Any] = {"workMode": work_mode}
+    target_dur = _normalize_target_duration(shot.get("targetDuration"))
+    if target_dur is not None:
+        out["targetDuration"] = target_dur
 
     src_fp = str((shot.get("sourceVideo") or {}).get("filePath") or "").strip()
     if src_fp and work_mode != "video_creation":
@@ -923,7 +944,7 @@ def try_fastpath_prompt_update(
         model = str(gen.get("model") or jm.get("model") or "").strip()
         ratio = str(gen.get("ratio") or jm.get("ratio") or "").strip()
         resolution = str(gen.get("resolution") or jm.get("resolution") or "").strip()
-        duration = gen.get("durationSeconds") or jm.get("duration")
+        duration = _normalize_target_duration(shot.get("targetDuration")) or gen.get("durationSeconds") or jm.get("duration")
         count = int(gen.get("outputCount") or 1)
         refs = [r for r in (gen.get("references") or []) if isinstance(r, dict) and r.get("id")]
         existing_node_ids = {str(r.get("id") or "") for r in refs if r.get("kind") == "node"}
@@ -990,6 +1011,8 @@ def try_fastpath_prompt_update(
             meta_patch["draftVersion"] = draft_ver
         if quoted_max is not None:
             meta_patch["quotedMaxCredits"] = quoted_max
+        if duration:
+            meta_patch["duration"] = int(round(float(duration)))
 
         update_body: dict[str, Any] = {
             "claimToken": claim_token,
@@ -1181,14 +1204,12 @@ def try_fastpath_jimeng_run(
         if progress_cb:
             progress_cb(phase, msg)
 
-    # Sync pending manual prompt edits first if present cleanly
+    # Sync pending manual prompt edits or updated targetDuration cleanly before running
     pending_edit = str(shot.get("pendingPromptEdit") or "").strip()
-    if pending_edit:
-        if _UNRESOLVED_AT_RE.search(pending_edit):
+    explicit_dur = _normalize_target_duration(shot.get("targetDuration"))
+    if pending_edit or explicit_dur is not None:
+        if pending_edit and _UNRESOLVED_AT_RE.search(pending_edit):
             return {"handled": False, "reason": "pending_prompt_has_unresolved_at_mentions"}
-        sync_copy = dict(shot)
-        sync_copy["promptText"] = pending_edit
-        # Reuse node edit verification cleanly without finalizing status yet
         try:
             show_res = _run_dreamina_json(["node", "show", "--project-id", project_uuid, "--node-id", sample_node_id], timeout=25)
             nodes = (show_res.get("data") or {}).get("nodes") or []
@@ -1196,25 +1217,30 @@ def try_fastpath_jimeng_run(
             if not isinstance(node, dict):
                 return {"handled": False, "reason": "sample_node_not_found"}
             gen = node.get("generation") if isinstance(node.get("generation"), dict) else {}
-            refs = [r for r in (gen.get("references") or []) if isinstance(r, dict) and r.get("id")]
-            existing_node_ids = {str(r.get("id") or "") for r in refs if r.get("kind") == "node"}
-            if not set(_NODE_TAG_RE.findall(pending_edit)).issubset(existing_node_ids):
-                return {"handled": False, "reason": "pending_prompt_references_new_node"}
-            cmd = ["node", "edit", "video", "--project-id", project_uuid, "--node-id", sample_node_id, "--mode", str(gen.get("mode") or jm.get("mode") or "m2v"), "--prompt", pending_edit]
-            for flag, val in (("--model", gen.get("model") or jm.get("model")), ("--ratio", gen.get("ratio") or jm.get("ratio")), ("--resolution", gen.get("resolution") or jm.get("resolution"))):
-                if val:
-                    cmd.extend([flag, str(val)])
-            dur = gen.get("durationSeconds") or jm.get("duration")
-            if dur:
-                cmd.extend(["--duration", str(int(round(float(dur))))])
-            if int(gen.get("outputCount") or 1) > 0:
-                cmd.extend(["--count", str(int(gen.get("outputCount") or 1))])
-            for ref in refs:
-                cmd.extend(["--ref", f"{'res' if ref.get('kind') == 'resource' else 'node'}:{ref['id']}"])
-            _run_dreamina_json(cmd, timeout=35)
-            cur_prompt_file = str(shot.get("promptFilePath") or "").strip()
-            md_path = Path(cur_prompt_file) if cur_prompt_file else (workspace_root / "outputs" / f"{sid}_提示词.md")
-            _sync_prompt_markdown(md_path, sid, pending_edit, get_platform_label(platform))
+            node_dur = _normalize_target_duration(gen.get("durationSeconds"))
+            dur_changed = explicit_dur is not None and explicit_dur != node_dur
+            if pending_edit or dur_changed:
+                eff_prompt = pending_edit or str(shot.get("promptText") or gen.get("prompt") or "").strip()
+                refs = [r for r in (gen.get("references") or []) if isinstance(r, dict) and r.get("id")]
+                existing_node_ids = {str(r.get("id") or "") for r in refs if r.get("kind") == "node"}
+                if pending_edit and not set(_NODE_TAG_RE.findall(eff_prompt)).issubset(existing_node_ids):
+                    return {"handled": False, "reason": "pending_prompt_references_new_node"}
+                cmd = ["node", "edit", "video", "--project-id", project_uuid, "--node-id", sample_node_id, "--mode", str(gen.get("mode") or jm.get("mode") or "m2v"), "--prompt", eff_prompt]
+                for flag, val in (("--model", gen.get("model") or jm.get("model")), ("--ratio", gen.get("ratio") or jm.get("ratio")), ("--resolution", gen.get("resolution") or jm.get("resolution"))):
+                    if val:
+                        cmd.extend([flag, str(val)])
+                dur = explicit_dur or gen.get("durationSeconds") or jm.get("duration")
+                if dur:
+                    cmd.extend(["--duration", str(int(round(float(dur))))])
+                if int(gen.get("outputCount") or 1) > 0:
+                    cmd.extend(["--count", str(int(gen.get("outputCount") or 1))])
+                for ref in refs:
+                    cmd.extend(["--ref", f"{'res' if ref.get('kind') == 'resource' else 'node'}:{ref['id']}"])
+                _run_dreamina_json(cmd, timeout=35)
+                if pending_edit:
+                    cur_prompt_file = str(shot.get("promptFilePath") or "").strip()
+                    md_path = Path(cur_prompt_file) if cur_prompt_file else (workspace_root / "outputs" / f"{sid}_提示词.md")
+                    _sync_prompt_markdown(md_path, sid, eff_prompt, get_platform_label(platform))
         except Exception as exc:
             return {"handled": False, "reason": f"prompt_sync_fallback: {exc}"}
 

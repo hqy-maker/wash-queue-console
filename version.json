@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.15",
+  "version": "2026.11.16.16",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T23:32:19+08:00",
-  "changelog": "新增「洗视频 / 正常生成」顶部滑块切换，正常生成支持无原片纯文生(t2v)与纯图生(m2v)，Worker仅加载seedance-video-prompts并彻底跳过抽帧与720P深度捕捉，极速出词",
+  "publishedAt": "2026-11-16T23:41:21+08:00",
+  "changelog": "新增「⏱️ 生成时长」控制块（自动 + 4-30s 快捷标签/滑块/输入框 + 详情页可调），支持传给即梦 --duration 与 Worker 提示词节奏约束并在快速通道自动同步画布",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

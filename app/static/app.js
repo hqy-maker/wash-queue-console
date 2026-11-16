@@ -173,6 +173,7 @@ const state = {
       localStorage.getItem("wash_builder_work_mode") === "video_creation"
         ? "video_creation"
         : "video_wash",
+    targetDuration: loadSavedBuilderDuration(),
     shotId: "",
     shotIdTouched: false,
     title: "",
@@ -275,8 +276,8 @@ function shotMediaSubtitle(s) {
   if (s.sourceVideo?.mediaUrl || s.sourceVideo?.filePath) {
     return mediaDisplayName(s.sourceVideo, "原片视频");
   }
-  if (s.compImage) return "仅图参考";
-  if (s.workMode === "video_creation") return "纯文生视频";
+  if (s.compImage) return s.targetDuration ? `仅图参考 · ${s.targetDuration}s` : "仅图参考";
+  if (s.workMode === "video_creation") return s.targetDuration ? `纯文生 · ${s.targetDuration}s` : "纯文生视频";
   return "";
 }
 
@@ -3752,6 +3753,138 @@ function renderBuilderPresetBodyHtml(presets, selectedPresetIds) {
   `;
 }
 
+function normalizeTargetDuration(raw) {
+  if (raw === null || raw === undefined || raw === "" || typeof raw === "boolean") return null;
+  const clean = String(raw).trim().toLowerCase().replace(/[s秒]+$/, "");
+  if (!clean || clean === "auto" || clean === "none" || clean === "null" || clean === "0") return null;
+  const n = Number(clean);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.max(4, Math.min(30, Math.round(n)));
+}
+
+function loadSavedBuilderDuration() {
+  try {
+    return normalizeTargetDuration(localStorage.getItem("wash_builder_target_duration"));
+  } catch {
+    return null;
+  }
+}
+
+function saveBuilderDuration(val) {
+  try {
+    const clean = normalizeTargetDuration(val);
+    if (clean) localStorage.setItem("wash_builder_target_duration", String(clean));
+    else localStorage.removeItem("wash_builder_target_duration");
+  } catch {}
+}
+
+function syncBuilderDurationUI(options = {}) {
+  const b = state.builder;
+  const isCreationMode = b.workMode === "video_creation";
+  const dur = normalizeTargetDuration(b.targetDuration);
+  b.targetDuration = dur;
+  saveBuilderDuration(dur);
+
+  const srcSug = !isCreationMode ? normalizeTargetDuration(b.videoItem?.meta?.suggestedDuration) : null;
+  const effectiveVal = dur || srcSug || 5;
+  const pct = (((effectiveVal - 4) / 26) * 100).toFixed(1);
+
+  const badgeEl = document.getElementById("builderDurationBadge");
+  if (badgeEl) {
+    badgeEl.className = `pill ${dur ? "pill-blue" : "pill-muted"}`;
+    badgeEl.textContent = dur
+      ? `${dur}s · 已指定`
+      : srcSug
+      ? `自动 · 原片 ${srcSug}s`
+      : isCreationMode
+      ? "自动 · 默认 5s"
+      : "自动 · 按原片";
+  }
+
+  const rangeEl = document.getElementById("builderDurationRange");
+  if (rangeEl) {
+    rangeEl.value = String(effectiveVal);
+    rangeEl.style.setProperty("--dur-pct", `${pct}%`);
+  }
+
+  const inputEl = document.getElementById("builderDurationInput");
+  if (inputEl && !options.skipInputValue) {
+    inputEl.value = dur !== null ? String(dur) : "";
+    inputEl.placeholder = String(effectiveVal);
+  } else if (inputEl) {
+    inputEl.placeholder = String(effectiveVal);
+  }
+
+  document.querySelectorAll("[data-duration-preset]").forEach((btn) => {
+    const raw = btn.dataset.durationPreset || "";
+    const active = raw === "" ? dur === null : dur === Number(raw);
+    btn.classList.toggle("is-active", active);
+  });
+}
+
+function buildBuilderDurationBarHtml(b, isCreationMode) {
+  const dur = normalizeTargetDuration(b.targetDuration);
+  const srcSug = !isCreationMode ? normalizeTargetDuration(b.videoItem?.meta?.suggestedDuration) : null;
+  const effectiveVal = dur || srcSug || 5;
+  const pct = (((effectiveVal - 4) / 26) * 100).toFixed(1);
+  const badgeText = dur
+    ? `${dur}s · 已指定`
+    : srcSug
+    ? `自动 · 原片 ${srcSug}s`
+    : isCreationMode
+    ? "自动 · 默认 5s"
+    : "自动 · 按原片";
+  const presets = [
+    { value: "", label: "自动" },
+    { value: "4", label: "4s" },
+    { value: "5", label: "5s" },
+    { value: "6", label: "6s" },
+    { value: "8", label: "8s" },
+    { value: "10", label: "10s" },
+    { value: "12", label: "12s" },
+    { value: "15", label: "15s" },
+  ];
+  const presetHtml = presets
+    .map((p) => {
+      const active = p.value === "" ? dur === null : dur === Number(p.value);
+      return `<button type="button" class="duration-preset-btn ${active ? "is-active" : ""}" data-duration-preset="${p.value}">${p.label}</button>`;
+    })
+    .join("");
+  return `
+    <div class="duration-control-bar">
+      <div class="duration-control-left">
+        <span class="duration-control-title">⏱️ 生成时长</span>
+        <span id="builderDurationBadge" class="pill ${dur ? "pill-blue" : "pill-muted"}">${escapeHtml(badgeText)}</span>
+        <div class="duration-preset-group" role="group" aria-label="快捷时长选择">${presetHtml}</div>
+      </div>
+      <div class="duration-control-right">
+        <input
+          id="builderDurationRange"
+          class="duration-range-input"
+          type="range"
+          min="4"
+          max="30"
+          step="1"
+          value="${effectiveVal}"
+          style="--dur-pct:${pct}%"
+          aria-label="生成视频时长滑块（4至30秒）"
+        />
+        <label class="duration-num-box" title="支持 4–30 秒整数，留空为自动">
+          <input
+            id="builderDurationInput"
+            type="number"
+            min="4"
+            max="30"
+            step="1"
+            value="${dur ?? ""}"
+            placeholder="${effectiveVal}"
+          />
+          <span>秒</span>
+        </label>
+      </div>
+    </div>`;
+}
+
 function renderBuilderView() {
   const main = document.getElementById("mainPane");
   const d = state.data;
@@ -3897,6 +4030,7 @@ function renderBuilderView() {
         </div>
 
         ${uploadGridHtml}
+        ${buildBuilderDurationBarHtml(b, isCreationMode)}
       </section>
 
       <section class="card">
@@ -3966,6 +4100,7 @@ function setBuilderVideoFile(vf) {
           pill.textContent = `${meta.suggestedDuration}s`;
         }
         renderBuilderAssetStripOnly();
+        syncBuilderDurationUI();
       }
     }
   });
@@ -4022,6 +4157,38 @@ function bindBuilderEvents() {
       } catch {}
       renderBuilderView();
     });
+  });
+
+  document.querySelectorAll("[data-duration-preset]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.builder.targetDuration = normalizeTargetDuration(btn.dataset.durationPreset);
+      syncBuilderDurationUI();
+    });
+  });
+
+  const durRangeEl = document.getElementById("builderDurationRange");
+  durRangeEl?.addEventListener("input", () => {
+    state.builder.targetDuration = normalizeTargetDuration(durRangeEl.value);
+    syncBuilderDurationUI();
+  });
+
+  const durInputEl = document.getElementById("builderDurationInput");
+  durInputEl?.addEventListener("input", () => {
+    const raw = (durInputEl.value || "").trim();
+    if (!raw) {
+      state.builder.targetDuration = null;
+      syncBuilderDurationUI({ skipInputValue: true });
+      return;
+    }
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 4 && n <= 30) {
+      state.builder.targetDuration = Math.round(n);
+      syncBuilderDurationUI({ skipInputValue: true });
+    }
+  });
+  durInputEl?.addEventListener("change", () => {
+    state.builder.targetDuration = normalizeTargetDuration(durInputEl.value);
+    syncBuilderDurationUI();
   });
 
   shotIdEl.addEventListener("input", () => {
@@ -4274,8 +4441,11 @@ function clearBuilderDraft() {
     localStorage.getItem("wash_builder_work_mode") === "video_creation"
       ? "video_creation"
       : "video_wash";
+  const keepTargetDur =
+    normalizeTargetDuration(state.builder?.targetDuration) ?? loadSavedBuilderDuration();
   state.builder = {
     workMode: keepWorkMode,
+    targetDuration: keepTargetDur,
     shotId: suggestNextShotId(state.data?.shots || []),
     shotIdTouched: false,
     title: "",
@@ -4336,6 +4506,9 @@ async function submitBuilderShot(forceOverwrite = false) {
     fd.append("scene", (b.scene || "").trim());
     fd.append("platform", activeCtx.platform);
     fd.append("work_mode", workMode);
+    if (normalizeTargetDuration(b.targetDuration)) {
+      fd.append("target_duration", String(normalizeTargetDuration(b.targetDuration)));
+    }
     fd.append("project_uuid", activeCtx.uuid || "");
     fd.append("project_name", activeCtx.name || "");
     fd.append("canvas_url", activeCtx.url || "");
@@ -4773,10 +4946,31 @@ function renderShotActionBarHtml(shot) {
     ? `<span class="outdated-final-badge" title="已二次确认解锁定版修改，原有 1080P 正片仍保留对照">↺ 已解锁修改 · 旧版 1080P 已归档</span>`
     : "";
 
+  const detailTargetDur = normalizeTargetDuration(shot.targetDuration);
+  const srcSugDur = normalizeTargetDuration(shot.sourceVideo?.meta?.suggestedDuration);
+  const durAutoLabel =
+    shot.workMode === "video_creation"
+      ? "自动 (默认5s)"
+      : srcSugDur
+      ? `自动 (原片${srcSugDur}s)`
+      : "自动 (按原片)";
+  const durOpts = [`<option value="" ${detailTargetDur === null ? "selected" : ""}>${durAutoLabel}</option>`];
+  for (let sec = 4; sec <= 30; sec += 1) {
+    durOpts.push(`<option value="${sec}" ${detailTargetDur === sec ? "selected" : ""}>${sec}s</option>`);
+  }
+  const detailDurHtml = `
+    <label class="detail-duration-ctrl" title="修改或锁定该镜头的生成时长（Seedance 2.5 支持 4–30s 整数）">
+      <span>⏱️</span>
+      <select id="detailDurationSelect" ${finalInProgress || st === "processing" ? "disabled" : ""}>
+        ${durOpts.join("")}
+      </select>
+    </label>`;
+
   return `
     <section class="shot-action-bar" aria-label="整镜全局操作栏">
       <div class="shot-action-meta">
         ${shot.workMode === "video_creation" ? `<span class="shot-mode-tag is-detail" title="正常生成模式：仅使用 seedance-video-prompts，已跳过原片洗片与深度捕捉">🎬 正常生成</span>` : ""}
+        ${detailDurHtml}
         ${passedMetaHtml}
         <span id="shotChangeBadge" class="change-badge ${info.badgeCls}" title="${escapeHtml(info.badgeTitle || "")}">${escapeHtml(passed && !info.hasChanges ? "✓ 与定版正片一致" : info.badgeText)}</span>
       </div>
@@ -5227,6 +5421,23 @@ function bindDetailEvents(shot) {
   bindDropzoneEl(fbDropEl, fbFilesEl, addFeedbackFiles, { clickToOpen: false });
   document.getElementById("fbUploadBtn")?.addEventListener("click", () => {
     fbFilesEl?.click();
+  });
+
+  document.getElementById("detailDurationSelect")?.addEventListener("change", async (e) => {
+    const sel = e.target;
+    const nextDur = normalizeTargetDuration(sel.value);
+    sel.disabled = true;
+    try {
+      await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/meta`, {
+        method: "PATCH",
+        body: JSON.stringify({ targetDuration: nextDur, syncLocal: false }),
+      });
+      showToast(nextDur ? `已设置目标时长 ${nextDur}s（生成/同步时生效）` : "已恢复自动时长");
+      await refreshState();
+    } catch (err) {
+      showToast(`更新时长失败: ${err.message}`);
+      sel.disabled = false;
+    }
   });
 
   document.getElementById("confirmShotBtn")?.addEventListener("click", async () => {

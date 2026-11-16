@@ -120,6 +120,24 @@ def normalize_work_mode(raw: str | None) -> str:
     return "video_wash"
 
 
+def normalize_target_duration(raw: Any) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    s = str(raw).strip().lower()
+    for suffix in ("s", "秒"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    if s in {"", "auto", "none", "null", "0"}:
+        return None
+    try:
+        val = int(round(float(s)))
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    return max(4, min(30, val))
+
+
 def get_platform_label(platform: str | None) -> str:
     return "即梦官网" if normalize_platform(platform) == "jimeng" else "LibTV"
 
@@ -572,6 +590,9 @@ def compute_generation_fingerprint(shot: dict[str, Any]) -> str:
     }
     if plat != DEFAULT_PLATFORM:
         payload["platform"] = plat
+    target_dur = normalize_target_duration(shot.get("targetDuration"))
+    if target_dur is not None:
+        payload["targetDuration"] = target_dur
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
@@ -584,6 +605,7 @@ def _decorate_shot_payload(
     out = copy.deepcopy(shot)
     out["title"] = str(out.get("title") or "").strip()
     out["workMode"] = normalize_work_mode(out.get("workMode"))
+    out["targetDuration"] = normalize_target_duration(out.get("targetDuration"))
     plat = normalize_platform(out.get("platform"))
     out["platform"] = plat
     out["platformLabel"] = get_platform_label(plat)
@@ -1711,6 +1733,7 @@ class QueueStore:
         title: str = "",
         platform: str = "",
         work_mode: str = "video_wash",
+        target_duration: Any = None,
         canvas_url: str = "",
         source_filename: str = "",
         source_bytes: bytes = b"",
@@ -1786,10 +1809,13 @@ class QueueStore:
             elif not source_video_obj and not comp_obj and not char_refs:
                 raise ValueError("洗视频模式请至少拖入原片视频或参考图片")
 
+            clean_dur = normalize_target_duration(target_duration)
             clean_whiteout_parts = [str(p).strip() for p in (whiteout_parts or []) if str(p).strip()]
             clean_whiteout_target = whiteout_target.strip()
             mode_tag = "正常生成" if clean_work_mode == "video_creation" else "洗视频"
             rev_note = f"创建镜头 {sid}（{mode_tag}）" + (" 并确认提交队列" if auto_confirm else "（草稿）")
+            if clean_dur is not None:
+                rev_note += f" · 目标时长 {clean_dur}s"
             if clean_whiteout_parts:
                 target_label = clean_whiteout_target or "自动识别构图图"
                 rev_note += f" · 涂白选项：{'、'.join(clean_whiteout_parts)}（{target_label}）"
@@ -1810,6 +1836,7 @@ class QueueStore:
                 "id": sid,
                 "title": (title or "").strip(),
                 "workMode": clean_work_mode,
+                "targetDuration": clean_dur,
                 "scene": scene.strip(),
                 "status": status,
                 "platform": eff_platform,
@@ -2497,6 +2524,8 @@ class QueueStore:
         shot_id: str,
         *,
         title: str | None = None,
+        target_duration: Any = None,
+        update_target_duration: bool = False,
         sync_local: bool = True,
     ) -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
@@ -2519,6 +2548,19 @@ class QueueStore:
                             "summary": f"镜头重命名：{old_title or '(未命名)'} → {new_title or '(已清空名称)'}",
                         }
                     )
+                if update_target_duration:
+                    old_dur = normalize_target_duration(shot.get("targetDuration"))
+                    new_dur = normalize_target_duration(target_duration)
+                    shot["targetDuration"] = new_dur
+                    if new_dur != old_dur:
+                        shot["updatedAt"] = now_iso()
+                        shot.setdefault("revisions", []).append(
+                            {
+                                "at": now_iso(),
+                                "actor": "user",
+                                "summary": f"生成时长调整：{f'{old_dur}s' if old_dur else '自动'} → {f'{new_dur}s' if new_dur else '自动'}",
+                            }
+                        )
 
                 synced_results: list[dict[str, Any]] = []
                 if sync_local:

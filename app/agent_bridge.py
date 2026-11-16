@@ -321,6 +321,7 @@ def _build_worker_prompt(
         "scene": shot.get("scene"),
         "platform": platform,
         "workMode": work_mode,
+        "targetDuration": shot.get("targetDuration"),
         "processingTaskType": task_type,
         "claimToken": shot.get("claimToken"),
         "projectUuid": shot.get("projectUuid"),
@@ -455,6 +456,17 @@ def _build_worker_prompt(
         refs_cli_hint = " ".join(ordered_refs) if ordered_refs else ""
         pid = str(shot.get("projectUuid") or "")
 
+        raw_target_dur = shot.get("targetDuration")
+        explicit_dur = int(round(float(raw_target_dur))) if raw_target_dur else 0
+        if explicit_dur > 0:
+            explicit_dur = max(4, min(30, explicit_dur))
+        dur_cli_token = str(explicit_dur) if explicit_dur else "<整数秒>"
+        dur_rule_line = (
+            f"- **目标时长强约束**：用户已明确指定生成时长为 **`{explicit_dur}s`**；请确保提示词动作节奏/时间戳按 `{explicit_dur}` 秒编排，并在建节点命令中严格传入 `--duration {explicit_dur}`。\n"
+            if explicit_dur
+            else ""
+        )
+
         if is_creation:
             creation_kind = str(prepped_dict.get("creationKind") or ("m2v" if ordered_refs else "t2v")).strip().lower()
             video_mode_flag = "t2v" if creation_kind == "t2v" or not ordered_refs else "m2v"
@@ -480,8 +492,9 @@ def _build_worker_prompt(
                 f"  - 角色参考：`{json.dumps(char_nodes, ensure_ascii=False)}`\n"
                 "- 深度捕捉：**正常生成模式已跳过**（严禁上传原片或触发 Chrome 深度捕捉）。\n"
                 f"- 涂白判断：{whiteout_hint}\n"
+                f"{dur_rule_line}"
                 "- 建样片与只读报价内联命令模板：\n"
-                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode {video_mode_flag} --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x {gen_x} --y {row_y} --prompt \"{prompt_bind_tip}\"{refs_suffix}`（**严禁传 `--run`**）\n"
+                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode {video_mode_flag} --ratio 21:9 --resolution 480p --duration {dur_cli_token} --count 1 --x {gen_x} --y {row_y} --prompt \"{prompt_bind_tip}\"{refs_suffix}`（**严禁传 `--run`**）\n"
                 f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
                 f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
             )
@@ -517,8 +530,9 @@ def _build_worker_prompt(
                 f"{src_line}"
                 f"- 深度捕捉：{depth_hint}\n"
                 f"- 涂白判断：{whiteout_hint}\n"
+                f"{dur_rule_line}"
                 "- 建样片与只读报价内联命令模板（若更换涂白图请替换第一个 `--ref node:`）：\n"
-                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode m2v --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x 3620 --y {row_y} --prompt \"<写好的提示词，含 {{node:...}} 绑定>\" {refs_hint_nonempty}`（**严禁传 `--run`**）\n"
+                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode m2v --ratio 21:9 --resolution 480p --duration {dur_cli_token} --count 1 --x 3620 --y {row_y} --prompt \"<写好的提示词，含 {{node:...}} 绑定>\" {refs_hint_nonempty}`（**严禁传 `--run`**）\n"
                 f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
                 f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
             )
@@ -557,12 +571,20 @@ def _build_worker_prompt(
             f"请先阅读 `{wash_skill_md}` 及本任务涉及的配套 Skill{skill_list}，然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
         )
 
+    hdr_dur = shot.get("targetDuration")
+    hdr_dur_label = (
+        f"{int(hdr_dur)}s（用户明确指定，须严格传 --duration {int(hdr_dur)}）"
+        if hdr_dur
+        else ("默认 5s / 按需 4-30s" if is_creation else "自动对齐原片整数秒（4-30s）")
+    )
+
     return (
         f"{intro}"
         f"- 工作区目录：`{WORKSPACE_ROOT}`\n"
         f"- 控制台地址：`{base_url}`\n"
         f"- 目标平台：`{'即梦官网 (jimeng)' if is_jimeng else 'LibTV (libtv)'}`\n"
         f"- 工作模式：`{'正常生成 (video_creation)' if is_creation else '洗视频 (video_wash)'}`\n"
+        f"- 生成时长：`{hdr_dur_label}`\n"
         f"- 镜头 ID：`{shot.get('id')}`\n"
         f"- 任务类型：`{task_type}`\n"
         f"- `claimToken`：`{shot.get('claimToken')}`\n"

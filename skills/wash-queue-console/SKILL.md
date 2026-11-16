@@ -38,6 +38,7 @@ description: >-
 每个镜头带有 `platform` 字段（`"libtv"` 或 `"jimeng"`）以及 `workMode` 字段（`"video_wash"` 洗视频默认 / `"video_creation"` 正常生成），请按平台与模式分流处理：
 
 - **当 `workMode` 为 `"video_creation"`（正常生成模式）**：参考视频非必需（支持无图纯文生 `--mode t2v` 或仅构图/角色图 `--mode m2v`）。**仅加载并遵循 `seedance-video-prompts`**（若目标平台为 `libtv` 辅以 `libtv-cli`；若为 `jimeng` 且队列已由 Fast-Path 内联给出命令则无需重复读 `dreamina-canvas-cli` / `schema`），**严禁加载或执行** `seedance-video-recreation`、`zdepth-video`、`libtv-seedance-batch` 及 720P 深度捕捉。
+- **目标生成时长（`targetDuration`）**：若镜头携带 `targetDuration`（`4–30` 整数秒），优先于原片对齐或默认 5 秒，写提示词节拍与建节点 `--duration` 参数必须严格对齐该秒数。
 - **当 `workMode` 为 `"video_wash"`（默认洗视频模式）**：
   - **当 `platform` 为 `"libtv"`（默认）**：加载并遵循 `libtv-cli`、`libtv-seedance-batch`、`seedance-video-recreation`、`seedance-video-prompts`；使用 `libtv` CLI 与 `{{Node nodeKey}}` 引用，保留网页「深度动作捕捉」流程与 `libtvMixedOrder`。
   - **当 `platform` 为 `"jimeng"`（即梦官网）**：加载并遵循 `dreamina-canvas-cli`（工作区 `.agents/skills/dreamina-canvas-cli/SKILL.md` 或全局 skill）、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`；使用 `dreamina-canvas --non-interactive --format json` 显式传入 `--project-id <projectUuid>`，以 `{{node:<node-id>}}` 写正文引用并遵循 `dreamina-canvas-cli` 的积分报价/确认与 7 天样片有效期规则，仅将公开可恢复 ID（`nodeId` / `submitId` / `selectedResourceId`）写入 `jimengMeta`。

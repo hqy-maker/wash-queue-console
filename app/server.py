@@ -893,6 +893,7 @@ class SceneRenameReq(BaseModel):
 
 class ShotMetaReq(BaseModel):
     title: str | None = None
+    targetDuration: int | str | None = None
     syncLocal: bool = True
 
 
@@ -1481,6 +1482,7 @@ async def create_shot(
     whiteout_parts_json: str = Form(default="[]"),
     whiteout_target: str = Form(default=""),
     work_mode: str = Form(default="video_wash"),
+    target_duration: str = Form(default=""),
     auto_confirm: str = Form(default="true"),
     overwrite: str = Form(default="false"),
     source_video: UploadFile | None = File(default=None),
@@ -1515,6 +1517,7 @@ async def create_shot(
             title=title,
             platform=platform.strip(),
             work_mode=work_mode.strip(),
+            target_duration=target_duration.strip(),
             project_uuid=project_uuid.strip(),
             project_name=project_name.strip(),
             canvas_url=canvas_url.strip(),
@@ -1791,7 +1794,13 @@ def update_shot_scene(shot_id: str, req: ShotSceneReq) -> dict[str, Any]:
 @app.patch("/api/shots/{shot_id}/meta")
 def update_shot_meta(shot_id: str, req: ShotMetaReq) -> dict[str, Any]:
     try:
-        res = store.update_shot_meta(shot_id, title=req.title, sync_local=bool(req.syncLocal))
+        res = store.update_shot_meta(
+            shot_id,
+            title=req.title,
+            target_duration=req.targetDuration,
+            update_target_duration=("targetDuration" in req.model_fields_set),
+            sync_local=bool(req.syncLocal),
+        )
         return {"ok": True, **res}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
