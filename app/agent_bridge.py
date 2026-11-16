@@ -95,7 +95,7 @@ def _load_bridge_settings() -> dict[str, Any]:
 
     return {
         "workers": _int_opt("workers", "WASH_BRIDGE_WORKERS", 4, 1, 6),
-        "timeoutSec": _int_opt("timeoutSec", "WASH_BRIDGE_AGY_TIMEOUT", 900, 120, 3600),
+        "timeoutSec": _int_opt("timeoutSec", "WASH_BRIDGE_AGY_TIMEOUT", 1500, 120, 3600),
         "resumeByShot": _bool_opt("resumeByShot", "WASH_BRIDGE_RESUME_SHOT", True),
         "fastPathEnabled": _bool_opt("fastPathEnabled", "WASH_BRIDGE_FASTPATH", True),
         "prePrepEnabled": _bool_opt("prePrepEnabled", "WASH_BRIDGE_PREPREP", True),
@@ -150,22 +150,40 @@ def _discover_agy_models(agy_bin: str) -> set[str]:
         return set(found)
 
 
+def _resolve_compatible_effort(model: str, effort: str) -> str:
+    """Align `--effort` with model-encoded tier suffixes to prevent CLI conflicts."""
+    clean_model = (model or "").strip().lower()
+    clean_effort = (effort or "").strip().lower()
+    for tier in ("-xhigh", "-high", "-medium", "-low"):
+        if clean_model.endswith(tier):
+            return tier.lstrip("-")
+    return clean_effort
+
+
 def _select_execution_profile(task_type: str, available_models: set[str], cfg: dict[str, Any]) -> tuple[str, str]:
     """Return `(model, effort)` tailored to task complexity."""
     if task_type in {"prompt_update_requested", "recheck_requested"}:
         effort = cfg["fastEffort"] or "low"
         model = cfg["fastModel"]
         if not model:
-            for cand in ("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-4-argon-low"):
+            candidates = {
+                "low": ("gemini-3.8-flash-low", "gemini-4-argon-low", "gemini-4-carbon-low", "gemini-3.8-flash-medium"),
+                "medium": ("gemini-3.8-flash-medium", "gemini-4-carbon-medium", "gemini-4-argon-medium", "gemini-3.8-flash-low"),
+            }.get(effort, ("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-4-argon-low"))
+            for cand in candidates:
                 if cand in available_models:
                     model = cand
                     break
-        return model, effort
+        return model, _resolve_compatible_effort(model, effort)
 
     if task_type in {"run_requested", "final_requested"}:
-        return cfg["heavyModel"], cfg["midEffort"] or "medium"
+        effort = cfg["midEffort"] or "medium"
+        model = cfg["heavyModel"]
+        return model, _resolve_compatible_effort(model, effort)
 
-    return cfg["heavyModel"], cfg["heavyEffort"] or "high"
+    effort = cfg["heavyEffort"] or "high"
+    model = cfg["heavyModel"]
+    return model, _resolve_compatible_effort(model, effort)
 
 
 def _acquire_singleton_lock(wait_sec: float = 3.5) -> bool:
@@ -347,14 +365,69 @@ def _build_worker_prompt(
     )
 
 
+def _terminate_proc_silently(proc: subprocess.Popen[str] | None) -> None:
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=1.5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _describe_stream_event(evt: dict[str, Any]) -> tuple[str, str]:
+    """Extract a concise human-readable (phase, note) pair from an agy stream-json event."""
+    ev_name = str(evt.get("event") or "").strip().lower()
+    if ev_name == "init":
+        cid = str(evt.get("conversation_id") or "").strip()
+        return "建立会话", f"已建立独立会话 {cid[:8]}…" if cid else "已建立独立会话"
+    if ev_name == "step_update":
+        su = evt.get("step_update") if isinstance(evt.get("step_update"), dict) else {}
+        st_type = str(su.get("step_type") or "").strip()
+        st_state = str(su.get("state") or "").strip()
+        low = st_type.lower()
+        tool_name = str(
+            su.get("tool_name")
+            or (su.get("tool_call") or {}).get("name")
+            or su.get("name")
+            or ""
+        ).strip()
+        if st_type == "user_input":
+            return "读取任务", "已接收本镜上下文与执行规则"
+        if tool_name or "tool" in low or "command" in low:
+            t_label = tool_name or st_type or "工具调用"
+            if st_state == "DONE":
+                return "工具完成", f"已完成 {t_label}"
+            return "执行工具", f"正在运行 {t_label}"
+        if "think" in low or "reason" in low:
+            return "分析规划", "正在推理方案与检查参数…"
+        if st_type == "agent_response":
+            snippet = re.sub(r"\s+", " ", str(su.get("text_delta") or "")).strip()[:64]
+            if st_state == "DONE":
+                return "总结回写", "Agent 已输出本轮结果"
+            return "生成回应", f"正在输出：{snippet}" if snippet else "正在组织回复与执行结论…"
+        return "执行步骤", f"{st_type or 'step'} ({st_state or 'ACTIVE'})"
+    if ev_name == "result":
+        res = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+        status = str(res.get("status") or "").strip() or "DONE"
+        return "任务收尾", f"CLI 返回终态：{status}"
+    return "", ""
+
+
 class BridgeRuntime:
-    """Coordinates heartbeats, standby vs active claiming, per-shot sessions, fast-paths & parallel `agy -p`."""
+    """Coordinates per-shot telemetry, sessions, fast-paths & parallel `agy -p` execution."""
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url
         self._lock = threading.Lock()
         self._conv_lock = threading.Lock()
         self._active: dict[str, Future[None]] = {}
+        self._worker_states: dict[str, dict[str, Any]] = {}
+        self._worker_procs: dict[str, subprocess.Popen[str]] = {}
+        self._cancelled_tokens: set[str] = set()
         self._last_conv_id = ""
         self._last_run_at = ""
         self._last_error = ""
@@ -362,6 +435,60 @@ class BridgeRuntime:
     def active_ids(self) -> list[str]:
         with self._lock:
             return sorted(self._active.keys())
+
+    def _snapshot_workers_locked(self) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for sid, info in self._worker_states.items():
+            snap = dict(info)
+            snap["recentSteps"] = list(info.get("recentSteps") or [])
+            out[sid] = snap
+        return out
+
+    def _update_worker(self, shot_id: str, *, step_note: str = "", **fields: Any) -> None:
+        now_wall = time.time()
+        now_hms = time.strftime("%H:%M:%S", time.localtime(now_wall))
+        with self._lock:
+            st = self._worker_states.setdefault(
+                shot_id,
+                {
+                    "shotId": shot_id,
+                    "startedAt": now_wall,
+                    "startedAtIso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_wall)),
+                    "lastEventAt": now_wall,
+                    "lastEventAtIso": now_hms,
+                    "stepCount": 0,
+                    "recentSteps": [],
+                },
+            )
+            st.update({k: v for k, v in fields.items() if v is not None})
+            st["lastEventAt"] = now_wall
+            st["lastEventAtIso"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_wall))
+            if step_note:
+                steps: list[dict[str, str]] = list(st.get("recentSteps") or [])
+                last_txt = steps[-1]["text"] if steps else ""
+                if step_note != last_txt:
+                    steps.append({"at": now_hms, "text": step_note})
+                    st["recentSteps"] = steps[-8:]
+                    st["stepCount"] = int(st.get("stepCount") or 0) + 1
+
+    def _handle_cancel_tokens(self, tokens: list[str]) -> None:
+        clean = {str(t).strip() for t in tokens if str(t).strip()}
+        if not clean:
+            return
+        procs_to_kill: list[subprocess.Popen[str]] = []
+        with self._lock:
+            self._cancelled_tokens.update(clean)
+            if len(self._cancelled_tokens) > 200:
+                self._cancelled_tokens = set(list(self._cancelled_tokens)[-100:])
+            for sid, info in list(self._worker_states.items()):
+                if str(info.get("claimToken") or "") in clean:
+                    proc = self._worker_procs.get(sid)
+                    if proc is not None:
+                        procs_to_kill.append(proc)
+                    info["phase"] = "正在中止"
+                    info["lastNote"] = "收到用户重试/中止指令，正在清理进程…"
+        for proc in procs_to_kill:
+            _terminate_proc_silently(proc)
 
     def _load_shot_convs(self) -> dict[str, Any]:
         if not SHOT_CONVS_PATH.is_file():
@@ -420,6 +547,7 @@ class BridgeRuntime:
             last_conv = self._last_conv_id
             last_run = self._last_run_at
             last_err = self._last_error
+            workers_snap = self._snapshot_workers_locked()
         try:
             resp = client.post(
                 "/api/agent/heartbeat",
@@ -433,11 +561,16 @@ class BridgeRuntime:
                     "lastConversationId": last_conv,
                     "lastRunAt": last_run,
                     "lastError": last_err,
+                    "shotWorkers": workers_snap,
                 },
                 timeout=5.0,
             )
             if resp.status_code == 200:
-                return resp.json().get("agentStatus")
+                data = resp.json()
+                cancel_tokens = data.get("cancelTokens") or []
+                if cancel_tokens:
+                    self._handle_cancel_tokens(cancel_tokens)
+                return data.get("agentStatus")
         except Exception:
             return None
         return None
@@ -490,6 +623,7 @@ class BridgeRuntime:
         model: str = "",
         effort: str = "",
         resume_conv_id: str = "",
+        claim_token: str = "",
     ) -> tuple[str, str, str]:
         shot_id = str(shot["id"])
         env = os.environ.copy()
@@ -519,6 +653,7 @@ class BridgeRuntime:
         err_msg = ""
         last_status = ""
         proc: subprocess.Popen[str] | None = None
+        last_step_append_ts = 0.0
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -530,15 +665,30 @@ class BridgeRuntime:
                 text=True,
                 bufsize=1,
             )
+            with self._lock:
+                self._worker_procs[shot_id] = proc
+            self._update_worker(
+                shot_id,
+                agyPid=proc.pid,
+                phase="启动 agy 进程",
+                lastNote=f"已拉起后台 Worker (PID {proc.pid})",
+                step_note=f"启动 agy 进程 (PID {proc.pid}, model={model or 'default'})",
+            )
             deadline = time.monotonic() + AGY_TIMEOUT_SEC + 60.0
             assert proc.stdout is not None
             for raw_line in proc.stdout:
+                with self._lock:
+                    cancelled = bool(claim_token and claim_token in self._cancelled_tokens)
+                if cancelled:
+                    err_msg = "已被用户手动中止重置"
+                    _terminate_proc_silently(proc)
+                    break
                 line = raw_line.strip()
                 if not line:
                     continue
                 if time.monotonic() > deadline:
                     err_msg = f"执行超时（超过 {AGY_TIMEOUT_SEC}s）"
-                    proc.kill()
+                    _terminate_proc_silently(proc)
                     break
                 if line.startswith("{"):
                     try:
@@ -548,21 +698,49 @@ class BridgeRuntime:
                             with self._lock:
                                 self._last_conv_id = conv_id
                             self._set_shot_conversation_id(shot, conv_id)
+                            self._update_worker(shot_id, conversationId=conv_id)
                             _log(f"{shot_id} agy conversation_id={conv_id} (resumed={bool(resume_conv_id)})")
+                        phase_str, note_str = _describe_stream_event(evt)
+                        if phase_str or note_str:
+                            now_m = time.monotonic()
+                            su = evt.get("step_update") if isinstance(evt.get("step_update"), dict) else {}
+                            step_type_str = str(su.get("step_type") or "")
+                            should_append = bool(note_str) and (
+                                evt.get("event") in {"init", "result"}
+                                or phase_str in {"读取任务", "执行工具", "工具完成"}
+                                or (now_m - last_step_append_ts) >= 8.0
+                            )
+                            if should_append:
+                                last_step_append_ts = now_m
+                            self._update_worker(
+                                shot_id,
+                                phase=phase_str or None,
+                                stepType=step_type_str or None,
+                                lastNote=note_str or None,
+                                step_note=note_str if should_append else "",
+                            )
                         if evt.get("event") == "result":
                             res_obj = evt.get("result") or {}
                             last_status = str(res_obj.get("status") or "")
                             if last_status != "SUCCESS":
                                 err_msg = str(res_obj.get("error") or last_status or "unknown_error")
                     except json.JSONDecodeError:
-                        pass
+                        self._update_worker(shot_id, lastNote=line[:90])
+                else:
+                    self._update_worker(shot_id, lastNote=line[:90])
             ret = proc.wait(timeout=15)
+            with self._lock:
+                if claim_token and claim_token in self._cancelled_tokens and not err_msg:
+                    err_msg = "已被用户手动中止重置"
             if ret != 0 and not err_msg:
                 err_msg = f"agy exited with code {ret}"
         except Exception as exc:
             err_msg = str(exc)
-            if proc and proc.poll() is None:
-                proc.kill()
+            _terminate_proc_silently(proc)
+        finally:
+            with self._lock:
+                if self._worker_procs.get(shot_id) is proc:
+                    self._worker_procs.pop(shot_id, None)
         return conv_id, err_msg, last_status
 
     def _run_shot_worker(self, shot: dict[str, Any]) -> None:
@@ -570,12 +748,21 @@ class BridgeRuntime:
         claim_token = str(shot.get("claimToken") or "")
         task_type = str(shot.get("processingTaskType") or "")
         _log(f"start worker shot={shot_id} task={task_type} token={claim_token}")
+        self._update_worker(
+            shot_id,
+            claimToken=claim_token,
+            taskType=task_type,
+            phase="签收任务",
+            lastNote=f"开始处理 {task_type} 任务…",
+            step_note=f"Worker 已签收 {task_type} 任务",
+        )
 
         conv_id = ""
         err_msg = ""
         last_status = ""
         try:
             if SETTINGS["fastPathEnabled"] and task_type == "prompt_update_requested":
+                self._update_worker(shot_id, phase="快速同步提示词", lastNote="直接同步提示词到画布节点…", step_note="执行确定性提示词快速同步")
                 fp_res = shot_fastpath.try_fastpath_prompt_update(
                     shot, base_url=self.base_url, workspace_root=WORKSPACE_ROOT
                 )
@@ -586,6 +773,7 @@ class BridgeRuntime:
 
             prepped: dict[str, Any] = {}
             if SETTINGS["prePrepEnabled"] and task_type in {"queued", "recheck_requested"}:
+                self._update_worker(shot_id, phase="预处理素材", lastNote="生成关键帧拼图与扫描音频声波…", step_note="预处理关键帧拼图与音频/画布信息")
                 prepped = shot_fastpath.prepare_shot_artifacts(
                     shot,
                     base_url=self.base_url,
@@ -605,6 +793,15 @@ class BridgeRuntime:
                 resume_id = self._get_shot_conversation_id(shot)
 
             _log(f"{shot_id} dispatch profile model={model or 'default'} effort={effort} resume={resume_id or 'new'}")
+            self._update_worker(
+                shot_id,
+                model=model or "default",
+                resumed=bool(resume_id),
+                conversationId=resume_id,
+                phase="唤醒 agy",
+                lastNote=f"调度模型 {model or 'default'} ({effort})，{'续接原会话' if resume_id else '新开会话'}…",
+                step_note=f"调度 agy 执行（{model or 'default'} / {effort}）",
+            )
             prompt = _build_worker_prompt(shot, self.base_url, prepped=prepped, is_resume=bool(resume_id))
             conv_id, err_msg, last_status = self._invoke_agy_once(
                 shot,
@@ -613,13 +810,23 @@ class BridgeRuntime:
                 model=model,
                 effort=effort,
                 resume_conv_id=resume_id,
+                claim_token=claim_token,
             )
 
             # Fallback seamlessly to a fresh session if resuming an older conversation failed and claim still holds
-            if resume_id and (err_msg or (last_status and last_status != "SUCCESS")):
+            with self._lock:
+                user_cancelled = claim_token in self._cancelled_tokens
+            if not user_cancelled and resume_id and (err_msg or (last_status and last_status != "SUCCESS")):
                 if self._claim_still_ours(shot_id, claim_token):
                     _log(f"{shot_id} resume conv={resume_id} failed ({err_msg}); retrying fresh session")
                     self._clear_shot_conversation_id(shot_id)
+                    self._update_worker(
+                        shot_id,
+                        phase="新开会话重试",
+                        resumed=False,
+                        lastNote="旧会话恢复失败，自动改用干净新会话重试…",
+                        step_note="旧会话续接失败，切换全新会话继续执行",
+                    )
                     fresh_prompt = _build_worker_prompt(shot, self.base_url, prepped=prepped, is_resume=False)
                     conv_id, err_msg, last_status = self._invoke_agy_once(
                         shot,
@@ -628,18 +835,25 @@ class BridgeRuntime:
                         model=model,
                         effort=effort,
                         resume_conv_id="",
+                        claim_token=claim_token,
                     )
         except Exception as exc:
             err_msg = str(exc)
         finally:
             now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             with self._lock:
+                was_cancelled = bool(claim_token and claim_token in self._cancelled_tokens)
                 self._active.pop(shot_id, None)
+                self._worker_states.pop(shot_id, None)
+                self._worker_procs.pop(shot_id, None)
                 self._last_run_at = now_str
                 if conv_id:
                     self._last_conv_id = conv_id
-                self._last_error = err_msg
-            if err_msg or (last_status and last_status != "SUCCESS"):
+                if not was_cancelled:
+                    self._last_error = err_msg
+            if was_cancelled:
+                _log(f"worker cancelled by user reset shot={shot_id}")
+            elif err_msg or (last_status and last_status != "SUCCESS"):
                 _log(f"worker finished with issue shot={shot_id}: {err_msg or last_status}")
                 self._ensure_not_stuck_processing(shot_id, claim_token, err_msg or last_status)
             else:
@@ -655,7 +869,7 @@ class BridgeRuntime:
             with httpx.Client(base_url=self.base_url, timeout=8.0) as hb_client:
                 while not _STOP_EVENT.is_set():
                     self._send_heartbeat(hb_client)
-                    _STOP_EVENT.wait(5.0)
+                    _STOP_EVENT.wait(2.0 if self.active_ids() else 5.0)
 
         hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         hb_thread.start()

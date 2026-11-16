@@ -115,6 +115,13 @@ const state = {
     open: false,
     focusScene: "",
   },
+  runtimeModal: {
+    open: false,
+    shotId: null,
+  },
+  runtimeByShot: {},
+  runtimeBusy: false,
+  runtimePollTimer: null,
   shotMoreOpen: false,
   shotChatMenuOpen: false,
   shotChatBusy: false,
@@ -2712,9 +2719,351 @@ async function refreshAgentStatus() {
     state.agentStatus = res;
     if (state.data) state.data.agentStatus = res;
     renderAiStatusPill();
+    if (state.view === "detail" && state.selectedShotId) {
+      const curShot = (state.data?.shots || []).find((s) => s.id === state.selectedShotId);
+      if (curShot && isShotInQueueOrProcessing(curShot)) {
+        refreshShotRuntimeBannerDom(curShot);
+      }
+    }
   } catch {
     state.serverUnreachable = true;
     renderAiStatusPill();
+  }
+}
+
+const ACTIONABLE_QUEUE_STATUSES = new Set([
+  "queued",
+  "feedback_queued",
+  "recheck_requested",
+  "prompt_update_requested",
+  "run_requested",
+  "final_requested",
+]);
+
+function isShotInQueueOrProcessing(shot) {
+  if (!shot) return false;
+  return shot.status === "processing" || ACTIONABLE_QUEUE_STATUSES.has(shot.status);
+}
+
+function formatDurationZh(totalSec) {
+  const sec = Math.max(0, Math.floor(Number(totalSec) || 0));
+  if (sec < 60) return `${sec} 秒`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return s ? `${m} 分 ${s} 秒` : `${m} 分`;
+}
+
+function getShotRuntimeSnapshot(shot) {
+  if (!shot) return null;
+  const cached = state.runtimeByShot?.[shot.id];
+  const cachedValid = cached && cached.status === shot.status;
+  if (cachedValid) return cached;
+
+  const summaryMap = state.agentStatus?.shotWorkers || state.data?.agentStatus?.shotWorkers || {};
+  const w = summaryMap[shot.id];
+  const st = shot.status || "";
+  const isProc = st === "processing";
+  const isWait = ACTIONABLE_QUEUE_STATUSES.has(st);
+  const agyMeta = getAgentStatusMeta();
+  let health = isProc ? "running" : isWait ? "queued" : "idle";
+  let healthLabel = isProc ? "🟢 Agent 正在后台处理中" : isWait ? "⏳ 正在排队等待接单" : "当前未在运行";
+  let diagnosis = shot.agentSummary || "";
+  const elapsedSec = w?.elapsedSec ?? 0;
+  const idleSec = w?.idleSec ?? 0;
+  if (isProc) {
+    if (!agyMeta.bridgeOnline && !state.serverUnreachable) {
+      health = "stalled";
+      healthLabel = "🔴 后台桥接未运行";
+      diagnosis = "镜头状态为「处理中」，但后台桥接未在线；建议点「↻ 刷新重试」。";
+    } else if (idleSec >= 180) {
+      health = "stalled";
+      healthLabel = `🟠 已 ${idleSec} 秒无新动作（疑似卡住）`;
+    } else if (idleSec >= 60) {
+      health = "slow";
+      healthLabel = `🟡 等待平台/工具响应中（${idleSec} 秒前更新）`;
+    }
+  } else if (isWait && agyMeta.bridgePaused) {
+    health = "paused";
+    healthLabel = "⏸ 后台桥接已暂停";
+  }
+  return {
+    shotId: shot.id,
+    status: st,
+    isProcessing: isProc,
+    isWaiting: isWait,
+    taskType: shot.processingTaskType || (isWait ? st : ""),
+    taskLabel: STATUS_META[shot.processingTaskType || st]?.label || shot.processingTaskType || st,
+    health,
+    healthLabel,
+    diagnosis,
+    elapsedSec,
+    idleSec,
+    phase: w?.phase || (isProc ? "后台执行中" : isWait ? "排队待领单" : ""),
+    lastNote: w?.lastNote || shot.agentSummary || "",
+    stepCount: w?.stepCount || 0,
+    agyPid: w?.agyPid || null,
+    agyPidAlive: w ? true : null,
+    bridgeOnline: Boolean(agyMeta.bridgeOnline),
+    bridgePaused: Boolean(agyMeta.bridgePaused),
+    bridgePid: agyMeta.bridgePid || null,
+    conversationId: shot.cliConversationId || "",
+    recentSteps: [],
+    recentLogs: [],
+  };
+}
+
+async function fetchShotRuntimeStatus(shotId, { showToastOnResult = false } = {}) {
+  if (!shotId) return null;
+  try {
+    const res = await apiJson(`/api/shots/${encodeURIComponent(shotId)}/agent-status`);
+    if (res.runtime) {
+      state.runtimeByShot[shotId] = res.runtime;
+    }
+    const latestShot = res.shot;
+    if (latestShot && state.data?.shots) {
+      const idx = state.data.shots.findIndex((s) => s.id === latestShot.id);
+      if (idx >= 0) {
+        const prevStatus = state.data.shots[idx].status;
+        state.data.shots[idx] = latestShot;
+        if (prevStatus !== latestShot.status && state.view === "detail" && state.selectedShotId === shotId) {
+          renderActiveView();
+          if (state.runtimeModal.open && state.runtimeModal.shotId === shotId) {
+            renderRuntimeModalBody();
+          }
+          if (showToastOnResult) {
+            showToast(`镜头状态已更新为「${getDisplayStatusMeta(latestShot).label}」`);
+          }
+          return res.runtime;
+        }
+      }
+    }
+    if (state.view === "detail" && state.selectedShotId === shotId && latestShot) {
+      refreshShotRuntimeBannerDom(latestShot);
+    }
+    if (state.runtimeModal.open && state.runtimeModal.shotId === shotId) {
+      renderRuntimeModalBody();
+    }
+    if (showToastOnResult && res.runtime) {
+      const rt = res.runtime;
+      showToast(
+        rt.health === "stalled" || rt.health === "offline"
+          ? `${rt.healthLabel}，建议点「↻ 强制刷新重试」`
+          : `${rt.healthLabel}（${rt.phase || rt.taskLabel} · 已耗时 ${formatDurationZh(rt.elapsedSec)}）`
+      );
+    }
+    return res.runtime || null;
+  } catch (err) {
+    if (showToastOnResult) {
+      showToast(err.message || "查询 Agent 状态失败");
+    }
+    return null;
+  }
+}
+
+async function retryShotProcessing(shotId, mode = "retry") {
+  if (!shotId || state.runtimeBusy) return;
+  state.runtimeBusy = true;
+  if (state.runtimeModal.open) renderRuntimeModalBody();
+  try {
+    const res = await apiJson(`/api/shots/${encodeURIComponent(shotId)}/retry-processing`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (res.runtime) {
+      state.runtimeByShot[shotId] = res.runtime;
+    }
+    const toastMsg =
+      mode === "restore"
+        ? "已中止当前后台任务并退回稳态"
+        : mode === "recheck"
+        ? "已中止旧任务并转入自检重检队列"
+        : "已中止卡住任务并重新入队重试，等待空闲 Worker 接单";
+    showToast(toastMsg);
+    if (mode === "restore") {
+      closeShotRuntimeModal();
+    }
+    await refreshState();
+    if (state.runtimeModal.open && state.runtimeModal.shotId === shotId) {
+      renderRuntimeModalBody();
+    }
+  } catch (err) {
+    showToast(err.message || "重试失败");
+  } finally {
+    state.runtimeBusy = false;
+    if (state.runtimeModal.open) renderRuntimeModalBody();
+  }
+}
+
+function buildRuntimeBannerInnerHtml(shot, rt) {
+  const health = rt?.health || "queued";
+  const isStalled = health === "stalled" || health === "offline";
+  const isProc = Boolean(rt?.isProcessing || shot.status === "processing");
+  const timerBits = [];
+  if (isProc) {
+    timerBits.push(`已耗时 ${formatDurationZh(rt?.elapsedSec || 0)}`);
+    timerBits.push(`${rt?.idleSec || 0} 秒前有动作`);
+    if (rt?.agyPid) timerBits.push(`PID ${rt.agyPid}`);
+  } else if (rt?.taskLabel) {
+    timerBits.push(`待执行：${rt.taskLabel}`);
+  }
+  const timerText = timerBits.join(" · ");
+  const retryCls = isStalled ? "btn-primary" : "btn-secondary";
+  const retryLabel = isProc ? "↻ 卡住刷新重试" : "↻ 刷新重试";
+
+  return `
+    <div class="runtime-banner-top">
+      <div class="runtime-banner-left">
+        <span class="runtime-health-label">${escapeHtml(rt?.healthLabel || "⏳ 正在处理中")}</span>
+        ${timerText ? `<span class="runtime-timer-pill">${escapeHtml(timerText)}</span>` : ""}
+      </div>
+      <div class="runtime-banner-actions">
+        <button id="runtimeBannerDetailBtn" class="btn btn-secondary btn-xs" type="button">📋 步骤与进程</button>
+        <button id="runtimeBannerRefreshBtn" class="btn btn-secondary btn-xs" type="button">↻ 刷新状态</button>
+        <button id="runtimeBannerRetryBtn" class="btn ${retryCls} btn-xs" type="button" ${state.runtimeBusy ? "disabled" : ""} title="立刻中止卡住的进程并把当前任务重新入队执行">${retryLabel}</button>
+      </div>
+    </div>
+    <div class="runtime-banner-detail">
+      ${rt?.phase ? `<span class="runtime-banner-phase">当前步骤：${escapeHtml(rt.phase)}</span>` : ""}
+      <span>${escapeHtml(rt?.lastNote || rt?.diagnosis || shot.agentSummary || "")}</span>
+    </div>
+  `;
+}
+
+function renderShotRuntimeBannerHtml(shot) {
+  if (!isShotInQueueOrProcessing(shot)) return "";
+  const rt = getShotRuntimeSnapshot(shot);
+  const healthCls = rt?.health ? `is-${rt.health}` : "is-running";
+  return `<section id="shotRuntimeBanner" class="runtime-status-banner ${healthCls}" aria-label="Agent 实时处理状态">${buildRuntimeBannerInnerHtml(shot, rt)}</section>`;
+}
+
+function refreshShotRuntimeBannerDom(shot) {
+  const banner = document.getElementById("shotRuntimeBanner");
+  const rt = getShotRuntimeSnapshot(shot);
+  if (banner && rt) {
+    banner.className = `runtime-status-banner is-${rt.health || "running"}`;
+    banner.innerHTML = buildRuntimeBannerInnerHtml(shot, rt);
+  }
+  const topBtn = document.getElementById("openShotRuntimeBtn");
+  if (topBtn && rt) {
+    const isStalled = rt.health === "stalled" || rt.health === "offline";
+    topBtn.className = `btn ${isStalled ? "btn-warning" : "btn-secondary"} btn-sm`;
+    topBtn.textContent = isStalled ? "⚠ 卡住·重试" : "📡 处理状态";
+  }
+}
+
+function openShotRuntimeModal(shotId) {
+  if (!shotId) return;
+  closeShotMoreMenu();
+  closeShotChatMenu();
+  state.runtimeModal = { open: true, shotId };
+  renderRuntimeModalBody();
+  document.getElementById("agentRuntimeModal")?.classList.remove("hidden");
+  fetchShotRuntimeStatus(shotId);
+  syncRuntimePollingTimer();
+}
+
+function closeShotRuntimeModal() {
+  document.getElementById("agentRuntimeModal")?.classList.add("hidden");
+  state.runtimeModal = { open: false, shotId: null };
+  syncRuntimePollingTimer();
+}
+
+function renderRuntimeModalBody() {
+  const bodyEl = document.getElementById("agentRuntimeModalBody");
+  const titleEl = document.getElementById("runtimeModalTitle");
+  if (!bodyEl) return;
+  const sid = state.runtimeModal.shotId;
+  const shot = (state.data?.shots || []).find((s) => s.id === sid);
+  if (titleEl) {
+    titleEl.textContent = shot ? `Agent 处理实时状态 · ${shot.id}` : "Agent 处理实时状态";
+  }
+  if (!shot) {
+    bodyEl.innerHTML = `<div class="runtime-diag-desc">未找到该镜头数据</div>`;
+    return;
+  }
+  const rt = getShotRuntimeSnapshot(shot) || {};
+  const health = rt.health || "idle";
+  const pidText = rt.agyPid
+    ? `PID ${rt.agyPid}（${rt.agyPidAlive === true ? "进程运行中 ✓" : rt.agyPidAlive === false ? "进程已退出 ✕" : "检查中"}）`
+    : rt.isProcessing
+    ? "未匹配到活跃子进程"
+    : "尚未拉起";
+  const bridgeText = rt.bridgePaused
+    ? "已暂停"
+    : rt.bridgeOnline
+    ? `在线（PID ${rt.bridgePid || "-"}）`
+    : "离线";
+  const stepsText = (rt.recentSteps || []).length
+    ? rt.recentSteps.map((st) => `[${st.at || ""}] ${st.text || ""}`).join("\n")
+    : rt.isProcessing
+    ? "等待 Worker 上报步骤流水（点击上方刷新可立刻拉取最新进展）"
+    : "暂无本轮执行步骤记录";
+  const logsText = (rt.recentLogs || []).length ? rt.recentLogs.join("\n") : "（bridge.log 暂无该镜头最近日志）";
+
+  bodyEl.innerHTML = `
+    <div class="runtime-diag-box is-${escapeHtml(health)}">
+      <div class="runtime-diag-title">${escapeHtml(rt.healthLabel || "状态未知")}</div>
+      <div class="runtime-diag-desc">${escapeHtml(rt.diagnosis || shot.agentSummary || "")}</div>
+    </div>
+    <div class="runtime-meta-grid">
+      <div class="runtime-meta-item"><span>当前任务</span><strong>${escapeHtml(rt.taskLabel || "-")} (${escapeHtml(shot.status)})</strong></div>
+      <div class="runtime-meta-item"><span>当前步骤</span><strong>${escapeHtml(rt.phase || "-")}</strong></div>
+      <div class="runtime-meta-item"><span>累计耗时 / 无动作</span><strong>${formatDurationZh(rt.elapsedSec || 0)} / ${formatDurationZh(rt.idleSec || 0)}</strong></div>
+      <div class="runtime-meta-item"><span>Worker 子进程</span><strong>${escapeHtml(pidText)}</strong></div>
+      <div class="runtime-meta-item"><span>后台桥接服务</span><strong>${escapeHtml(bridgeText)}</strong></div>
+      <div class="runtime-meta-item"><span>最近检查时间</span><strong>${escapeHtml(rt.checkedAt || "实时")}</strong></div>
+    </div>
+    <div class="runtime-log-section">
+      <div class="runtime-log-head">Agent 实时动作流水（最新在底部）</div>
+      <pre class="runtime-log-box">${escapeHtml(stepsText)}</pre>
+    </div>
+    <div class="runtime-log-section">
+      <div class="runtime-log-head">桥接调度日志（bridge.log）</div>
+      <pre class="runtime-log-box">${escapeHtml(logsText)}</pre>
+    </div>
+  `;
+
+  const retryBtn = document.getElementById("runtimeModalRetryBtn");
+  const recheckBtn = document.getElementById("runtimeModalRecheckBtn");
+  const restoreBtn = document.getElementById("runtimeModalRestoreBtn");
+  const busy = Boolean(state.runtimeBusy);
+  if (retryBtn) {
+    retryBtn.disabled = busy;
+    retryBtn.textContent = busy ? "重置重试中…" : "↻ 强制刷新重试";
+  }
+  if (recheckBtn) recheckBtn.disabled = busy;
+  if (restoreBtn) {
+    restoreBtn.disabled = busy || (!rt.isProcessing && !rt.isWaiting);
+  }
+}
+
+function syncRuntimePollingTimer() {
+  const curShot =
+    state.view === "detail"
+      ? (state.data?.shots || []).find((s) => s.id === state.selectedShotId) || null
+      : null;
+  const needPoll = Boolean(
+    state.runtimeModal.open || (curShot && isShotInQueueOrProcessing(curShot))
+  );
+  if (!needPoll) {
+    if (state.runtimePollTimer) {
+      clearInterval(state.runtimePollTimer);
+      state.runtimePollTimer = null;
+    }
+    return;
+  }
+  if (!state.runtimePollTimer) {
+    const initialTarget = state.runtimeModal.open ? state.runtimeModal.shotId : curShot?.id;
+    if (initialTarget) fetchShotRuntimeStatus(initialTarget);
+    state.runtimePollTimer = setInterval(() => {
+      const targetId = state.runtimeModal.open
+        ? state.runtimeModal.shotId
+        : state.view === "detail"
+        ? state.selectedShotId
+        : null;
+      if (targetId) fetchShotRuntimeStatus(targetId);
+    }, 2500);
   }
 }
 
@@ -4173,6 +4522,12 @@ function renderShotActionBarHtml(shot) {
     ? `<button id="syncLibtvBtn" class="btn btn-secondary btn-sm" type="button" title="从 ${escapeHtml(platLabel)} 画布拉取最新生成的样片">↓ 同步成片</button>`
     : "";
 
+  const rtSnap = isShotInQueueOrProcessing(shot) ? getShotRuntimeSnapshot(shot) : null;
+  const rtStalled = rtSnap && (rtSnap.health === "stalled" || rtSnap.health === "offline");
+  const runtimeStatusBtn = rtSnap
+    ? `<button id="openShotRuntimeBtn" class="btn ${rtStalled ? "btn-warning" : "btn-secondary"} btn-sm" type="button" title="查看后台 Agent 当前处理进度、进程是否存活或强制刷新重试">${rtStalled ? "⚠ 卡住·重试" : "📡 处理状态"}</button>`
+    : "";
+
   const canResumeChat = Boolean(shot.canResumeCliChat && shot.cliConversationId);
   const chatMainLabel = canResumeChat ? "💬 接手原对话" : "💬 前台开聊";
   const chatMainMode = canResumeChat ? "resume" : "new";
@@ -4238,6 +4593,7 @@ function renderShotActionBarHtml(shot) {
       <div class="shot-action-btns">
         ${historyBtn}
         ${syncBtn}
+        ${runtimeStatusBtn}
         ${chatSplitHtml}
         ${primaryBtn}
       </div>
@@ -4471,6 +4827,7 @@ function renderDetailView() {
   main.innerHTML = `
     <div class="stack-lg is-detail">
       ${renderShotActionBarHtml(shot)}
+      ${renderShotRuntimeBannerHtml(shot)}
       <div class="detail-workspace">
         <div class="detail-main-col">
           ${renderErrorBanner(shot)}
@@ -4998,7 +5355,17 @@ function bindDetailEvents(shot) {
     });
   });
 
+  let confirmResolving = false;
   const handleResolveConfirm = async (decision) => {
+    if (confirmResolving) return;
+    confirmResolving = true;
+    const approveBtn = document.getElementById("approveConfirmBtn");
+    const rejectBtn = document.getElementById("rejectConfirmBtn");
+    if (approveBtn) approveBtn.disabled = true;
+    if (rejectBtn) rejectBtn.disabled = true;
+    const activeBtn = decision === "approve" ? approveBtn : rejectBtn;
+    const origText = activeBtn ? activeBtn.textContent : "";
+    if (activeBtn) activeBtn.textContent = "提交中…";
     const fd = new FormData();
     fd.append("decision", decision);
     fd.append("comment", document.getElementById("confirmCommentInput")?.value || "");
@@ -5013,6 +5380,10 @@ function bindDetailEvents(shot) {
       await refreshState();
     } catch (err) {
       showToast(err.message);
+      if (approveBtn) approveBtn.disabled = false;
+      if (rejectBtn) rejectBtn.disabled = false;
+      if (activeBtn) activeBtn.textContent = origText;
+      confirmResolving = false;
     }
   };
   document.getElementById("approveConfirmBtn")?.addEventListener("click", () => handleResolveConfirm("approve"));
@@ -5551,6 +5922,7 @@ function renderActiveView() {
   renderSidebar();
   if (state.view === "builder") renderBuilderView();
   else renderDetailView();
+  syncRuntimePollingTimer();
 }
 
 async function refreshState({ preserveEditing = false } = {}) {
@@ -5957,8 +6329,27 @@ function bindGlobalEvents() {
     }
   });
 
-  // Delegated click for original comparison preview, Paint Canvas, or video Lightbox
+  // Delegated click for runtime status buttons, original comparison preview, Paint Canvas, or video Lightbox
   document.getElementById("mainPane").addEventListener("click", (e) => {
+    const rtDetailBtn = e.target.closest("#openShotRuntimeBtn, #runtimeBannerDetailBtn");
+    if (rtDetailBtn) {
+      e.stopPropagation();
+      if (state.selectedShotId) openShotRuntimeModal(state.selectedShotId);
+      return;
+    }
+    const rtRefreshBtn = e.target.closest("#runtimeBannerRefreshBtn");
+    if (rtRefreshBtn) {
+      e.stopPropagation();
+      if (state.selectedShotId) fetchShotRuntimeStatus(state.selectedShotId, { showToastOnResult: true });
+      return;
+    }
+    const rtRetryBtn = e.target.closest("#runtimeBannerRetryBtn");
+    if (rtRetryBtn) {
+      e.stopPropagation();
+      const curShot = (state.data?.shots || []).find((s) => s.id === state.selectedShotId);
+      if (curShot) retryShotProcessing(curShot.id, "retry");
+      return;
+    }
     const origBtn = e.target.closest("[data-zoom-orig-url]");
     if (origBtn) {
       e.stopPropagation();
@@ -6287,6 +6678,24 @@ function bindGlobalEvents() {
     saveExportConfig({ syncAllAfter: true });
   });
 
+  // Agent Runtime Modal
+  document.getElementById("closeRuntimeModalBtn")?.addEventListener("click", closeShotRuntimeModal);
+  document.getElementById("agentRuntimeModal")?.addEventListener("click", (e) => {
+    if (e.target.id === "agentRuntimeModal") closeShotRuntimeModal();
+  });
+  document.getElementById("runtimeModalRefreshBtn")?.addEventListener("click", () => {
+    if (state.runtimeModal.shotId) fetchShotRuntimeStatus(state.runtimeModal.shotId, { showToastOnResult: true });
+  });
+  document.getElementById("runtimeModalRetryBtn")?.addEventListener("click", () => {
+    if (state.runtimeModal.shotId) retryShotProcessing(state.runtimeModal.shotId, "retry");
+  });
+  document.getElementById("runtimeModalRecheckBtn")?.addEventListener("click", () => {
+    if (state.runtimeModal.shotId) retryShotProcessing(state.runtimeModal.shotId, "recheck");
+  });
+  document.getElementById("runtimeModalRestoreBtn")?.addEventListener("click", () => {
+    if (state.runtimeModal.shotId) retryShotProcessing(state.runtimeModal.shotId, "restore");
+  });
+
   // Lightbox & Paint Canvas modal
   bindPaintModalEvents();
   document.getElementById("closeLightboxBtn").addEventListener("click", closeLightbox);
@@ -6307,6 +6716,10 @@ function bindGlobalEvents() {
       }
       if (state.exportConfigModal?.open) {
         closeExportConfigModal();
+        return;
+      }
+      if (state.runtimeModal?.open) {
+        closeShotRuntimeModal();
         return;
       }
       if (!document.getElementById("lightboxModal")?.classList.contains("hidden")) {

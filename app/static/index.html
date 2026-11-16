@@ -12,7 +12,7 @@
     <link rel="manifest" href="/static/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/static/icon-192.png" />
     <link rel="icon" type="image/png" href="/static/icon-192.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=30" />
+    <link rel="stylesheet" href="/static/styles.css?v=31" />
   </head>
   <body>
     <div class="app-shell">
@@ -272,6 +272,26 @@
       </div>
     </div>
 
+    <!-- 单镜 Agent 实时处理状态与卡住重试弹窗 -->
+    <div id="agentRuntimeModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="runtimeModalTitle">
+      <div class="modal-card modal-card-wide export-modal-card">
+        <div class="modal-head">
+          <h3 id="runtimeModalTitle">Agent 处理实时状态</h3>
+          <button id="closeRuntimeModalBtn" class="icon-btn" type="button" aria-label="关闭处理状态窗口">✕</button>
+        </div>
+        <div class="modal-body">
+          <div id="agentRuntimeModalBody" class="runtime-modal-body"></div>
+          <div class="modal-actions">
+            <button id="runtimeModalRefreshBtn" class="btn btn-secondary" type="button">↻ 刷新状态</button>
+            <div class="modal-actions-spacer"></div>
+            <button id="runtimeModalRestoreBtn" class="btn btn-secondary" type="button" title="中止当前任务并安全退回上一次稳态（不重跑）">✕ 中止并退回稳态</button>
+            <button id="runtimeModalRecheckBtn" class="btn btn-secondary" type="button" title="中止后转入重新自检队列，由 Agent 核查画布并修复">🛠 转自检重检</button>
+            <button id="runtimeModalRetryBtn" class="btn btn-primary" type="button" title="若卡住，立刻中止旧进程并用相同任务重新入队重跑">↻ 强制刷新重试</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 图片预览 / 手涂涂白画板 Lightbox -->
     <div id="lightboxModal" class="lightbox-backdrop hidden" role="dialog" aria-modal="true">
       <div class="lightbox-inner" id="lightboxInner">
@@ -325,6 +345,6 @@
     <datalist id="sceneDatalist"></datalist>
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=30" type="module"></script>
+    <script src="/static/app.js?v=31" type="module"></script>
   </body>
 </html>

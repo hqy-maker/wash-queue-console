@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.5",
+  "version": "2026.11.16.6",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T19:43:54+08:00",
-  "changelog": "新增镜头命名与下载重命名、本地成片目录绑定；单镜修改/重转/画布同步或替换 1080P 时自动覆盖更新本地目录成片（无重复副本）。",
+  "publishedAt": "2026-11-16T20:34:24+08:00",
+  "changelog": "新增单镜 Agent 实时处理状态诊断与卡住一键刷新重试，修复 recheck_requested 模型/effort 冲突、重复确认误覆盖 claimToken 及即梦确认待办回归排队问题，并将单次桥接超时调优为 1500 秒。",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

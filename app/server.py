@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import quote
@@ -30,6 +31,7 @@ from store import (
     APP_ROOT,
     DATA_ROOT,
     SHOTS_DIR,
+    TASK_TYPE_LABELS,
     WORKSPACE_ROOT,
     ClaimConflictError,
     QueueStore,
@@ -63,12 +65,59 @@ def _read_bridge_pid() -> int | None:
         return None
 
 
+def _is_agy_command_pid(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        proc = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=2)
+        cmd = (proc.stdout or "").strip().lower()
+        return "agy" in cmd
+    except Exception:
+        return True
+
+
+def _parse_iso_ts(val: str | None) -> float | None:
+    text = str(val or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text[:19], fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _tail_shot_bridge_logs(shot_id: str, limit: int = 8) -> list[str]:
+    if not BRIDGE_LOG_PATH.is_file():
+        return []
+    try:
+        size = BRIDGE_LOG_PATH.stat().st_size
+        with BRIDGE_LOG_PATH.open("rb") as fh:
+            if size > 32768:
+                fh.seek(-32768, os.SEEK_END)
+            raw = fh.read().decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        needle_eq = f"shot={shot_id}"
+        needle_sp = f"] {shot_id} "
+        matched = [ln for ln in lines if needle_eq in ln or needle_sp in ln or f" {shot_id} " in ln]
+        return matched[-limit:]
+    except Exception:
+        return []
+
+
 class AgentPresenceTracker:
-    """In-memory heartbeat & health state for the background agy bridge pool."""
+    """In-memory heartbeat & live per-shot runtime telemetry for the agy bridge pool."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._watchers: dict[str, dict[str, Any]] = {}
+        self._shot_workers: dict[str, dict[str, Any]] = {}
+        self._cancel_tokens: dict[str, float] = {}
         self._bridge_meta: dict[str, Any] = {
             "lastConversationId": "",
             "lastRunAt": "",
@@ -91,6 +140,42 @@ class AgentPresenceTracker:
         expired = [k for k, v in self._watchers.items() if now >= float(v.get("expiresAt", 0.0))]
         for k in expired:
             self._watchers.pop(k, None)
+        expired_workers = [
+            sid for sid, w in self._shot_workers.items() if now - float(w.get("heartbeatMono", now)) >= 45.0
+        ]
+        for sid in expired_workers:
+            self._shot_workers.pop(sid, None)
+        expired_cancels = [tok for tok, exp in self._cancel_tokens.items() if now >= exp]
+        for tok in expired_cancels:
+            self._cancel_tokens.pop(tok, None)
+
+    def request_cancel(self, shot_id: str, claim_token: str) -> dict[str, Any]:
+        clean_tok = str(claim_token or "").strip()
+        killed_pid: int | None = None
+        agy_pid: int | None = None
+        now = time.monotonic()
+        with self._lock:
+            w = self._shot_workers.get(shot_id)
+            if isinstance(w, dict):
+                w_pid = w.get("agyPid")
+                if isinstance(w_pid, int) and (not clean_tok or str(w.get("claimToken") or "") == clean_tok):
+                    agy_pid = w_pid
+                self._shot_workers.pop(shot_id, None)
+            if clean_tok:
+                self._cancel_tokens[clean_tok] = now + 90.0
+        if agy_pid and _is_agy_command_pid(agy_pid):
+            try:
+                os.kill(agy_pid, signal.SIGTERM)
+                killed_pid = agy_pid
+            except OSError:
+                pass
+        return {"cancelledToken": clean_tok, "killedPid": killed_pid}
+
+    def get_active_cancel_tokens(self) -> list[str]:
+        now = time.monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            return list(self._cancel_tokens.keys())
 
     def record_heartbeat(
         self,
@@ -104,10 +189,12 @@ class AgentPresenceTracker:
         last_conversation_id: str | None = None,
         last_run_at: str | None = None,
         last_error: str | None = None,
+        shot_workers: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         wid = (watcher_id or mode or "agy_bridge").strip()[:80] or "agy_bridge"
         ttl = max(5.0, min(float(ttl_sec or 40.0), 180.0))
         now = time.monotonic()
+        wall_now = time.time()
         active_clean = [str(x).strip() for x in (active_shot_ids or []) if str(x).strip()]
         with self._lock:
             self._prune_locked(now)
@@ -118,7 +205,7 @@ class AgentPresenceTracker:
                 "activeShotIds": active_clean,
                 "pid": int(pid) if pid else None,
                 "expiresAt": now + ttl,
-                "updatedAt": time.time(),
+                "updatedAt": wall_now,
             }
             self._bridge_meta["busy"] = bool(busy)
             self._bridge_meta["activeShotIds"] = active_clean
@@ -128,6 +215,20 @@ class AgentPresenceTracker:
                 self._bridge_meta["lastRunAt"] = str(last_run_at).strip()
             if last_error is not None:
                 self._bridge_meta["lastError"] = str(last_error).strip()
+            if isinstance(shot_workers, dict):
+                next_workers: dict[str, dict[str, Any]] = {}
+                for k, v in shot_workers.items():
+                    if not isinstance(v, dict):
+                        continue
+                    sid = str(v.get("shotId") or k).strip()
+                    if not sid:
+                        continue
+                    rec = dict(v)
+                    rec["shotId"] = sid
+                    rec["heartbeatMono"] = now
+                    rec["heartbeatWall"] = wall_now
+                    next_workers[sid] = rec
+                self._shot_workers = next_workers
         return self.snapshot()
 
     def clear_watcher(self, watcher_id: str) -> None:
@@ -136,9 +237,136 @@ class AgentPresenceTracker:
             return
         with self._lock:
             self._watchers.pop(wid, None)
+            if wid == "agy_bridge":
+                self._shot_workers.clear()
+
+    def inspect_shot_runtime(self, shot: dict[str, Any]) -> dict[str, Any]:
+        sid = str(shot.get("id") or "").strip()
+        status = str(shot.get("status") or "").strip()
+        task_type = str(shot.get("processingTaskType") or (status if status in ACTIONABLE_STATUSES else "") or "").strip()
+        task_label = TASK_TYPE_LABELS.get(task_type, task_type or "后台处理")
+        snap = self.snapshot()
+        bridge_online = bool(snap.get("bridgeOnline"))
+        bridge_paused = bool(snap.get("bridgePaused"))
+        bridge_pid = snap.get("bridgePid")
+        wall_now = time.time()
+
+        with self._lock:
+            self._prune_locked(time.monotonic())
+            worker = dict(self._shot_workers.get(sid) or {})
+
+        claim_tok = str(shot.get("claimToken") or "").strip()
+        if worker and claim_tok and str(worker.get("claimToken") or "").strip() not in {"", claim_tok}:
+            worker = {}
+
+        claimed_ts = _parse_iso_ts(shot.get("claimedAt") or shot.get("updatedAt"))
+        started_at = float(worker.get("startedAt") or claimed_ts or wall_now) if (worker or status == "processing") else None
+        last_event_at = float(worker.get("lastEventAt") or started_at or wall_now) if (worker or status == "processing") else None
+        elapsed_sec = max(0, int(round(wall_now - started_at))) if started_at is not None else 0
+        idle_sec = max(0, int(round(wall_now - last_event_at))) if last_event_at is not None else 0
+
+        agy_pid = worker.get("agyPid") if isinstance(worker.get("agyPid"), int) else None
+        agy_pid_alive = _is_agy_command_pid(agy_pid) if agy_pid else None
+
+        is_processing = status == "processing"
+        is_waiting = status in ACTIONABLE_STATUSES
+        health = "idle"
+        health_label = "当前不在执行队列中"
+        diagnosis = "该镜头目前未在队列或后台处理中。"
+        suggested_action = "none"
+
+        if is_processing:
+            if not bridge_online:
+                health = "stalled"
+                health_label = "🔴 后台桥接进程未运行"
+                diagnosis = "镜头仍标记为「处理中」，但后台桥接进程已离线；建议点「↻ 刷新重试」重新入队并启动执行。"
+                suggested_action = "retry"
+            elif not worker:
+                if elapsed_sec >= 12:
+                    health = "stalled"
+                    health_label = "🔴 未检测到活跃 Worker（疑似中断）"
+                    diagnosis = f"桥接虽在线，但已过 {elapsed_sec} 秒仍未找到该镜头的活跃 Worker（可能桥接曾重启中断）；点「↻ 刷新重试」可立刻重跑。"
+                    suggested_action = "retry"
+                else:
+                    health = "running"
+                    health_label = "🟢 Worker 刚签收启动中"
+                    diagnosis = f"任务已签收（{elapsed_sec} 秒），正在拉起 Worker 状态心跳…"
+                    suggested_action = "wait"
+            elif agy_pid and agy_pid_alive is False:
+                health = "stalled"
+                health_label = "🔴 子进程已退出（未正常回写）"
+                diagnosis = f"检测到子进程 PID {agy_pid} 已不在运行，但镜头状态尚未回写完成；请点击「↻ 刷新重试」。"
+                suggested_action = "retry"
+            elif idle_sec >= 180:
+                health = "stalled"
+                health_label = f"🟠 已 {idle_sec} 秒无任何新响应（疑似卡住）"
+                diagnosis = f"已累计耗时 {elapsed_sec} 秒，但超过 {idle_sec} 秒没有任何新动作输出，可能卡在浏览器弹窗、登录或平台超时；可直接点「↻ 刷新重试」。"
+                suggested_action = "retry"
+            elif idle_sec >= 60:
+                health = "slow"
+                health_label = f"🟡 等待平台/工具响应中（{idle_sec} 秒前更新）"
+                diagnosis = f"Worker 进程在线（已耗时 {elapsed_sec} 秒），正在等待平台出片或外部工具返回结果。"
+                suggested_action = "wait"
+            else:
+                health = "running"
+                health_label = "🟢 Agent 正在正常处理中"
+                diagnosis = f"Worker 活跃运行中，已耗时 {elapsed_sec} 秒，最近 {idle_sec} 秒内有新输出。"
+                suggested_action = "wait"
+        elif is_waiting:
+            if bridge_paused:
+                health = "paused"
+                health_label = "⏸ 后台桥接已暂停"
+                diagnosis = "后台 4 路并发桥接处于暂停状态，任务暂时不会自动领单；点击右上角状态恢复桥接或点「↻ 重试」核查。"
+                suggested_action = "resume_bridge"
+            elif not bridge_online:
+                health = "offline"
+                health_label = "🔴 后台桥接未连接"
+                diagnosis = "当前任务正在队列等待，但后台桥接尚未启动；请在右上角点击「一键重连（启动桥接）」。"
+                suggested_action = "resume_bridge"
+            else:
+                health = "queued"
+                health_label = "⏳ 正在排队等待空闲槽位领单"
+                active_cnt = len(snap.get("activeShotIds") or [])
+                diagnosis = f"后台桥接正常在线（当前正在并发处理 {active_cnt}/{snap.get('maxWorkers', 4)} 个镜头），空闲后会立即自动领单执行。"
+                suggested_action = "wait"
+
+        return {
+            "shotId": sid,
+            "status": status,
+            "isProcessing": is_processing,
+            "isWaiting": is_waiting,
+            "taskType": task_type,
+            "taskLabel": task_label,
+            "health": health,
+            "healthLabel": health_label,
+            "diagnosis": diagnosis,
+            "suggestedAction": suggested_action,
+            "elapsedSec": elapsed_sec,
+            "idleSec": idle_sec,
+            "phase": str(worker.get("phase") or ("排队待领单" if is_waiting else ("后台处理中" if is_processing else ""))),
+            "stepCount": int(worker.get("stepCount") or 0),
+            "stepType": str(worker.get("stepType") or ""),
+            "lastNote": str(worker.get("lastNote") or shot.get("agentSummary") or ""),
+            "recentSteps": list(worker.get("recentSteps") or []),
+            "model": str(worker.get("model") or ""),
+            "resumed": bool(worker.get("resumed")),
+            "conversationId": str(worker.get("conversationId") or shot.get("cliConversationId") or ""),
+            "agyPid": agy_pid,
+            "agyPidAlive": agy_pid_alive,
+            "bridgeOnline": bridge_online,
+            "bridgePaused": bridge_paused,
+            "bridgePid": bridge_pid,
+            "claimedAt": str(shot.get("claimedAt") or ""),
+            "claimedBy": str(shot.get("claimedBy") or ""),
+            "startedAtIso": str(worker.get("startedAtIso") or shot.get("claimedAt") or ""),
+            "lastEventAtIso": str(worker.get("lastEventAtIso") or ""),
+            "recentLogs": _tail_shot_bridge_logs(sid, limit=8),
+            "checkedAt": time.strftime("%H:%M:%S", time.localtime(wall_now)),
+        }
 
     def snapshot(self, state_data: dict[str, Any] | None = None) -> dict[str, Any]:
         now = time.monotonic()
+        wall_now = time.time()
         live_pid = _read_bridge_pid()
         paused = self.is_paused()
         with self._lock:
@@ -147,6 +375,7 @@ class AgentPresenceTracker:
             bridge_watchers = [w for w in watchers if w["mode"] == "bridge"]
             bridge_online = bool(bridge_watchers) or (live_pid is not None and not paused)
             bridge_meta = dict(self._bridge_meta)
+            workers_copy = {sid: dict(w) for sid, w in self._shot_workers.items()}
 
         processing_ids = []
         pending_count = 0
@@ -186,6 +415,19 @@ class AgentPresenceTracker:
             label = "AI 桥接未连接"
             detail = "后台并发桥接进程未运行；点击下方「一键重连（启动桥接）」即可恢复自动领单执行。"
 
+        worker_summaries: dict[str, dict[str, Any]] = {}
+        for sid, w in workers_copy.items():
+            started_at = float(w.get("startedAt") or wall_now)
+            last_ev_at = float(w.get("lastEventAt") or started_at)
+            worker_summaries[sid] = {
+                "phase": w.get("phase", ""),
+                "lastNote": w.get("lastNote", ""),
+                "elapsedSec": max(0, int(round(wall_now - started_at))),
+                "idleSec": max(0, int(round(wall_now - last_ev_at))),
+                "stepCount": int(w.get("stepCount") or 0),
+                "agyPid": w.get("agyPid"),
+            }
+
         return {
             "state": conn_state,
             "label": label,
@@ -202,6 +444,7 @@ class AgentPresenceTracker:
             "lastConversationId": bridge_meta.get("lastConversationId", ""),
             "lastRunAt": bridge_meta.get("lastRunAt", ""),
             "lastError": bridge_meta.get("lastError", ""),
+            "shotWorkers": worker_summaries,
         }
 
 
@@ -725,6 +968,11 @@ class HeartbeatReq(BaseModel):
     lastConversationId: str | None = None
     lastRunAt: str | None = None
     lastError: str | None = None
+    shotWorkers: dict[str, dict[str, Any]] | None = None
+
+
+class RetryProcessingReq(BaseModel):
+    mode: str = "retry"
 
 
 class OpenShotChatReq(BaseModel):
@@ -1355,6 +1603,12 @@ def approve_final(shot_id: str) -> dict[str, Any]:
 def reprocess_shot(shot_id: str, req: ReprocessReq | None = None) -> dict[str, Any]:
     body = req or ReprocessReq()
     try:
+        prev_shot = store.get_shot(shot_id)
+        if prev_shot.get("status") == "processing" and prev_shot.get("claimToken"):
+            agent_presence.request_cancel(prev_shot["id"], str(prev_shot.get("claimToken") or ""))
+    except KeyError:
+        pass
+    try:
         shot = store.reprocess_shot(
             shot_id,
             reason=body.reason,
@@ -1674,6 +1928,36 @@ def get_agent_status() -> dict[str, Any]:
     return agent_presence.snapshot(store.get_state())
 
 
+@app.get("/api/shots/{shot_id}/agent-status")
+def get_shot_agent_runtime_status(shot_id: str) -> dict[str, Any]:
+    try:
+        shot = store.get_shot(shot_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    runtime = agent_presence.inspect_shot_runtime(shot)
+    return {"ok": True, "shot": shot, "runtime": runtime}
+
+
+@app.post("/api/shots/{shot_id}/retry-processing")
+def retry_processing_shot(shot_id: str, req: RetryProcessingReq | None = None) -> dict[str, Any]:
+    body = req or RetryProcessingReq()
+    try:
+        before_shot = store.get_shot(shot_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    old_token = str(before_shot.get("claimToken") or "").strip()
+    cancel_info = agent_presence.request_cancel(before_shot["id"], old_token)
+    try:
+        res = store.reset_stuck_shot(before_shot["id"], mode=body.mode)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    updated_shot = res["shot"]
+    if (body.mode or "retry").strip().lower() != "restore" and not agent_presence.is_paused():
+        ensure_bridge_running(clear_paused=False)
+    runtime = agent_presence.inspect_shot_runtime(updated_shot)
+    return {"ok": True, "cancelInfo": cancel_info, "runtime": runtime, **res}
+
+
 @app.post("/api/agent/heartbeat")
 def post_agent_heartbeat(req: HeartbeatReq) -> dict[str, Any]:
     snap = agent_presence.record_heartbeat(
@@ -1686,8 +1970,9 @@ def post_agent_heartbeat(req: HeartbeatReq) -> dict[str, Any]:
         last_conversation_id=req.lastConversationId,
         last_run_at=req.lastRunAt,
         last_error=req.lastError,
+        shot_workers=req.shotWorkers,
     )
-    return {"ok": True, "agentStatus": snap}
+    return {"ok": True, "agentStatus": snap, "cancelTokens": agent_presence.get_active_cancel_tokens()}
 
 
 @app.post("/api/agent/bridge/start")

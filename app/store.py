@@ -1997,6 +1997,8 @@ class QueueStore:
                 if shot["id"] != sid:
                     continue
                 req = shot.get("confirmationRequest")
+                if req is None and shot.get("status") in {"processing", *ACTIONABLE_STATUSES}:
+                    return _decorate_shot_payload(shot)
                 saved_correction = None
                 if corrected_file is not None:
                     fname, raw = corrected_file
@@ -2022,6 +2024,12 @@ class QueueStore:
                 self._clear_error_fields(shot)
                 jm = shot.get("jimengMeta") or {}
                 pending_act = str(jm.get("pendingAction") or "") if isinstance(jm, dict) else ""
+                if not pending_act and isinstance(jm, dict):
+                    has_draft_video = bool((shot.get("draftVideo") or {}).get("mediaUrl"))
+                    if jm.get("promoteSubmitId") or (has_draft_video and jm.get("promoteQuotedMaxCredits")):
+                        pending_act = "promote_1080p"
+                    elif jm.get("submitId") or jm.get("quotedCredits") or jm.get("quotedMaxCredits"):
+                        pending_act = "run_sample"
                 if decision == "approve" and pending_act == "promote_1080p":
                     shot["status"] = "final_requested"
                     shot["agentSummary"] = "1080P 正片积分上限已确认，正在提交并等待生成 1080P 正片…"
@@ -2698,6 +2706,82 @@ class QueueStore:
                     },
                 )
                 return _decorate_shot_payload(shot)
+        raise KeyError(f"镜头不存在: {shot_id}")
+
+    def reset_stuck_shot(self, shot_id: str, *, mode: str = "retry") -> dict[str, Any]:
+        """Abort/unstick a processing or stalled queued shot and re-queue or restore safely."""
+        sid = sanitize_shot_id(shot_id)
+        clean_mode = (mode or "retry").strip().lower()
+        if clean_mode not in {"retry", "recheck", "restore"}:
+            clean_mode = "retry"
+        with self._lock:
+            q = self._load_queue()
+            self._ensure_export_config(q)
+            for shot in q["shots"]:
+                if shot["id"] != sid:
+                    continue
+                old_token = str(shot.get("claimToken") or "")
+                old_task = str(shot.get("processingTaskType") or shot.get("status") or "")
+                jm = shot.get("jimengMeta") or {}
+                if clean_mode == "restore":
+                    if isinstance(jm, dict) and jm.get("pendingAction") == "promote_1080p":
+                        jm["pendingAction"] = ""
+                    if (shot.get("finalVideo") or {}).get("mediaUrl") and not shot.get("finalModifiedReopened"):
+                        target_status = "final_ready"
+                    elif (shot.get("draftVideo") or {}).get("mediaUrl"):
+                        target_status = "draft_ready"
+                    elif shot.get("libtvSampleNodeKey") or (isinstance(jm, dict) and jm.get("nodeId")):
+                        target_status = "ready_on_canvas"
+                    else:
+                        target_status = "drafting"
+                    summary = "已中止卡住的后台任务，并安全退回上一次稳定状态。"
+                elif clean_mode == "recheck":
+                    target_status = "recheck_requested"
+                    summary = "已中止卡住的后台任务，转入「重新自检修复」队列等待 Agent 核查…"
+                else:
+                    cand = str(shot.get("processingTaskType") or "").strip()
+                    if cand not in ACTIONABLE_STATUSES:
+                        cur_st = str(shot.get("status") or "").strip()
+                        if cur_st in ACTIONABLE_STATUSES:
+                            cand = cur_st
+                        elif isinstance(jm, dict) and jm.get("pendingAction") == "promote_1080p":
+                            cand = "final_requested"
+                        elif any(f.get("status") == "pending" for f in (shot.get("feedbacks") or [])):
+                            cand = "feedback_queued"
+                        elif (shot.get("pendingPromptEdit") or "").strip():
+                            cand = "prompt_update_requested"
+                        elif shot.get("libtvSampleNodeKey") or (isinstance(jm, dict) and jm.get("nodeId")):
+                            cand = "recheck_requested"
+                        else:
+                            cand = "queued"
+                    target_status = cand
+                    task_label = TASK_TYPE_LABELS.get(target_status, target_status)
+                    summary = f"已中止原卡住任务并重新入队重试（{task_label}），等待空闲 Worker 立即接单…"
+
+                self._clear_claim_fields(shot)
+                self._clear_error_fields(shot)
+                shot["status"] = target_status
+                shot["agentSummary"] = summary
+                shot["updatedAt"] = now_iso()
+                shot.setdefault("revisions", []).append(
+                    {"at": now_iso(), "actor": "user", "summary": summary}
+                )
+                self._save_queue(
+                    q,
+                    {
+                        "type": "processing_reset",
+                        "shotId": sid,
+                        "mode": clean_mode,
+                        "previousTask": old_task,
+                        "status": target_status,
+                    },
+                )
+                return {
+                    "shot": self._decorate_shot(q, shot),
+                    "previousClaimToken": old_token,
+                    "previousTaskType": old_task,
+                    "newStatus": target_status,
+                }
         raise KeyError(f"镜头不存在: {shot_id}")
 
     @staticmethod
