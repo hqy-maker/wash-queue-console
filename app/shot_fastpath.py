@@ -895,7 +895,7 @@ def prepare_shot_artifacts(
     shot_dir = SHOTS_DIR / sid
     shot_dir.mkdir(parents=True, exist_ok=True)
     out: dict[str, Any] = {"workMode": work_mode}
-    target_dur = _normalize_target_duration(shot.get("targetDuration"))
+    target_dur = _normalize_target_duration(shot.get("targetDuration")) if work_mode == "video_creation" else None
     if target_dur is not None:
         out["targetDuration"] = target_dur
 
@@ -995,7 +995,9 @@ def try_fastpath_prompt_update(
         model = str(gen.get("model") or jm.get("model") or "").strip()
         ratio = str(gen.get("ratio") or jm.get("ratio") or "").strip()
         resolution = str(gen.get("resolution") or jm.get("resolution") or "").strip()
-        duration = _normalize_target_duration(shot.get("targetDuration")) or gen.get("durationSeconds") or jm.get("duration")
+        is_creation = str(shot.get("workMode") or "video_wash").strip().lower() == "video_creation"
+        target_dur = _normalize_target_duration(shot.get("targetDuration")) if is_creation else None
+        duration = target_dur or gen.get("durationSeconds") or jm.get("duration")
         count = int(gen.get("outputCount") or 1)
         refs = [r for r in (gen.get("references") or []) if isinstance(r, dict) and r.get("id")]
         existing_node_ids = {str(r.get("id") or "") for r in refs if r.get("kind") == "node"}
@@ -1255,9 +1257,10 @@ def try_fastpath_jimeng_run(
         if progress_cb:
             progress_cb(phase, msg)
 
-    # Sync pending manual prompt edits or updated targetDuration cleanly before running
+    # Sync pending manual prompt edits or updated targetDuration (creation mode) cleanly before running
     pending_edit = str(shot.get("pendingPromptEdit") or "").strip()
-    explicit_dur = _normalize_target_duration(shot.get("targetDuration"))
+    is_creation = str(shot.get("workMode") or "video_wash").strip().lower() == "video_creation"
+    explicit_dur = _normalize_target_duration(shot.get("targetDuration")) if is_creation else None
     if pending_edit or explicit_dur is not None:
         if pending_edit and _UNRESOLVED_AT_RE.search(pending_edit):
             return {"handled": False, "reason": "pending_prompt_has_unresolved_at_mentions"}

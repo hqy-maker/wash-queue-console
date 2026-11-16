@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.17",
+  "version": "2026.11.16.18",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T23:48:51+08:00",
-  "changelog": "精简提速：按模式/任务分级调度模型思考档位(medium/high)；新增jimeng_commit_sample.py原子单命令建样片+报价+回写(省2轮对话)；画布layout增量缓存+预处理三路并行；加长长轮询防空转+前端详情无变更免重绘",
+  "publishedAt": "2026-11-16T23:51:38+08:00",
+  "changelog": "「⏱️ 生成时长」控制块仅在「🎬 正常生成」模式显示并生效；「🎞️ 洗视频」默认完全隐藏手动时长选项，严格按原视频长度自动对齐不变",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

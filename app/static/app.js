@@ -276,7 +276,7 @@ function shotMediaSubtitle(s) {
   if (s.sourceVideo?.mediaUrl || s.sourceVideo?.filePath) {
     return mediaDisplayName(s.sourceVideo, "原片视频");
   }
-  if (s.compImage) return s.targetDuration ? `仅图参考 · ${s.targetDuration}s` : "仅图参考";
+  if (s.compImage) return s.workMode === "video_creation" && s.targetDuration ? `仅图参考 · ${s.targetDuration}s` : "仅图参考";
   if (s.workMode === "video_creation") return s.targetDuration ? `纯文生 · ${s.targetDuration}s` : "纯文生视频";
   return "";
 }
@@ -4030,7 +4030,7 @@ function renderBuilderView() {
         </div>
 
         ${uploadGridHtml}
-        ${buildBuilderDurationBarHtml(b, isCreationMode)}
+        ${isCreationMode ? buildBuilderDurationBarHtml(b, true) : ""}
       </section>
 
       <section class="card">
@@ -4506,7 +4506,7 @@ async function submitBuilderShot(forceOverwrite = false) {
     fd.append("scene", (b.scene || "").trim());
     fd.append("platform", activeCtx.platform);
     fd.append("work_mode", workMode);
-    if (normalizeTargetDuration(b.targetDuration)) {
+    if (workMode === "video_creation" && normalizeTargetDuration(b.targetDuration)) {
       fd.append("target_duration", String(normalizeTargetDuration(b.targetDuration)));
     }
     fd.append("project_uuid", activeCtx.uuid || "");
@@ -4969,8 +4969,7 @@ function renderShotActionBarHtml(shot) {
   return `
     <section class="shot-action-bar" aria-label="整镜全局操作栏">
       <div class="shot-action-meta">
-        ${shot.workMode === "video_creation" ? `<span class="shot-mode-tag is-detail" title="正常生成模式：仅使用 seedance-video-prompts，已跳过原片洗片与深度捕捉">🎬 正常生成</span>` : ""}
-        ${detailDurHtml}
+        ${shot.workMode === "video_creation" ? `<span class="shot-mode-tag is-detail" title="正常生成模式：仅使用 seedance-video-prompts，已跳过原片洗片与深度捕捉">🎬 正常生成</span>${detailDurHtml}` : ""}
         ${passedMetaHtml}
         <span id="shotChangeBadge" class="change-badge ${info.badgeCls}" title="${escapeHtml(info.badgeTitle || "")}">${escapeHtml(passed && !info.hasChanges ? "✓ 与定版正片一致" : info.badgeText)}</span>
       </div>

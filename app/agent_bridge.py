@@ -485,11 +485,17 @@ def _build_worker_prompt(
         refs_cli_hint = " ".join(ordered_refs) if ordered_refs else ""
         pid = str(shot.get("projectUuid") or "")
 
-        raw_target_dur = shot.get("targetDuration")
+        raw_target_dur = shot.get("targetDuration") if is_creation else None
         explicit_dur = int(round(float(raw_target_dur))) if raw_target_dur else 0
         if explicit_dur > 0:
             explicit_dur = max(4, min(30, explicit_dur))
-        dur_cli_token = str(explicit_dur) if explicit_dur else "<整数秒>"
+        src_sug_dur = (
+            ((shot.get("sourceVideo") or {}).get("meta") or {}).get("suggestedDuration")
+            if not is_creation
+            else None
+        )
+        src_sug_int = max(4, min(30, int(round(float(src_sug_dur))))) if src_sug_dur else 0
+        dur_cli_token = str(explicit_dur) if explicit_dur else (str(src_sug_int) if src_sug_int else "<整数秒>")
         dur_rule_line = (
             f"- **目标时长强约束**：用户已明确指定生成时长为 **`{explicit_dur}s`**；请确保提示词动作节奏/时间戳按 `{explicit_dur}` 秒编排，并在建节点命令中严格传入 `--duration {explicit_dur}`。\n"
             if explicit_dur
@@ -594,11 +600,11 @@ def _build_worker_prompt(
             f"请先阅读 `{wash_skill_md}` 及本任务涉及的配套 Skill{skill_list}，然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
         )
 
-    hdr_dur = shot.get("targetDuration")
+    hdr_dur = shot.get("targetDuration") if is_creation else None
     hdr_dur_label = (
         f"{int(hdr_dur)}s（用户明确指定，须严格传 --duration {int(hdr_dur)}）"
         if hdr_dur
-        else ("默认 5s / 按需 4-30s" if is_creation else "自动对齐原片整数秒（4-30s）")
+        else ("默认 5s / 按需 4-30s" if is_creation else "自动对齐原视频长度不变")
     )
 
     return (
