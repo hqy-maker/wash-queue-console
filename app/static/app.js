@@ -2243,9 +2243,25 @@ function renderCanvasPopover() {
 
   const curWsId = state.data?.platformDefaults?.libtv?.workspaceId || state.data?.defaultWorkspaceId || "";
   const curWsLabel = state.data?.platformDefaults?.libtv?.projectName || state.data?.defaultProjectName || "当前工作区";
+  const curCeiling = Number(state.data?.jimengCreditCeiling ?? 0) || 0;
   const jimengAccountBarHtml =
     activePlat === "jimeng" && jimengSt.authenticated
-      ? `<div class="jimeng-account-bar"><span>已连接：${escapeHtml(jimengSt.accountName || "即梦账号")}${jimengSt.teamName ? ` · ${escapeHtml(jimengSt.teamName)}` : ""}</span><span>${jimengSt.credits != null ? `积分 ${escapeHtml(String(jimengSt.credits))}` : ""}</span></div>`
+      ? `
+        <div class="jimeng-account-bar">
+          <div class="jimeng-account-top">
+            <span>已连接：${escapeHtml(jimengSt.accountName || "即梦账号")}${jimengSt.teamName ? ` · ${escapeHtml(jimengSt.teamName)}` : ""}</span>
+            <span>${jimengSt.credits != null ? `积分 ${escapeHtml(String(jimengSt.credits))}` : ""}</span>
+          </div>
+          <div class="jimeng-ceiling-row" title="设置单镜积分自动确认上限：报价不超过上限时自动执行 node confirm/run，超限或设为 0 时停在待确认询问">
+            <span class="jimeng-ceiling-label">单镜自动确认上限</span>
+            <div class="jimeng-ceiling-ctrl">
+              <input id="jimengCreditCeilingInput" type="number" min="0" max="100000" step="50" value="${curCeiling}" />
+              <span class="jimeng-ceiling-unit">积分</span>
+              <button id="saveJimengCeilingBtn" class="btn btn-secondary btn-sm" type="button">保存</button>
+            </div>
+          </div>
+        </div>
+      `
       : "";
 
   const createModeSelectHtml =
@@ -2288,6 +2304,41 @@ function renderCanvasPopover() {
       e.stopPropagation();
       switchPlatform(tBtn.dataset.popoverPlatform, { openPopover: true });
     });
+  });
+
+  const ceilingInp = document.getElementById("jimengCreditCeilingInput");
+  const saveCeilingBtn = document.getElementById("saveJimengCeilingBtn");
+  const submitCreditCeiling = async () => {
+    const rawVal = Number(ceilingInp?.value ?? 0);
+    const cleanVal = Number.isFinite(rawVal) ? Math.max(0, Math.min(100000, Math.round(rawVal))) : 0;
+    try {
+      const res = await apiJson("/api/config/jimeng-credit-ceiling", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ creditCeiling: cleanVal }),
+      });
+      if (state.data) state.data.jimengCreditCeiling = res.jimengCreditCeiling ?? cleanVal;
+      if (ceilingInp) ceilingInp.value = String(res.jimengCreditCeiling ?? cleanVal);
+      showToast(
+        (res.jimengCreditCeiling ?? cleanVal) > 0
+          ? `已开启即梦单镜 ${res.jimengCreditCeiling ?? cleanVal} 积分以内自动确认放行`
+          : "已关闭即梦自动确认（每次扣费停下询问）"
+      );
+    } catch (err) {
+      showToast(err.message);
+    }
+  };
+  ceilingInp?.addEventListener("click", (e) => e.stopPropagation());
+  ceilingInp?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      submitCreditCeiling();
+    }
+  });
+  saveCeilingBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    submitCreditCeiling();
   });
 
   const searchInp = document.getElementById("canvasSearchInput");

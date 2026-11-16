@@ -922,6 +922,10 @@ class ErrorRecoverReq(BaseModel):
     mode: str = "retry"
 
 
+class JimengCreditCeilingReq(BaseModel):
+    creditCeiling: int = 0
+
+
 class AgentUpdateReq(BaseModel):
     status: str | None = None
     platform: str | None = None
@@ -1355,6 +1359,12 @@ def start_jimeng_auth_login() -> dict[str, Any]:
         projects, _, _ = _get_projects_cached("jimeng", force=True)
     st = jimeng_bridge.get_auth_status(force=True)
     return {"ok": True, **res, "jimengStatus": st, "projects": projects}
+
+
+@app.post("/api/config/jimeng-credit-ceiling")
+def set_jimeng_credit_ceiling(req: JimengCreditCeilingReq) -> dict[str, Any]:
+    updated = store.set_jimeng_credit_ceiling(req.creditCeiling)
+    return {"ok": True, "jimengCreditCeiling": int(updated.get("jimengCreditCeiling", 0))}
 
 
 @app.post("/api/config/default-project")

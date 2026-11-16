@@ -111,6 +111,7 @@ def _load_bridge_settings() -> dict[str, Any]:
         "midEffort": _str_opt("midEffort", "WASH_BRIDGE_MID_EFFORT", "medium"),
         "recheckEffort": _str_opt("recheckEffort", "WASH_BRIDGE_RECHECK_EFFORT", "medium"),
         "fastEffort": _str_opt("fastEffort", "WASH_BRIDGE_FAST_EFFORT", "low"),
+        "jimengCreditCeiling": _int_opt("jimengCreditCeiling", "WASH_JIMENG_CREDIT_CEILING", 0, 0, 100000),
     }
 
 
@@ -259,8 +260,8 @@ JIMENG_TASK_SECTION_HINTS = {
     "queued": "请严格按 Fast-Path 预建流执行：优先直接复用 `prepped` 中已预上传并定位好的 `preuploadedCompNodeId`、`preuploadedCharRefNodes`（含 `公共-<角色>`）、`preuploadedSourceNodeId` 及 `pretriggeredDepthNodeId`（无需重扫全画布、重复上传或重开浏览器点深度）；用 `read_file` 看 `prepped.sourceKeyframesPath`（有明显声波才听 `prepped.sourceAudioPath`）并目视 `compImage` 决定是否跑 `whiteout_mask.py` 涂白替换；写出高水准提示词并落盘 `outputs/{shot_id}_提示词.md`，确认景深视频生成就绪后创建 `{shot_id}-样片`（`--mode m2v --model seedance_2.5_draft --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x 3620 --y <suggestedRowY>`，严禁传 `--run`）并完成只读 `node quote` 报价，最后回写 `ready_on_canvas`、`jimengMeta` 与 `revisionDirection`。",
     "feedback_queued": "请严格按 `wash-queue-console` + `dreamina-canvas-cli` 处理即梦官网画布修改意见：**必须逐条核对并落实 `pendingFeedbacks[]` 中的全部未处理意见**（例如既有手涂涂白替换，又紧接着补充了细节修改意见），遵循增量修改原则，上传新素材并替换连线与 `dreamina-canvas node edit`（显式 `--project-id`）同步至即梦节点与 `outputs/{shot_id}_提示词.md`，保留既有已归档正片元字段，回写 `ready_on_canvas`、`resolveFeedbacks: true` 与 `revisionDirection`。",
     "recheck_requested": "请用 `dreamina-canvas node show` 与 `schema` 核对即梦官网画布节点/连线/参考顺序/提示词规范并补全同步，恢复合适状态并在 `revisionDirection` / `agentSummary` 汇报结果。",
-    "final_requested": "请用 `dreamina-canvas node promote`（若超过 7 天有效期提醒用户）或超清工作流为即梦官网样片转 1080P 正片、下载归档并完成画面与音频全量质检后，回写 `final_ready`。",
-    "run_requested": "请严格遵循 `dreamina-canvas-cli` 报价与积分确认规则：先核对待更新提示词并用 `dreamina-canvas node quote` 查看即梦积分报价；若需确认或无用户明确 ceiling 授权请遵循 `credits-and-hitl.md` 停下询问并保存 `jimengMeta` 中的 `submitId`；取得批准后执行 `node confirm`/`node run`、下载并多模态自检成片后再回写结果（样片交付时务必提醒最长存储 7 天）。",
+    "final_requested": "请用 `dreamina-canvas node promote video-sample` 为即梦官网样片转 1080P 正片、下载归档并完成画面与音频全量质检后回写 `final_ready`；若 `brief.jimengCreditCeiling > 0` 且报价在该上限内，直接传 `--credit-ceiling <ceiling> --yes` 自动确认执行（禁止无故停在 `needs_confirmation`），仅在超限或无法报价时才停下询问。",
+    "run_requested": "请严格遵循 `dreamina-canvas-cli` 报价与积分确认规则：先核对待更新提示词并用 `dreamina-canvas node quote` 查看即梦积分报价；若 `brief.jimengCreditCeiling > 0` 且总价在该上限内（且余额充足、非 `occupancy_unknown`），**直接执行 `node confirm --credit-ceiling <ceiling>` + `node run --credit-token <token>`** 放行生成（禁止再停回 `needs_confirmation` 询问）；仅在超限或 `jimengCreditCeiling == 0` 时停下保存 `submitId`；出片后下载并多模态自检，回写 `draft_ready`（提醒样片最长保存 7 天）。",
     "prompt_update_requested": "请对照 `promptText` 与 `previousPromptText`，通过 `dreamina-canvas node edit video`（显式 `--project-id` 与完整 generation/ref 参数，不触发 `node run`）将改词同步回即梦官网画布节点与 `outputs/{shot_id}_提示词.md`，完成后恢复为 `promptUpdatePrevStatus`（若已有 `finalModifiedReopened` 标记不得回写 `final_ready`）并清除 `pendingPromptEdit`。",
 }
 
@@ -331,6 +332,11 @@ def _build_worker_prompt(
         "promptFilePath": shot.get("promptFilePath"),
         "pendingFeedbacks": pending_fbs,
         "latestFeedback": shot.get("latestFeedback"),
+        "jimengCreditCeiling": (
+            int(shot["jimengCreditCeiling"])
+            if shot.get("jimengCreditCeiling") is not None
+            else int(SETTINGS.get("jimengCreditCeiling") or 0)
+        ),
         "prepped": prepped or {},
         "depthCdpScriptPath": str(Path(__file__).resolve().parent / "scripts" / "dreamina_depth_cdp.py"),
     }
@@ -355,15 +361,24 @@ def _build_worker_prompt(
     )
 
     prepped_dict = prepped or {}
+    credit_ceiling = int(brief.get("jimengCreditCeiling") or 0)
     if is_jimeng:
         if task_type == "queued" and prepped_dict.get("prebuildReady"):
             skill_list = "（`dreamina-canvas-cli`、`seedance-video-recreation`、`seedance-video-prompts`）"
         else:
             skill_list = "（`dreamina-canvas-cli`、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`）"
+        if credit_ceiling > 0:
+            credit_rule = (
+                f"3. **已获用户明确全局积分上限授权（`{credit_ceiling}` 积分/镜）**：在 `run_requested` 或 `final_requested` 中执行扣费前，先核对报价（`node quote` 等）；只要明确报价 **`<= {credit_ceiling}`** 积分且余额充足，**严禁停在 `needs_confirmation` 打断用户**，直接调用 `dreamina-canvas node confirm --project-id <projectUuid> --node-id <nodeId> --credit-ceiling {credit_ceiling}` 获取 `--credit-token` 后紧接着 `node run`（1080P 转正传 `--credit-ceiling {credit_ceiling} --yes`）放行生成；只有超过 `{credit_ceiling}`、报 `occupancy_unknown` 或余额不足时才停回 `needs_confirmation`；`nodeId` / `submitId` / `selectedResourceId` 写入 `jimengMeta`（严禁保存 token 或凭据）；向用户交付样片时须明确提醒最长存储 7 天。\n"
+            )
+        else:
+            credit_rule = (
+                "3. 若需积分确认请严格遵循 `credits-and-hitl.md`，并将 `nodeId` / `submitId` / `selectedResourceId`（严禁保存 token 或凭据）写入 `jimengMeta`；向用户交付样片时须明确提醒最长存储 7 天。\n"
+            )
         exec_rules = (
             f"1. 目标平台为 **即梦官网（`dreamina-canvas` CLI）**：请遵循 `{dreamina_skill_md}`（命令入参以 `dreamina-canvas --format json schema` 实测为准，显式传入 `--project-id <projectUuid>`，不得调用未公开接口）。\n"
             f"2. {chrome_lock_rule}"
-            "3. 若需积分确认请严格遵循 `credits-and-hitl.md`，并将 `nodeId` / `submitId` / `selectedResourceId`（严禁保存 token 或凭据）写入 `jimengMeta`；向用户交付样片时须明确提醒最长存储 7 天。\n"
+            f"{credit_rule}"
             f"4. {callback_rule}"
             "5. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n"
             f"{lightweight_rule}"
@@ -489,12 +504,33 @@ def _describe_stream_event(evt: dict[str, Any]) -> tuple[str, str]:
 SAFE_AUTO_RETRY_TASKS = {"queued", "feedback_queued", "recheck_requested", "prompt_update_requested"}
 
 
+def _is_auth_error(err_msg: str) -> bool:
+    low = (err_msg or "").lower()
+    return any(
+        k in low
+        for k in (
+            "authentication failed",
+            "auth failed",
+            "auth timed out",
+            "not logged into",
+            "oauth",
+            "keyring",
+            "unauthorized",
+            "login",
+            "401",
+            "403",
+        )
+    )
+
+
 def _is_auto_retryable_issue(err_msg: str) -> bool:
     low = (err_msg or "").lower()
     if not low:
         return False
-    # Never auto-retry policy/auth/credits/model errors or manual cancels
-    if any(k in low for k in ("已被用户手动中止", "invalid model", "401", "403", "unauthorized", "login", "insufficient", "credit", "safety", "policy")):
+    # Never auto-retry policy/auth/credits/model errors or manual cancels (check auth BEFORE "timed out"!)
+    if _is_auth_error(low):
+        return False
+    if any(k in low for k in ("已被用户手动中止", "invalid model", "insufficient", "credit", "safety", "policy")):
         return False
     return any(
         k in low
@@ -522,6 +558,8 @@ class BridgeRuntime:
         self.base_url = base_url
         self._lock = threading.Lock()
         self._conv_lock = threading.Lock()
+        self._spawn_lock = threading.Lock()
+        self._auth_cooldown_until = 0.0
         self._active: dict[str, Future[None]] = {}
         self._worker_states: dict[str, dict[str, Any]] = {}
         self._worker_procs: dict[str, subprocess.Popen[Any]] = {}
@@ -825,7 +863,13 @@ class BridgeRuntime:
         last_step_append_ts = 0.0
         task_type = str(shot.get("processingTaskType") or "")
         current_phase = "启动 agy 进程"
+        spawn_lock_held = False
+        spawn_auth_settled = False
         try:
+            # Stagger concurrent agy cold starts so macOS Keyring LoadStoredToken never exceeds its 5s timeout under contention
+            self._spawn_lock.acquire()
+            spawn_lock_held = True
+            spawn_deadline = time.monotonic() + 12.0
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(WORKSPACE_ROOT),
@@ -856,8 +900,17 @@ class BridgeRuntime:
             sel = selectors.DefaultSelector()
             sel.register(fd, selectors.EVENT_READ)
 
+            def _release_spawn_lock_once() -> None:
+                nonlocal spawn_lock_held
+                if spawn_lock_held:
+                    spawn_lock_held = False
+                    try:
+                        self._spawn_lock.release()
+                    except RuntimeError:
+                        pass
+
             def _consume_line(raw_text: str) -> None:
-                nonlocal conv_id, err_msg, last_status, last_step_append_ts, current_phase
+                nonlocal conv_id, err_msg, last_status, last_step_append_ts, current_phase, spawn_auth_settled
                 line = raw_text.strip()
                 if not line:
                     return
@@ -871,6 +924,9 @@ class BridgeRuntime:
                             self._set_shot_conversation_id(shot, conv_id)
                             self._update_worker(shot_id, conversationId=conv_id)
                             _log(f"{shot_id} agy conversation_id={conv_id} (resumed={bool(resume_conv_id)})")
+                        if not spawn_auth_settled and evt.get("event") in {"init", "step_update", "message", "result"}:
+                            spawn_auth_settled = True
+                            _release_spawn_lock_once()
                         phase_str, note_str = _describe_stream_event(evt)
                         if phase_str:
                             current_phase = phase_str
@@ -917,6 +973,8 @@ class BridgeRuntime:
                         break
 
                     now_m = time.monotonic()
+                    if spawn_lock_held and (spawn_auth_settled or now_m >= spawn_deadline or proc.poll() is not None):
+                        _release_spawn_lock_once()
                     if now_m > deadline:
                         err_msg = f"执行超时（超过 {AGY_TIMEOUT_SEC}s）"
                         _terminate_proc_silently(proc)
@@ -971,6 +1029,12 @@ class BridgeRuntime:
             with self._lock:
                 if self._worker_procs.get(shot_id) is proc:
                     self._worker_procs.pop(shot_id, None)
+            if spawn_lock_held:
+                spawn_lock_held = False
+                try:
+                    self._spawn_lock.release()
+                except RuntimeError:
+                    pass
         return conv_id, err_msg, last_status
 
     def _run_shot_worker(self, shot: dict[str, Any]) -> None:
@@ -1053,10 +1117,15 @@ class BridgeRuntime:
                 claim_token=claim_token,
             )
 
-            # Fallback seamlessly to a fresh session if resuming an older conversation failed and claim still holds
+            # Fallback seamlessly to a fresh session if resuming an older conversation failed and claim still holds (never retry auth popups)
             with self._lock:
                 user_cancelled = claim_token in self._cancelled_tokens
-            if not user_cancelled and resume_id and (err_msg or (last_status and last_status != "SUCCESS")):
+            if (
+                not user_cancelled
+                and resume_id
+                and not _is_auth_error(err_msg or last_status)
+                and (err_msg or (last_status and last_status != "SUCCESS"))
+            ):
                 if self._claim_still_ours(shot_id, claim_token):
                     _log(f"{shot_id} resume conv={resume_id} failed ({err_msg}); retrying fresh session")
                     self._clear_shot_conversation_id(shot_id)
@@ -1136,8 +1205,13 @@ class BridgeRuntime:
             if was_cancelled:
                 _log(f"worker cancelled by user reset shot={shot_id}")
             elif err_msg or (last_status and last_status != "SUCCESS"):
-                _log(f"worker finished with issue shot={shot_id}: {err_msg or last_status}")
-                self._ensure_not_stuck_processing(shot_id, claim_token, err_msg or last_status)
+                issue_text = err_msg or last_status
+                if _is_auth_error(issue_text):
+                    with self._lock:
+                        self._auth_cooldown_until = max(self._auth_cooldown_until, time.monotonic() + 30.0)
+                    _log(f"auth cooldown 30s activated after {shot_id} auth error (suppressing popup loops)")
+                _log(f"worker finished with issue shot={shot_id}: {issue_text}")
+                self._ensure_not_stuck_processing(shot_id, claim_token, issue_text)
             else:
                 _log(f"worker finished shot={shot_id} conv={conv_id}")
 
@@ -1199,9 +1273,10 @@ class BridgeRuntime:
 
                         with self._lock:
                             running_count = len(self._active)
+                            auth_cooling = time.monotonic() < self._auth_cooldown_until
                         slots = MAX_WORKERS - running_count
 
-                        if slots > 0 and st.get("pendingCount", 0) > 0 and find_agy_bin():
+                        if slots > 0 and not auth_cooling and st.get("pendingCount", 0) > 0 and find_agy_bin():
                             claim_resp = client.post(
                                 "/api/agent/claim",
                                 json={"workerId": "agy_bridge", "limit": slots},

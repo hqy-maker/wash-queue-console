@@ -77,6 +77,19 @@ DEFAULT_PLATFORM = "libtv"
 JIMENG_HOME_URL = "https://jimeng.jianying.com/ai-tool/home"
 
 
+def _parse_credit_ceiling(raw: Any, default: int = 0) -> int:
+    try:
+        if raw is None or str(raw).strip() == "":
+            return max(0, min(int(default), 100000))
+        val = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return max(0, min(int(default), 100000))
+    return max(0, min(val, 100000))
+
+
+DEFAULT_JIMENG_CREDIT_CEILING = _parse_credit_ceiling(os.environ.get("WASH_JIMENG_CREDIT_CEILING"), default=0)
+
+
 def normalize_platform(raw: str | None) -> str:
     clean = (raw or "").strip().lower()
     if clean in {"jimeng", "dreamina", "即梦", "即梦官网"}:
@@ -1181,6 +1194,28 @@ class QueueStore:
         return cfg
 
     @staticmethod
+    def _get_jimeng_credit_ceiling(q: dict[str, Any]) -> int:
+        if "jimengCreditCeiling" in q and q.get("jimengCreditCeiling") is not None:
+            return _parse_credit_ceiling(q.get("jimengCreditCeiling"), default=DEFAULT_JIMENG_CREDIT_CEILING)
+        return DEFAULT_JIMENG_CREDIT_CEILING
+
+    def get_jimeng_credit_ceiling(self) -> int:
+        with self._lock:
+            q = self._load_queue()
+            return self._get_jimeng_credit_ceiling(q)
+
+    def set_jimeng_credit_ceiling(self, credit_ceiling: int) -> dict[str, Any]:
+        clean_val = _parse_credit_ceiling(credit_ceiling, default=0)
+        with self._lock:
+            q = self._load_queue()
+            q["jimengCreditCeiling"] = clean_val
+            self._save_queue(
+                q,
+                {"type": "jimeng_credit_ceiling_changed", "creditCeiling": clean_val},
+            )
+            return q
+
+    @staticmethod
     def _decorate_shot(q: dict[str, Any], shot: dict[str, Any]) -> dict[str, Any]:
         return _decorate_shot_payload(shot, export_config=_extract_export_config(q))
 
@@ -1298,6 +1333,7 @@ class QueueStore:
                 "defaultExportDir": export_cfg["defaultExportDir"],
                 "sceneExportDirs": export_cfg["sceneExportDirs"],
                 "autoSyncExport": export_cfg["autoSyncExport"],
+                "jimengCreditCeiling": self._get_jimeng_credit_ceiling(q),
                 "eventSeq": q.get("eventSeq", 1),
                 "events": q.get("events", [])[-20:],
                 "scenes": q.get("scenes", []),
@@ -2877,7 +2913,12 @@ class QueueStore:
                 if s.get("status") in ACTIONABLE_STATUSES and (not wanted or s["id"] in wanted)
             ][:max_items]
             digest = self._build_digest(targets)
-            claimed = [self._claim_shot_obj(s, worker_id) for s in targets]
+            ceiling = self._get_jimeng_credit_ceiling(q)
+            claimed = []
+            for s in targets:
+                c = self._claim_shot_obj(s, worker_id)
+                c["jimengCreditCeiling"] = ceiling
+                claimed.append(c)
             if claimed:
                 clean_worker = (worker_id or "coordinator").strip()[:80] or "coordinator"
                 self._save_queue(
@@ -2896,6 +2937,7 @@ class QueueStore:
                 "defaultProjectUuid": q.get("defaultProjectUuid", DEFAULT_PROJECT_UUID),
                 "defaultProjectName": q.get("defaultProjectName", DEFAULT_PROJECT_NAME),
                 "defaultWorkspaceId": q.get("defaultWorkspaceId", DEFAULT_WORKSPACE_ID),
+                "jimengCreditCeiling": ceiling,
                 "claimedCount": len(claimed),
                 "remainingPendingCount": remaining_pending,
                 "processingCount": len(processing_ids),
@@ -2908,6 +2950,7 @@ class QueueStore:
         sid = sanitize_shot_id(shot_id)
         with self._lock:
             q = self._load_queue()
+            ceiling = self._get_jimeng_credit_ceiling(q)
             for shot in q["shots"]:
                 if shot["id"] != sid:
                     continue
@@ -2916,6 +2959,7 @@ class QueueStore:
                         f"镜头 {sid} 当前状态为 {shot.get('status')}，已被其他并发任务签收或无需领单"
                     )
                 claimed_copy = self._claim_shot_obj(shot, worker_id)
+                claimed_copy["jimengCreditCeiling"] = ceiling
                 self._save_queue(
                     q,
                     {

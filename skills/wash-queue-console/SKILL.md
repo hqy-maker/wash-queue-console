@@ -74,12 +74,12 @@ description: >-
 2. 全部校验修复完成后，更新 `POST /api/shots/{shot_id}/agent-update`，把 `status` 恢复为合适状态（如 `ready_on_canvas` 或 `draft_ready`）并在 `agentSummary` 与 `revisions` 写明逐项核查结果。
 
 ### D. `final_requested`（转为 1080P 正片并下载归档）
-按 `libtv-seedance-batch` 执行 `libtv video final -n <sampleNodeKey> -p <projectUuid> [-g <groupKey>]` 转出 1080P 正片并下载至 `shots/{shot_id}/final_1080p.mp4`，回写 `status: "final_ready"`、`finalVideo: { filePath, remoteUrl, watermark }` 与本地正片路径。
+按 `libtv-seedance-batch` 执行 `libtv video final -n <sampleNodeKey> -p <projectUuid> [-g <groupKey>]` 转出 1080P 正片并下载至 `shots/{shot_id}/final_1080p.mp4`，回写 `status: "final_ready"`、`finalVideo: { filePath, remoteUrl, watermark }` 与本地正片路径；即梦官网执行 `dreamina-canvas node promote video-sample` 时，若 `brief.jimengCreditCeiling > 0` 且报价在该上限内，直接传 `--credit-ceiling <jimengCreditCeiling> --yes` 自动放行，超限或无法报价再停在 `needs_confirmation`。
 
 ### E. `run_requested`（用户在控制台点击「▶ 帮我 Run 生成」）
 当画布节点已处于 `ready_on_canvas`（已就绪）或用户改完提示词后在 App 里点击「▶ 帮我 Run 生成」：
 1. 若 `pendingPromptEdit` 非空，先将最新提示词同步至 `libtvSampleNodeKey`（`libtv node <sampleNodeKey> -p <projectUuid> [-g <groupKey>] --prompt "..."`）；若尚未建完节点先按 A 流程补齐。
-2. **执行生成（遵守 `libtv-cli` 规范）**：运行 `libtv node <sampleNodeKey> -p <projectUuid> [-g <groupKey>] --run` 同步阻塞等待终态 JSON（禁止自行轮询、禁止提前 kill、禁止后台化）；多路镜头并发时各自独立执行互不阻塞，且**无需占锁 Chrome UI**。
+2. **执行生成（遵守 `libtv-cli` 与即梦积分上限规范）**：LibTV 运行 `libtv node <sampleNodeKey> -p <projectUuid> [-g <groupKey>] --run` 同步阻塞等待终态 JSON（禁止自行轮询、禁止提前 kill、禁止后台化）；即梦官网先跑只读 `node quote` 核对报价，若 `brief.jimengCreditCeiling > 0` 且明确报价 `<= jimengCreditCeiling`，**禁止停在 `needs_confirmation`**，直接用 `node confirm --credit-ceiling <ceiling>` + `node run --credit-token <token>`（不写 token 入状态）发起生成；多路镜头并发时各自独立执行互不阻塞，且**无需占锁 Chrome UI**。
 3. **下载做好的成片给用户看片**：`--run` 返回 `status == 2` 成功后，立刻调用 `POST http://127.0.0.1:8787/api/shots/{shot_id}/sync-libtv`（或 `libtv download -n <sampleNodeKey> -p <projectUuid> -o <dataRoot>/shots/{shot_id}/ --watermark false`，非会员降级 `--watermark true` 存入 `draft_480p.mp4`）。
 4. **看片自检并回写结果**：多模态直读下载回来的 `draft_480p.mp4` 核对画面/动作/音画后，调用 `POST /api/shots/{shot_id}/agent-update`（带 `claimToken`、`status: "draft_ready"`、`draftVideo: { filePath, remoteUrl, watermark }`、`resolveFeedbacks: true` 若由反馈触发、`agentSummary` 附上简明自检结论），控制台右侧成片预览与反馈区即会立刻出现可播放视频供用户观看。
 

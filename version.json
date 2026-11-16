@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.10",
+  "version": "2026.11.16.11",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T21:49:08+08:00",
-  "changelog": "即梦 queued 极速预建通道（并发上传+确定性Chrome CDP 720P深度捕捉+Worker减负指南）",
+  "publishedAt": "2026-11-16T22:34:30+08:00",
+  "changelog": "新增即梦单镜积分自动确认上限配置；修复并发冷启动 Keyring 超时反复弹出 Antigravity 登录框并交错启动防并发锁死",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",
