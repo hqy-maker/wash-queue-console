@@ -404,17 +404,33 @@ def _list_all_dreamina_items(project_uuid: str, max_pages: int = 12) -> list[dic
 
 
 _LAYOUT_CACHE_LOCK = threading.Lock()
-_CANVAS_LAYOUT_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
+_LAYOUT_CACHE_TTL_SEC = 180.0
+_CANVAS_LAYOUT_CACHE: dict[str, dict[str, tuple[float, dict[str, Any]]]] = {}
+_PROJECT_ALLOC_Y: dict[str, tuple[float, float]] = {}
 
 
 def _cache_canvas_nodes(project_uuid: str, nodes: list[dict[str, Any]]) -> None:
     if not project_uuid or not nodes:
         return
+    now_m = time.monotonic()
     with _LAYOUT_CACHE_LOCK:
         bucket = _CANVAS_LAYOUT_CACHE.setdefault(project_uuid, {})
         for node in nodes:
             if isinstance(node, dict) and node.get("nodeId"):
-                bucket[str(node["nodeId"])] = node
+                bucket[str(node["nodeId"])] = (now_m, node)
+
+
+def _reserve_next_canvas_row_y(project_uuid: str, max_bottom: float) -> float:
+    base_y = float(int(math.ceil((max_bottom + 260.0) / 100.0) * 100)) if max_bottom > 0 else 0.0
+    if not project_uuid:
+        return base_y
+    now_m = time.monotonic()
+    with _LAYOUT_CACHE_LOCK:
+        entry = _PROJECT_ALLOC_Y.get(project_uuid)
+        prev_y = float(entry[1]) if (entry and (now_m - float(entry[0])) < 90.0) else 0.0
+        chosen = max(base_y, prev_y) if (base_y > 0.0 or prev_y > 0.0) else 0.0
+        _PROJECT_ALLOC_Y[project_uuid] = (now_m, chosen + 420.0)
+        return chosen
 
 
 def _compute_canvas_layouts(
@@ -425,8 +441,14 @@ def _compute_canvas_layouts(
 ) -> tuple[float, dict[str, dict[str, Any]]]:
     all_ids = [str(n.get("nodeId") or "").strip() for n in nodes_summary if n.get("nodeId")]
     force_ids = force_refresh_ids or set()
+    now_m = time.monotonic()
     with _LAYOUT_CACHE_LOCK:
-        cached_bucket = dict(_CANVAS_LAYOUT_CACHE.get(project_uuid) or {})
+        raw_bucket = _CANVAS_LAYOUT_CACHE.get(project_uuid) or {}
+        cached_bucket = {
+            nid: entry[1]
+            for nid, entry in raw_bucket.items()
+            if (now_m - float(entry[0])) < _LAYOUT_CACHE_TTL_SEC
+        }
 
     missing_ids = [
         nid
@@ -740,7 +762,7 @@ def inspect_dreamina_canvas_context(
         if anchor_id and isinstance((nodes_by_id.get(anchor_id) or {}).get("layout"), dict):
             suggested_y = float(nodes_by_id[anchor_id]["layout"].get("y") or 0.0)
         if suggested_y <= 0.0:
-            suggested_y = float(int(math.ceil((max_bottom + 260.0) / 100.0) * 100)) if max_bottom > 0 else 0.0
+            suggested_y = _reserve_next_canvas_row_y(project_uuid, max_bottom)
 
         comp_node_id = snap["compNodeId"]
         comp_res_id = str(jm.get("compResourceId") or "").strip()
@@ -854,9 +876,15 @@ def inspect_dreamina_canvas_context(
     result["creationKind"] = "t2v" if (is_creation and not has_comp and not char_specs) else "m2v"
     if is_creation:
         result["depthTriggerStatus"] = "skipped_creation_mode"
+        chars_ready = all(
+            bool(cs.get("nodeId"))
+            for cs in char_specs
+            if cs.get("filePath") or cs.get("isPublicPreset")
+        )
         result["prebuildReady"] = bool(
             ("nodeCount" in result)
             and (not has_comp or result.get("preuploadedCompNodeId"))
+            and chars_ready
         )
     else:
         result["prebuildReady"] = bool(result.get("preuploadedCompNodeId") and (not has_source or result.get("preuploadedSourceNodeId")))
@@ -1261,6 +1289,7 @@ def try_fastpath_jimeng_run(
     pending_edit = str(shot.get("pendingPromptEdit") or "").strip()
     is_creation = str(shot.get("workMode") or "video_wash").strip().lower() == "video_creation"
     explicit_dur = _normalize_target_duration(shot.get("targetDuration")) if is_creation else None
+    synced_dur: int | None = None
     if pending_edit or explicit_dur is not None:
         if pending_edit and _UNRESOLVED_AT_RE.search(pending_edit):
             return {"handled": False, "reason": "pending_prompt_has_unresolved_at_mentions"}
@@ -1285,7 +1314,8 @@ def try_fastpath_jimeng_run(
                         cmd.extend([flag, str(val)])
                 dur = explicit_dur or gen.get("durationSeconds") or jm.get("duration")
                 if dur:
-                    cmd.extend(["--duration", str(int(round(float(dur))))])
+                    synced_dur = int(round(float(dur)))
+                    cmd.extend(["--duration", str(synced_dur)])
                 if int(gen.get("outputCount") or 1) > 0:
                     cmd.extend(["--count", str(int(gen.get("outputCount") or 1))])
                 for ref in refs:
@@ -1295,6 +1325,8 @@ def try_fastpath_jimeng_run(
                     cur_prompt_file = str(shot.get("promptFilePath") or "").strip()
                     md_path = Path(cur_prompt_file) if cur_prompt_file else (workspace_root / "outputs" / f"{sid}_提示词.md")
                     _sync_prompt_markdown(md_path, sid, eff_prompt, get_platform_label(platform))
+            elif node_dur is not None:
+                synced_dur = node_dur
         except Exception as exc:
             return {"handled": False, "reason": f"prompt_sync_fallback: {exc}"}
 
@@ -1454,6 +1486,10 @@ def try_fastpath_jimeng_run(
     if quoted_cost is not None:
         done_meta["quotedCredits"] = quoted_cost
         done_meta["quotedMaxCredits"] = quoted_cost
+    if draft_ver is not None:
+        done_meta["draftVersion"] = draft_ver
+    if synced_dur is not None:
+        done_meta["duration"] = synced_dur
 
     draft_vid_obj = {
         "filePath": str(draft_path),

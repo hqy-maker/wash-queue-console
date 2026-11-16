@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.18",
+  "version": "2026.11.16.19",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T23:51:38+08:00",
-  "changelog": "「⏱️ 生成时长」控制块仅在「🎬 正常生成」模式显示并生效；「🎞️ 洗视频」默认完全隐藏手动时长选项，严格按原视频长度自动对齐不变",
+  "publishedAt": "2026-11-16T23:55:50+08:00",
+  "changelog": "全量代码审计与Bug修复：480P快速通道同步回写jimengMeta最新duration/draftVersion；画布layout缓存增加180s TTL并防并发t2v行号碰撞；校验角色参考上传失败时不误标prebuildReady；扩展jimeng_commit_sample支持txt围栏与CRLF；完善正常生成增量修订Prompt路由与深色对比度",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

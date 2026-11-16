@@ -320,14 +320,21 @@ def _build_worker_prompt(
 
     wash_skill_md = _resolve_skill_path("wash-queue-console")
     dreamina_skill_md = _resolve_skill_path("dreamina-canvas-cli")
-    if is_creation and task_type in {"queued", "recheck_requested"}:
-        section_hint = (
-            "【正常生成模式 · 跳过洗片与深度捕捉】"
-            "仅按 `seedance-video-prompts` 规范（结合用户输入与可选构图/角色参考图；无图时纯文生）撰写 Seedance 2.5 提示词，并在即梦画布创建 480P 样片节点（纯文生 `--mode t2v`，带参考图 `--mode m2v`；只读报价、不代点生成），回写状态为 ready_on_canvas。"
-            if is_jimeng
-            else "【正常生成模式 · 跳过洗片与深度捕捉】"
-            "仅按 `seedance-video-prompts` 与 `libtv-cli` 规范撰写提示词并搭建 LibTV Seedance 2.5 视频生成节点（无需深度动作捕捉），回写状态为 ready_on_canvas。"
-        )
+    if is_creation and task_type in {"queued", "recheck_requested", "feedback_queued"}:
+        if task_type == "feedback_queued":
+            dur_tip = f"（目标时长严格保持 {int(shot['targetDuration'])}s）" if shot.get("targetDuration") else ""
+            section_hint = (
+                f"【正常生成模式 · 增量修订{dur_tip}】仅按 `seedance-video-prompts` 增量修改铁律逐条落实 `pendingFeedbacks[]`，同步至"
+                + ("即梦节点与 `outputs/{shot_id}_提示词.md`（不触发深度捕捉，也不自动生成），回写 `ready_on_canvas` 与 `resolveFeedbacks: true`。" if is_jimeng else "LibTV 节点与 `outputs/{shot_id}_提示词.md`，回写 `ready_on_canvas` 与 `resolveFeedbacks: true`。")
+            )
+        else:
+            section_hint = (
+                "【正常生成模式 · 跳过洗片与深度捕捉】"
+                "仅按 `seedance-video-prompts` 规范（结合用户输入与可选构图/角色参考图；无图时纯文生）撰写 Seedance 2.5 提示词，并在即梦画布创建 480P 样片节点（纯文生 `--mode t2v`，带参考图 `--mode m2v`；只读报价、不代点生成），回写状态为 ready_on_canvas。"
+                if is_jimeng
+                else "【正常生成模式 · 跳过洗片与深度捕捉】"
+                "仅按 `seedance-video-prompts` 与 `libtv-cli` 规范撰写提示词并搭建 LibTV Seedance 2.5 视频生成节点（无需深度动作捕捉），回写状态为 ready_on_canvas。"
+            )
     else:
         section_hint = (
             JIMENG_TASK_SECTION_HINTS.get(task_type)
@@ -537,8 +544,9 @@ def _build_worker_prompt(
                     f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，只需查状态 `dreamina-canvas --non-interactive --format json node show --project-id {pid} --node-id {depth_id}` 等其 `status == success`！"
                 )
             else:
+                depth_script_path = brief.get("depthCdpScriptPath") or str(Path(__file__).resolve().parent / "scripts" / "dreamina_depth_cdp.py")
                 depth_hint = (
-                    f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {pid} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅脚本失败时才持 `chrome_ui` 锁走 Chrome MCP 手点。"
+                    f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：先执行 `.venv/bin/python {depth_script_path} --project-id {pid} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅脚本失败时才持 `chrome_ui` 锁走 Chrome MCP 手点。"
                 )
             whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
             whiteout_hint = (

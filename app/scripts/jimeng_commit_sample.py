@@ -13,11 +13,11 @@ from typing import Any
 
 import httpx
 
-_CODE_FENCE_RE = re.compile(r"```(?:text|prompt|markdown)?\s*\n(.*?)\n```", re.DOTALL)
+_CODE_FENCE_RE = re.compile(r"```(?:text|txt|prompt|md|markdown)?[ \t]*\r?\n(.*?)\r?\n```", re.DOTALL | re.IGNORECASE)
 
 
 def _extract_prompt_from_md(prompt_file: Path) -> str:
-    raw = prompt_file.read_text(encoding="utf-8")
+    raw = prompt_file.read_text(encoding="utf-8").replace("\r\n", "\n")
     m = _CODE_FENCE_RE.search(raw)
     text = (m.group(1) if m else raw).strip()
     if not text:
@@ -183,7 +183,10 @@ def main() -> int:
     if args.conversation_id.strip():
         body["conversationId"] = args.conversation_id.strip()
     if args.whiteout_json.strip():
-        body["whiteoutUpdates"] = json.loads(args.whiteout_json)
+        try:
+            body["whiteoutUpdates"] = json.loads(args.whiteout_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--whiteout-json 格式无效: {exc}") from exc
 
     with httpx.Client(base_url=args.base_url, timeout=15.0) as client:
         cb = client.post(f"/api/shots/{args.shot_id}/agent-update", json=body)

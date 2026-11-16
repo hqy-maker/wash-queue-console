@@ -1480,8 +1480,8 @@ button {
 }
 
 .duration-preset-btn.is-active {
-  background: var(--blue);
-  border-color: var(--blue);
+  background: var(--btn-primary-bg);
+  border-color: var(--btn-primary-bg);
   color: #fff;
 }
 
@@ -1490,7 +1490,7 @@ button {
   align-items: center;
   gap: 10px;
   flex: 1 1 220px;
-  max-width: 340px;
+  max-width: min(340px, 100%);
 }
 
 .duration-range-input {
