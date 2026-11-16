@@ -120,6 +120,13 @@ def normalize_work_mode(raw: str | None) -> str:
     return "video_wash"
 
 
+def normalize_ai_dispatch_mode(raw: str | None) -> str:
+    clean = (raw or "").strip().lower()
+    if clean in {"cli", "cli_bridge", "agy_cli"}:
+        return "cli_bridge"
+    return "desktop_subagent"
+
+
 def normalize_target_duration(raw: Any) -> int | None:
     if raw is None or isinstance(raw, bool):
         return None
@@ -355,6 +362,7 @@ def safe_prompt_update_prev_status(shot: dict[str, Any], cur_status: str) -> str
 
 _SAFE_CONV_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,128}$")
 _CLI_STORE_ROOT = Path.home() / ".gemini" / "antigravity-cli"
+_DESKTOP_BRAIN_ROOT = Path.home() / ".gemini" / "antigravity" / "brain"
 
 
 def _cli_session_exists(cid: str) -> bool:
@@ -364,6 +372,69 @@ def _cli_session_exists(cid: str) -> bool:
     db_file = _CLI_STORE_ROOT / "conversations" / f"{clean}.db"
     brain_dir = _CLI_STORE_ROOT / "brain" / clean
     return db_file.is_file() or brain_dir.is_dir()
+
+
+def _desktop_session_exists(cid: str) -> bool:
+    clean = (cid or "").strip()
+    if not _SAFE_CONV_ID_RE.match(clean):
+        return False
+    root = Path(os.environ.get("WASH_DESKTOP_BRAIN_ROOT") or str(_DESKTOP_BRAIN_ROOT))
+    return (root / clean).is_dir()
+
+
+def resolve_desktop_conversation_id(shot: dict[str, Any]) -> str:
+    """Find the most recent Antigravity Desktop Subagent conversation ID bound to a shot."""
+    sid = str(shot.get("id") or "").strip()
+    candidates: list[str] = []
+    for key in ("desktopConversationId", "shotConversationId"):
+        val = str(shot.get(key) or "").strip()
+        if val:
+            candidates.append(val)
+
+    convs_path = DATA_ROOT / "shot_conversations.json"
+    if convs_path.is_file() and sid:
+        try:
+            convs = json.loads(convs_path.read_text(encoding="utf-8"))
+            rec = convs.get(sid) if isinstance(convs, dict) else None
+            if isinstance(rec, dict):
+                plat = normalize_platform(shot.get("platform"))
+                if rec.get("platform", plat) == plat:
+                    for key in ("desktopConversationId", "conversationId"):
+                        cid = str(rec.get(key) or "").strip()
+                        if cid:
+                            candidates.append(cid)
+        except Exception:
+            pass
+
+    for item in reversed(shot.get("versionHistory") or []):
+        if isinstance(item, dict):
+            cid = str(item.get("conversationId") or "").strip()
+            if cid:
+                candidates.append(cid)
+
+    seen: set[str] = set()
+    for cid in candidates:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if _desktop_session_exists(cid):
+            return cid
+    return ""
+
+
+def compute_fastpath_bypass_sig(shot: dict[str, Any]) -> str:
+    return (
+        f"{shot.get('status') or ''}|{shot.get('updatedAt') or ''}|"
+        f"{(shot.get('pendingPromptEdit') or '').strip()}|{shot.get('targetDuration') or ''}"
+    )
+
+
+def is_fastpath_mechanical_candidate(shot: dict[str, Any]) -> bool:
+    if normalize_platform(shot.get("platform")) != "jimeng":
+        return False
+    if str(shot.get("status") or "") not in {"prompt_update_requested", "run_requested", "final_requested"}:
+        return False
+    return str(shot.get("fastpathBypassSig") or "") != compute_fastpath_bypass_sig(shot)
 
 
 def resolve_cli_conversation_id(shot: dict[str, Any]) -> str:
@@ -681,6 +752,9 @@ def _decorate_shot_payload(
     cli_conv_id = resolve_cli_conversation_id(out)
     out["cliConversationId"] = cli_conv_id
     out["canResumeCliChat"] = bool(cli_conv_id)
+    desk_conv_id = resolve_desktop_conversation_id(out)
+    out["desktopConversationId"] = desk_conv_id
+    out["canResumeDesktopSubagent"] = bool(desk_conv_id)
 
     dl_480 = build_shot_download_filename(out, kind="480p")
     dl_1080 = build_shot_download_filename(out, kind="1080p")
@@ -1279,6 +1353,26 @@ class QueueStore:
             return q
 
     @staticmethod
+    def _get_ai_dispatch_mode(q: dict[str, Any]) -> str:
+        return normalize_ai_dispatch_mode(q.get("aiDispatchMode"))
+
+    def get_ai_dispatch_mode(self) -> str:
+        with self._lock:
+            q = self._load_queue()
+            return self._get_ai_dispatch_mode(q)
+
+    def set_ai_dispatch_mode(self, mode: str) -> dict[str, Any]:
+        clean_val = normalize_ai_dispatch_mode(mode)
+        with self._lock:
+            q = self._load_queue()
+            q["aiDispatchMode"] = clean_val
+            self._save_queue(
+                q,
+                {"type": "ai_dispatch_mode_updated", "aiDispatchMode": clean_val},
+            )
+            return {"aiDispatchMode": clean_val}
+
+    @staticmethod
     def _decorate_shot(q: dict[str, Any], shot: dict[str, Any]) -> dict[str, Any]:
         return _decorate_shot_payload(shot, export_config=_extract_export_config(q))
 
@@ -1398,6 +1492,7 @@ class QueueStore:
                 "autoSyncExport": export_cfg["autoSyncExport"],
                 "jimengCreditCeiling": self._get_jimeng_credit_ceiling(q),
                 "autoQaAfterRender": self._get_auto_qa_after_render(q),
+                "aiDispatchMode": self._get_ai_dispatch_mode(q),
                 "eventSeq": q.get("eventSeq", 1),
                 "events": q.get("events", [])[-20:],
                 "scenes": q.get("scenes", []),
@@ -2998,22 +3093,35 @@ class QueueStore:
         worker_id: str = "coordinator",
         limit: int = 10,
         shot_ids: list[str] | None = None,
+        *,
+        fastpath_only: bool = False,
+        ai_only: bool = False,
     ) -> dict[str, Any]:
         wanted = {sanitize_shot_id(x) for x in (shot_ids or []) if sanitize_shot_id(x)}
         max_items = max(1, min(int(limit or 10), 50))
         with self._lock:
             q = self._load_queue()
-            targets = [
-                s
-                for s in q["shots"]
-                if s.get("status") in ACTIONABLE_STATUSES and (not wanted or s["id"] in wanted)
-            ][:max_items]
+            targets = []
+            for s in q["shots"]:
+                if s.get("status") not in ACTIONABLE_STATUSES:
+                    continue
+                if wanted and s["id"] not in wanted:
+                    continue
+                is_fp = is_fastpath_mechanical_candidate(s)
+                if fastpath_only and not is_fp:
+                    continue
+                if ai_only and is_fp:
+                    continue
+                targets.append(s)
+                if len(targets) >= max_items:
+                    break
             digest = self._build_digest(targets)
             ceiling = self._get_jimeng_credit_ceiling(q)
             auto_qa = self._get_auto_qa_after_render(q)
+            ai_mode = self._get_ai_dispatch_mode(q)
             claimed = []
             for s in targets:
-                c = self._claim_shot_obj(s, worker_id)
+                c = self._decorate_shot(q, self._claim_shot_obj(s, worker_id))
                 c["jimengCreditCeiling"] = ceiling
                 c["autoQaAfterRender"] = auto_qa
                 claimed.append(c)
@@ -3037,6 +3145,7 @@ class QueueStore:
                 "defaultWorkspaceId": q.get("defaultWorkspaceId", DEFAULT_WORKSPACE_ID),
                 "jimengCreditCeiling": ceiling,
                 "autoQaAfterRender": auto_qa,
+                "aiDispatchMode": ai_mode,
                 "claimedCount": len(claimed),
                 "remainingPendingCount": remaining_pending,
                 "processingCount": len(processing_ids),
@@ -3044,6 +3153,73 @@ class QueueStore:
                 "claimed": claimed,
                 "digestMarkdown": digest,
             }
+
+    def release_fastpath_claim(self, shot_id: str, claim_token: str, reason: str = "") -> dict[str, Any]:
+        sid = sanitize_shot_id(shot_id)
+        tok = (claim_token or "").strip()
+        with self._lock:
+            q = self._load_queue()
+            for shot in q["shots"]:
+                if shot["id"] != sid:
+                    continue
+                if shot.get("status") != "processing" or (tok and str(shot.get("claimToken") or "") != tok):
+                    raise ClaimConflictError(f"镜头 {sid} claimToken 已失效或状态已变更")
+                prev_task = str(shot.get("processingTaskType") or "queued").strip()
+                if prev_task not in ACTIONABLE_STATUSES:
+                    prev_task = "queued"
+                self._clear_claim_fields(shot)
+                shot["status"] = prev_task
+                shot["updatedAt"] = now_iso()
+                shot["fastpathBypassSig"] = compute_fastpath_bypass_sig(shot)
+                shot["agentSummary"] = f"该操作需 AI 介入（{reason or 'fastpath_bypass'}），等待桌面一镜一对话领单…"
+                self._save_queue(
+                    q,
+                    {
+                        "type": "fastpath_released_to_ai",
+                        "shotId": sid,
+                        "status": prev_task,
+                    },
+                )
+                return self._decorate_shot(q, shot)
+        raise KeyError(f"镜头不存在: {shot_id}")
+
+    def bind_shot_conversation(self, shot_id: str, conversation_id: str, surface: str = "desktop") -> dict[str, Any]:
+        sid = sanitize_shot_id(shot_id)
+        clean_cid = (conversation_id or "").strip()
+        if not _SAFE_CONV_ID_RE.match(clean_cid):
+            raise ValueError("无效的 conversationId")
+        clean_surface = "cli" if (surface or "").strip().lower() == "cli" else "desktop"
+        with self._lock:
+            q = self._load_queue()
+            for shot in q["shots"]:
+                if shot["id"] != sid:
+                    continue
+                if clean_surface == "desktop":
+                    shot["desktopConversationId"] = clean_cid
+                else:
+                    shot["shotConversationId"] = clean_cid
+                shot["updatedAt"] = now_iso()
+
+                convs_path = DATA_ROOT / "shot_conversations.json"
+                convs = self._read_json(convs_path, {}) if convs_path.is_file() else {}
+                if not isinstance(convs, dict):
+                    convs = {}
+                rec = dict(convs.get(sid) or {})
+                rec["platform"] = normalize_platform(shot.get("platform"))
+                if clean_surface == "desktop":
+                    rec["desktopConversationId"] = clean_cid
+                else:
+                    rec["conversationId"] = clean_cid
+                rec["updatedAt"] = now_iso()
+                convs[sid] = rec
+                _atomic_write_json(convs_path, convs)
+
+                self._save_queue(
+                    q,
+                    {"type": "shot_conversation_bound", "shotId": sid, "surface": clean_surface},
+                )
+                return self._decorate_shot(q, shot)
+        raise KeyError(f"镜头不存在: {shot_id}")
 
     def claim_shot(self, shot_id: str, worker_id: str = "worker") -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
@@ -3206,10 +3382,15 @@ class QueueStore:
 
                 rev_dir = str(payload.get("revisionDirection") or "").strip()
                 conv_id = str(payload.get("conversationId") or "").strip()
+                desktop_conv_id = str(payload.get("desktopConversationId") or "").strip()
                 if rev_dir:
                     shot["latestRevisionDirection"] = rev_dir
+                if desktop_conv_id:
+                    shot["desktopConversationId"] = desktop_conv_id
                 if conv_id:
                     shot["shotConversationId"] = conv_id
+                    if _desktop_session_exists(conv_id):
+                        shot["desktopConversationId"] = conv_id
 
                 updated_result_video = None
                 final_video_updated = False
@@ -3333,6 +3514,7 @@ class QueueStore:
 
                 if shot.get("status") != "processing":
                     self._clear_claim_fields(shot)
+                    shot.pop("fastpathBypassSig", None)
                     shot["promptUpdatePrevStatus"] = ""
                     if shot.get("status") in {"ready_on_canvas", "draft_ready", "final_ready"}:
                         shot["pendingPromptEdit"] = ""
@@ -3685,17 +3867,23 @@ class QueueStore:
             q = self._load_queue()
             pdefs = self._ensure_platform_defaults(q)
             default_plat = q["defaultPlatform"]
-            pending = [s for s in q["shots"] if s.get("status") in ACTIONABLE_STATUSES]
+            raw_pending = [s for s in q["shots"] if s.get("status") in ACTIONABLE_STATUSES]
+            ai_pending_ids = [s["id"] for s in raw_pending if not is_fastpath_mechanical_candidate(s)]
+            fp_pending_ids = [s["id"] for s in raw_pending if is_fastpath_mechanical_candidate(s)]
+            pending = [self._decorate_shot(q, s) for s in raw_pending]
             processing_ids = [s["id"] for s in q["shots"] if s.get("status") == "processing"]
             awaiting_user = [s for s in q["shots"] if s.get("status") == "needs_confirmation"]
             return {
                 "eventSeq": q.get("eventSeq", 1),
+                "aiDispatchMode": self._get_ai_dispatch_mode(q),
                 "defaultPlatform": default_plat,
                 "platformDefaults": pdefs,
                 "defaultProjectUuid": q.get("defaultProjectUuid", DEFAULT_PROJECT_UUID),
                 "defaultProjectName": q.get("defaultProjectName", DEFAULT_PROJECT_NAME),
                 "defaultWorkspaceId": q.get("defaultWorkspaceId", DEFAULT_WORKSPACE_ID),
                 "pendingCount": len(pending),
+                "aiPendingShotIds": ai_pending_ids,
+                "fastpathPendingShotIds": fp_pending_ids,
                 "processingCount": len(processing_ids),
                 "processingShotIds": processing_ids,
                 "awaitingUserCount": len(awaiting_user),
@@ -3775,24 +3963,40 @@ class QueueStore:
                 )
         return "\n".join(lines)
 
-    def wait_for_events(self, since_seq: int, timeout: float = 20.0, only_actionable: bool = False) -> dict[str, Any]:
+    def wait_for_events(
+        self,
+        since_seq: int,
+        timeout: float = 20.0,
+        only_actionable: bool = False,
+        ai_only: bool = False,
+        fastpath_only: bool = False,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + max(0.5, min(timeout, 30.0))
         with self._cv:
             while True:
                 q = self._load_queue()
                 cur_seq = int(q.get("eventSeq", 1))
-                pending = [s for s in q.get("shots", []) if s.get("status") in ACTIONABLE_STATUSES]
+                queue_ai_mode = normalize_ai_dispatch_mode(q.get("aiDispatchMode"))
+                raw_pending = [s for s in q.get("shots", []) if s.get("status") in ACTIONABLE_STATUSES]
+                if ai_only:
+                    pending = [s for s in raw_pending if not is_fastpath_mechanical_candidate(s)]
+                elif fastpath_only and queue_ai_mode != "cli_bridge":
+                    pending = [s for s in raw_pending if is_fastpath_mechanical_candidate(s)]
+                else:
+                    pending = raw_pending
                 processing_ids = [s["id"] for s in q.get("shots", []) if s.get("status") == "processing"]
                 if only_actionable:
                     if pending:
+                        decorated_pending = [self._decorate_shot(q, s) for s in pending]
                         return {
                             "timedOut": False,
                             "eventSeq": cur_seq,
-                            "pendingCount": len(pending),
+                            "pendingCount": len(raw_pending),
+                            "aiPendingCount": len([s for s in raw_pending if not is_fastpath_mechanical_candidate(s)]),
                             "processingCount": len(processing_ids),
                             "processingShotIds": processing_ids,
-                            "pending": pending,
-                            "digestMarkdown": self._build_digest(pending),
+                            "pending": decorated_pending,
+                            "digestMarkdown": self._build_digest(decorated_pending),
                         }
                 elif cur_seq > since_seq:
                     recent = [e for e in q.get("events", []) if int(e.get("seq", 0)) > since_seq]
@@ -3803,7 +4007,7 @@ class QueueStore:
                         "processingCount": len(processing_ids),
                         "processingShotIds": processing_ids,
                         "recentEvents": recent,
-                        "pending": pending,
+                        "pending": [self._decorate_shot(q, s) for s in pending],
                     }
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

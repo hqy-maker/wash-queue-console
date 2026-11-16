@@ -96,7 +96,7 @@ def _load_bridge_settings() -> dict[str, Any]:
         return (os.environ.get(env_key, "").strip() or str(raw.get(conf_key) or "").strip() or default)
 
     return {
-        "workers": _int_opt("workers", "WASH_BRIDGE_WORKERS", 4, 1, 6),
+        "workers": _int_opt("workers", "WASH_BRIDGE_WORKERS", 2, 1, 6),
         "timeoutSec": _int_opt("timeoutSec", "WASH_BRIDGE_AGY_TIMEOUT", 1500, 120, 3600),
         "idleTimeoutSec": _int_opt("idleTimeoutSec", "WASH_BRIDGE_IDLE_TIMEOUT", 300, 60, 1200),
         "heavyIdleTimeoutSec": _int_opt("heavyIdleTimeoutSec", "WASH_BRIDGE_HEAVY_IDLE_TIMEOUT", 540, 120, 1500),
@@ -1006,6 +1006,18 @@ class BridgeRuntime:
         except Exception as exc:
             _log(f"{shot_id} failed-state cleanup error: {exc}")
 
+    def _release_to_desktop_ai(self, shot_id: str, claim_token: str, reason: str = "") -> None:
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=10.0) as client:
+                r = client.post(
+                    f"/api/shots/{shot_id}/release-fastpath",
+                    json={"claimToken": claim_token, "reason": reason},
+                )
+                if r.status_code not in {200, 409}:
+                    _log(f"{shot_id} release-fastpath unexpected status={r.status_code} body={r.text[:200]}")
+        except Exception as exc:
+            _log(f"{shot_id} release-fastpath error: {exc}")
+
     def _invoke_agy_once(
         self,
         shot: dict[str, Any],
@@ -1222,11 +1234,11 @@ class BridgeRuntime:
                     pass
         return conv_id, err_msg, last_status
 
-    def _run_shot_worker(self, shot: dict[str, Any]) -> None:
+    def _run_shot_worker(self, shot: dict[str, Any], ai_mode: str = "desktop_subagent") -> None:
         shot_id = str(shot["id"])
         claim_token = str(shot.get("claimToken") or "")
         task_type = str(shot.get("processingTaskType") or "")
-        _log(f"start worker shot={shot_id} task={task_type} token={claim_token}")
+        _log(f"start worker shot={shot_id} task={task_type} mode={ai_mode} token={claim_token}")
         self._update_worker(
             shot_id,
             claimToken=claim_token,
@@ -1239,6 +1251,8 @@ class BridgeRuntime:
         conv_id = ""
         err_msg = ""
         last_status = ""
+        released_to_ai = False
+        fp_reason = ""
         try:
             prepped: dict[str, Any] = {}
             if SETTINGS["fastPathEnabled"] and task_type == "prompt_update_requested":
@@ -1249,7 +1263,8 @@ class BridgeRuntime:
                 if fp_res.get("handled"):
                     _log(f"{shot_id} fast-path completed: {fp_res.get('summary')}")
                     return
-                _log(f"{shot_id} fast-path skipped ({fp_res.get('reason')}); falling back to agy")
+                fp_reason = str(fp_res.get("reason") or "prompt_update Fast-Path 跳过")
+                _log(f"{shot_id} fast-path skipped ({fp_reason})")
             elif (
                 SETTINGS["fastPathEnabled"]
                 and str(shot.get("platform") or "").lower() == "jimeng"
@@ -1277,10 +1292,18 @@ class BridgeRuntime:
                 if fp_res.get("handled"):
                     _log(f"{shot_id} {task_type} fast-path completed: {fp_res.get('summary')}")
                     return
-                if isinstance(fp_res.get("preppedOverride"), dict):
+                if isinstance(fp_res.get("preppedOverride"), dict) and ai_mode == "cli_bridge":
                     prepped = dict(fp_res["preppedOverride"])
                 else:
-                    _log(f"{shot_id} {task_type} fast-path skipped ({fp_res.get('reason')}); falling back to agy")
+                    fp_reason = str(fp_res.get("reason") or f"{task_type} Fast-Path 跳过")
+                    _log(f"{shot_id} {task_type} fast-path skipped ({fp_reason})")
+
+            if ai_mode != "cli_bridge":
+                reason = fp_reason or f"{task_type or 'ai'} 需 AI 处理，交由桌面一镜一对话"
+                _log(f"{shot_id} releasing fast-path claim to desktop_subagent: {reason}")
+                self._release_to_desktop_ai(shot_id, claim_token, reason=reason)
+                released_to_ai = True
+                return
 
             if not prepped and SETTINGS["prePrepEnabled"] and task_type in {"queued", "recheck_requested"}:
                 is_jimeng_queued = str(shot.get("platform") or "").lower() == "jimeng" and task_type == "queued"
@@ -1441,31 +1464,31 @@ class BridgeRuntime:
                 self._last_run_at = now_str
                 if conv_id:
                     self._last_conv_id = conv_id
-                if not was_cancelled:
+                if not was_cancelled and not released_to_ai:
                     self._last_error = err_msg
-                if not (err_msg or (last_status and last_status != "SUCCESS")):
+                if not released_to_ai and not (err_msg or (last_status and last_status != "SUCCESS")):
                     self._auto_retried_counts.pop(shot_id, None)
-            if was_cancelled or err_msg or (last_status and last_status != "SUCCESS"):
+            if released_to_ai:
                 self._release_owner_lock(shot_id)
-            if was_cancelled:
-                _log(f"worker cancelled by user reset shot={shot_id}")
-            elif err_msg or (last_status and last_status != "SUCCESS"):
-                issue_text = err_msg or last_status
-                if _is_auth_error(issue_text):
-                    with self._lock:
-                        self._auth_cooldown_until = max(self._auth_cooldown_until, time.monotonic() + 30.0)
-                    _log(f"auth cooldown 30s activated after {shot_id} auth error (suppressing popup loops)")
-                _log(f"worker finished with issue shot={shot_id}: {issue_text}")
-                self._ensure_not_stuck_processing(shot_id, claim_token, issue_text)
+                _log(f"worker released shot={shot_id} to desktop_subagent")
             else:
-                _log(f"worker finished shot={shot_id} conv={conv_id}")
+                if was_cancelled or err_msg or (last_status and last_status != "SUCCESS"):
+                    self._release_owner_lock(shot_id)
+                if was_cancelled:
+                    _log(f"worker cancelled by user reset shot={shot_id}")
+                elif err_msg or (last_status and last_status != "SUCCESS"):
+                    issue_text = err_msg or last_status
+                    if _is_auth_error(issue_text):
+                        with self._lock:
+                            self._auth_cooldown_until = max(self._auth_cooldown_until, time.monotonic() + 30.0)
+                        _log(f"auth cooldown 30s activated after {shot_id} auth error (suppressing popup loops)")
+                    _log(f"worker finished with issue shot={shot_id}: {issue_text}")
+                    self._ensure_not_stuck_processing(shot_id, claim_token, issue_text)
+                else:
+                    _log(f"worker finished shot={shot_id} conv={conv_id}")
 
     def run_forever(self) -> int:
-        agy_bin_init = find_agy_bin()
-        if not agy_bin_init:
-            _log("WARNING: Antigravity agy CLI not found; waiting in standby")
-        else:
-            threading.Thread(target=_discover_agy_models, args=(agy_bin_init,), daemon=True).start()
+        _log("bridge worker ready (fast-path always enabled; cli_bridge loaded on demand)")
 
         pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="agy-worker")
 
@@ -1494,6 +1517,8 @@ class BridgeRuntime:
                             _STOP_EVENT.wait(2.0)
                             continue
 
+                        ai_mode = str(st.get("aiDispatchMode") or "desktop_subagent").strip()
+
                         now_scan_m = time.monotonic()
                         if (now_scan_m - started_m) >= 30.0 and (now_scan_m - last_orphan_scan_m) >= 15.0:
                             last_orphan_scan_m = now_scan_m
@@ -1511,6 +1536,7 @@ class BridgeRuntime:
                                     rt_shot = rt_data.get("shot") or {}
                                     if (
                                         rt_info.get("status") == "processing"
+                                        and str(rt_shot.get("claimedBy") or "") == "agy_bridge"
                                         and int(rt_info.get("bridgePid") or 0) == os.getpid()
                                         and rt_info.get("agyPidAlive") is not True
                                         and int(rt_info.get("idleSec") or 0) >= SETTINGS["orphanIdleSec"]
@@ -1524,10 +1550,26 @@ class BridgeRuntime:
                             auth_cooling = time.monotonic() < self._auth_cooldown_until
                         slots = MAX_WORKERS - running_count
 
-                        if slots > 0 and not auth_cooling and st.get("pendingCount", 0) > 0 and find_agy_bin():
+                        is_desktop_mode = ai_mode != "cli_bridge"
+                        can_claim = (
+                            slots > 0
+                            and (
+                                (is_desktop_mode and int(st.get("fastpathPendingCount", 0) or 0) > 0)
+                                or (
+                                    not is_desktop_mode
+                                    and not auth_cooling
+                                    and int(st.get("pendingCount", 0) or 0) > 0
+                                    and bool(find_agy_bin())
+                                )
+                            )
+                        )
+                        if can_claim:
+                            claim_payload: dict[str, Any] = {"workerId": "agy_bridge", "limit": slots}
+                            if is_desktop_mode:
+                                claim_payload["fastpathOnly"] = True
                             claim_resp = client.post(
                                 "/api/agent/claim",
-                                json={"workerId": "agy_bridge", "limit": slots},
+                                json=claim_payload,
                                 timeout=8.0,
                             )
                             if claim_resp.status_code == 200:
@@ -1538,20 +1580,23 @@ class BridgeRuntime:
                                             sid = str(s["id"])
                                             if sid in self._active:
                                                 continue
-                                            fut = pool.submit(self._run_shot_worker, s)
+                                            fut = pool.submit(self._run_shot_worker, s, ai_mode)
                                             self._active[sid] = fut
                                     self._send_heartbeat(client)
                                     continue
 
+                        wait_params: dict[str, Any] = {
+                            "since": since_seq,
+                            "timeout": 10.0,
+                            "actionable": "true",
+                            "watcher": "agy_bridge",
+                            "mode": "bridge",
+                        }
+                        if is_desktop_mode:
+                            wait_params["fastpath_only"] = "true"
                         wait_resp = client.get(
                             "/api/events/wait",
-                            params={
-                                "since": since_seq,
-                                "timeout": 10.0,
-                                "actionable": "true",
-                                "watcher": "agy_bridge",
-                                "mode": "bridge",
-                            },
+                            params=wait_params,
                             timeout=14.0,
                         )
                         if wait_resp.status_code == 200:

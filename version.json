@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.19",
+  "version": "2026.11.17.1",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T23:55:50+08:00",
-  "changelog": "全量代码审计与Bug修复：480P快速通道同步回写jimengMeta最新duration/draftVersion；画布layout缓存增加180s TTL并防并发t2v行号碰撞；校验角色参考上传失败时不误标prebuildReady；扩展jimeng_commit_sample支持txt围栏与CRLF；完善正常生成增量修订Prompt路由与深色对比度",
+  "publishedAt": "2026-11-17T03:38:21+08:00",
+  "changelog": "新增桌面「一镜一对话」派单模式（默认）与纯本地零LLM Fast-Path 执行器，消除独立 CLI 登录弹窗与并发冲突",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

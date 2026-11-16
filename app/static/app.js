@@ -2680,12 +2680,16 @@ function getAgentStatusMeta() {
       state: "offline",
       label: "服务未连接",
       detail: "无法连接到本地控制台服务（127.0.0.1:8787）；请双击桌面「洗片控制台.app」启动后点下方刷新。",
+      aiDispatchMode: "desktop_subagent",
+      desktopCoordinatorOnline: false,
       bridgeOnline: false,
       bridgePaused: false,
-      maxWorkers: 4,
+      maxWorkers: 2,
       busy: false,
       activeShotIds: [],
       pendingCount: 0,
+      aiPendingCount: 0,
+      fastpathPendingCount: 0,
     };
   }
   return (
@@ -2693,13 +2697,17 @@ function getAgentStatusMeta() {
     state.data?.agentStatus || {
       state: "offline",
       label: "AI 检查中…",
-      detail: "正在检查后台 agy 并发桥接状态…",
+      detail: "正在检查桌面协同监听与本地 Fast-Path 状态…",
+      aiDispatchMode: state.data?.aiDispatchMode || "desktop_subagent",
+      desktopCoordinatorOnline: false,
       bridgeOnline: false,
       bridgePaused: false,
-      maxWorkers: 4,
+      maxWorkers: 2,
       busy: false,
       activeShotIds: [],
       pendingCount: 0,
+      aiPendingCount: 0,
+      fastpathPendingCount: 0,
     }
   );
 }
@@ -2741,6 +2749,30 @@ async function runAiBridgeAction(endpoint, successMessage) {
   }
 }
 
+async function switchAiDispatchMode(mode) {
+  state.aiActionPending = true;
+  renderAiStatusPopover();
+  try {
+    const res = await apiJson("/api/config/ai-dispatch-mode", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    });
+    state.serverUnreachable = false;
+    if (res.agentStatus) state.agentStatus = res.agentStatus;
+    if (state.data) {
+      state.data.aiDispatchMode = res.aiDispatchMode || mode;
+      if (res.agentStatus) state.data.agentStatus = res.agentStatus;
+    }
+    showToast(mode === "desktop_subagent" ? "已切换为「桌面一镜一对话」模式" : "已切换为「独立 CLI 桥接」模式");
+    await refreshAgentStatus();
+  } catch (err) {
+    showToast(err.message);
+  } finally {
+    state.aiActionPending = false;
+    renderAiStatusPill();
+  }
+}
+
 function renderAiStatusPopover() {
   const pop = document.getElementById("aiStatusPopover");
   const btn = document.getElementById("aiStatusBtn");
@@ -2757,6 +2789,8 @@ function renderAiStatusPopover() {
   btn.setAttribute("aria-expanded", "true");
 
   const st = getAgentStatusMeta();
+  const aiMode = st.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent";
+  const isDesktopMode = aiMode !== "cli_bridge";
   const badgeCls =
     st.state === "busy"
       ? "pill-blue"
@@ -2771,16 +2805,28 @@ function renderAiStatusPopover() {
   const pendingAttr = state.aiActionPending ? "disabled" : "";
   const isBridgeActive = st.bridgeOnline && !st.bridgePaused;
 
+  const modeSwitchHtml = !state.serverUnreachable
+    ? `
+      <div class="ai-mode-switch" role="group" aria-label="AI 派单模式">
+        <button type="button" class="ai-mode-btn${isDesktopMode ? " is-active" : ""}" data-ai-mode="desktop_subagent" ${pendingAttr} title="AI 任务由 Antigravity 桌面主控一镜一子对话处理（无 CLI 登录弹窗），改词/出片走纯本地 Fast-Path">💬 桌面一镜一对话（推荐）</button>
+        <button type="button" class="ai-mode-btn${!isDesktopMode ? " is-active" : ""}" data-ai-mode="cli_bridge" ${pendingAttr} title="全部任务交由后台 agy CLI 独立子进程池执行">${"⚙️ 独立 CLI 桥接"}</button>
+      </div>
+    `
+    : "";
+
   let actionsHtml = `<button id="refreshAiStatusBtn" data-ai-action="refresh" class="btn btn-secondary btn-sm" type="button" ${pendingAttr}>刷新状态</button>`;
   if (!state.serverUnreachable) {
+    const stopLabel = isDesktopMode ? "暂停 Fast-Path" : "暂停后台桥接";
+    const startLabel = isDesktopMode ? "启动 Fast-Path 执行器" : "一键重连（启动桥接）";
+    const restartLabel = isDesktopMode ? "重启执行器" : "一键重连";
     if (isBridgeActive) {
       actionsHtml += `
-        <button id="toggleBridgeBtn" data-ai-action="stop" class="btn btn-secondary btn-sm" type="button" ${pendingAttr}>${state.aiActionPending ? "处理中…" : "暂停后台桥接"}</button>
-        <button id="reconnectBridgeBtn" data-ai-action="restart" class="btn btn-primary btn-sm" type="button" ${pendingAttr}>${state.aiActionPending ? "重连中…" : "一键重连"}</button>
+        <button id="toggleBridgeBtn" data-ai-action="stop" class="btn btn-secondary btn-sm" type="button" ${pendingAttr}>${state.aiActionPending ? "处理中…" : stopLabel}</button>
+        <button id="reconnectBridgeBtn" data-ai-action="restart" class="btn btn-primary btn-sm" type="button" ${pendingAttr}>${state.aiActionPending ? "重连中…" : restartLabel}</button>
       `;
     } else {
       actionsHtml += `
-        <button id="toggleBridgeBtn" data-ai-action="start" class="btn btn-primary btn-sm" type="button" ${pendingAttr}>${state.aiActionPending ? "重连中…" : "一键重连（启动桥接）"}</button>
+        <button id="toggleBridgeBtn" data-ai-action="start" class="btn btn-primary btn-sm" type="button" ${pendingAttr}>${state.aiActionPending ? "启动中…" : startLabel}</button>
       `;
     }
   }
@@ -2794,17 +2840,29 @@ function renderAiStatusPopover() {
     `
     : "";
 
-  const nextHtml = `
-    <div class="ai-popover-head">
-      <span class="ai-popover-title">Antigravity 并发桥接与前台接管</span>
-      <span class="pill ${badgeCls}">${escapeHtml(st.label)}</span>
-    </div>
-    <div class="ai-popover-desc">${escapeHtml(st.detail || "")}</div>
-    <div class="ai-popover-meta">
+  const metaRowsHtml = isDesktopMode
+    ? `
+      <div class="ai-popover-row"><span>桌面协同监听</span><strong>${state.serverUnreachable ? "服务未连接" : st.desktopCoordinatorOnline ? "在线（自动派单 · 1~2 并发）" : "未在线（待主控挂载监听）"}</strong></div>
+      <div class="ai-popover-row"><span>本地 Fast-Path</span><strong>${state.serverUnreachable ? "服务未连接" : st.bridgePaused ? "已暂停" : st.bridgeOnline ? `运行中 (PID ${st.bridgePid || "-"})` : "未运行"}</strong></div>
+      <div class="ai-popover-row"><span>待办队列</span><strong>AI ${st.aiPendingCount || 0} 条 · 直出 ${st.fastpathPendingCount || 0} 条</strong></div>
+      <div class="ai-popover-row"><span>当前处理中</span><strong>${escapeHtml(activeText)}</strong></div>
+    `
+    : `
       <div class="ai-popover-row"><span>本地 agy 桥接</span><strong>${state.serverUnreachable ? "服务未连接" : st.agyInstalled === false ? "未安装 agy CLI" : st.bridgePaused ? "已暂停" : st.bridgeOnline ? `运行中 (PID ${st.bridgePid || "-"})` : "未运行"}</strong></div>
-      <div class="ai-popover-row"><span>并发调度能力</span><strong>${st.maxWorkers || 4} 路独立会话（互不串线）</strong></div>
+      <div class="ai-popover-row"><span>并发调度能力</span><strong>${st.maxWorkers || 2} 路独立会话（互不串线）</strong></div>
       <div class="ai-popover-row"><span>处理中 / 排队</span><strong>${escapeHtml(activeText)} / ${st.pendingCount || 0} 待办</strong></div>
       <div class="ai-popover-row"><span>最近完成会话</span><strong>${escapeHtml(convShort)}${st.lastRunAt ? ` · ${escapeHtml(st.lastRunAt.slice(11))}` : ""}</strong></div>
+    `;
+
+  const nextHtml = `
+    <div class="ai-popover-head">
+      <span class="ai-popover-title">${isDesktopMode ? "桌面一镜一对话 & Fast-Path" : "Antigravity CLI 桥接与接管"}</span>
+      <span class="pill ${badgeCls}">${escapeHtml(st.label)}</span>
+    </div>
+    ${modeSwitchHtml}
+    <div class="ai-popover-desc">${escapeHtml(st.detail || "")}</div>
+    <div class="ai-popover-meta">
+      ${metaRowsHtml}
     </div>
     ${st.lastError ? `<div class="ai-popover-err">最近异常：${escapeHtml(st.lastError)}</div>` : ""}
     <div class="ai-popover-actions">${actionsHtml}</div>
@@ -4891,6 +4949,8 @@ function renderShotActionBarHtml(shot) {
     : "";
 
   const canResumeChat = Boolean(shot.canResumeCliChat && shot.cliConversationId);
+  const desktopConvId = String(shot.desktopConversationId || "").trim();
+  const hasDesktopSubagent = Boolean(shot.canResumeDesktopSubagent && desktopConvId);
   const chatMainLabel = canResumeChat ? "💬 接手原对话" : "💬 前台开聊";
   const chatMainMode = canResumeChat ? "resume" : "new";
   const chatMainTitle = canResumeChat
@@ -4898,13 +4958,21 @@ function renderShotActionBarHtml(shot) {
     : "打开终端独立前台 agy 对话，并自动带入本镜提示词、画布与参考素材上下文";
   const resumeMenuBtn = canResumeChat
     ? `<button id="chatResumeMenuBtn" class="more-menu-item" type="button" role="menuitem">💬 续接原对话（终端 · ${escapeHtml(shot.cliConversationId.slice(0, 8))}…）</button>`
-    : `<button id="chatResumeMenuBtn" class="more-menu-item" type="button" role="menuitem" disabled title="该镜头尚未沉淀后台 agy 会话（首次 AI 处理后即可续接）">💬 续接原对话（暂无记录）</button>`;
+    : `<button id="chatResumeMenuBtn" class="more-menu-item" type="button" role="menuitem" disabled title="该镜头尚未沉淀终端 agy 会话">💬 续接终端原对话（暂无记录）</button>`;
+  const desktopConvMenuNote = hasDesktopSubagent
+    ? `<button class="more-menu-item more-menu-info" type="button" role="menuitem" disabled title="Antigravity 桌面主控已为该镜头绑定专属子对话，提交反馈或重检将自动在同一对话中续接">🧵 已绑定桌面子对话 (${escapeHtml(desktopConvId.slice(0, 8))}…)</button>`
+    : "";
+  const desktopConvPillHtml = hasDesktopSubagent
+    ? `<span class="desktop-conv-pill" title="该镜头已绑定专属 Antigravity 桌面子对话（${escapeHtml(desktopConvId)}），后续返工与复检将自动续接同一对话">🧵 子对话 ${escapeHtml(desktopConvId.slice(0, 6))}</span>`
+    : "";
 
   const chatSplitHtml = `
+    ${desktopConvPillHtml}
     <div id="shotChatWrap" class="chat-split-wrap">
       <button id="openShotChatMainBtn" class="btn btn-secondary btn-sm chat-split-main" type="button" data-chat-mode="${chatMainMode}" title="${escapeHtml(chatMainTitle)}">${chatMainLabel}</button>
       <button id="shotChatMenuToggleBtn" class="btn btn-secondary btn-sm chat-split-arrow${state.shotChatMenuOpen ? " is-open" : ""}" type="button" aria-haspopup="menu" aria-expanded="${state.shotChatMenuOpen ? "true" : "false"}" title="更多前台转聊方式">▾</button>
       <div id="shotChatMenu" class="chat-popover${state.shotChatMenuOpen ? "" : " hidden"}" role="menu" aria-label="转到前台独立对话选项">
+        ${desktopConvMenuNote}
         ${resumeMenuBtn}
         <button id="chatNewTerminalMenuBtn" class="more-menu-item" type="button" role="menuitem">🆕 新开独立前台对话（终端 agy）</button>
         <button id="chatHandoffDesktopMenuBtn" class="more-menu-item" type="button" role="menuitem">📋 复制上下文 + 唤起 Antigravity</button>
@@ -6428,18 +6496,27 @@ function bindGlobalEvents() {
 
   document.getElementById("aiStatusPopover")?.addEventListener("click", async (e) => {
     e.stopPropagation();
+    const modeBtn = e.target.closest("[data-ai-mode]");
+    if (modeBtn && !modeBtn.disabled) {
+      const nextMode = modeBtn.dataset.aiMode;
+      const curMode = getAgentStatusMeta().aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent";
+      if (nextMode && nextMode !== curMode) {
+        await switchAiDispatchMode(nextMode);
+      }
+      return;
+    }
     const actionBtn = e.target.closest("[data-ai-action]");
     if (!actionBtn || actionBtn.disabled) return;
     const action = actionBtn.dataset.aiAction;
     if (action === "refresh") {
       await refreshAgentStatus();
-      showToast(state.serverUnreachable ? "仍未连接到本地服务 (127.0.0.1:8787)" : "已刷新后台并发桥接状态");
+      showToast(state.serverUnreachable ? "仍未连接到本地服务 (127.0.0.1:8787)" : "已刷新执行器与监听状态");
     } else if (action === "stop") {
-      await runAiBridgeAction("/api/agent/bridge/stop", "已暂停本地 agy 后台桥接");
+      await runAiBridgeAction("/api/agent/bridge/stop", "已暂停本地后台执行器");
     } else if (action === "start") {
-      await runAiBridgeAction("/api/agent/bridge/start", "已重连并启动本地 agy 后台桥接");
+      await runAiBridgeAction("/api/agent/bridge/start", "已启动本地后台执行器");
     } else if (action === "restart") {
-      await runAiBridgeAction("/api/agent/bridge/restart", "已重连本地 agy 后台桥接");
+      await runAiBridgeAction("/api/agent/bridge/restart", "已重启本地后台执行器");
     } else if (action === "open-terminal-agy") {
       await launchForegroundAppWindow("terminal_agy");
     } else if (action === "open-antigravity") {

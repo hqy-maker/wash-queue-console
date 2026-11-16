@@ -13,23 +13,29 @@ description: >-
 
 ---
 
-## 1. 全自动后台并发桥接（`agent_bridge.py`）与单镜前台接手
+## 1. 桌面「一镜一对话」+ 纯本地 Fast-Path 与单镜接手
 
 > [!IMPORTANT]
-> 本系统采用 **独立多进程并发池（`agent_bridge.py`）+ 按需单镜前台接管**：
-> 1. **默认后台全自动并发**：打开 `洗片控制台.app` 或启动本地 8787 服务时，独立守护进程 `agent_bridge.py` 同步常驻（默认 4 路并发）。每来一个待办镜头，桥接池会自动按镜头分配独立干净的 `agy -p` 会话（并在同镜返工时用 `--conversation` 续接其专属对话）端到端执行并回写；纯改词同步优先走 Python 快速通道。
-> 2. **复杂镜前台人工接手**：若某个镜头疑难复杂或连续报错，用户在控制台点 **「💬 接手原对话 / 前台开聊」** 即可弹起 macOS Terminal 前台 `agy` 窗口，直接基于原会话或完整上下文简报和 AI 对话调试（**严禁**在任何单镜 Worker 内再递归挂起队列监听）。
+> 本系统默认采用 **「桌面一镜一对话（`desktop_subagent`）」+ 纯 Python Fast-Path 混合流水线**（也可在右上角状态弹窗切换回 `cli_bridge`）：
+> 1. **纯机械操作走零 LLM Fast-Path（`agent_bridge.py`）**：改词同步（`prompt_update_requested`）、即梦 480P 样片生成/下载（`run_requested`）与 1080P 转正（`final_requested`）在默认模式下直接由后台 `agent_bridge.py` 走纯 Python Fast-Path 直出，**绝不触发外部 `agy -p` CLI 进程**、无任何登录弹窗；若纯机械尝试无法处理，自动通过 `/api/shots/{shot_id}/release-fastpath` 退回 AI 队列。
+> 2. **AI 思考任务走桌面「一镜一对话」（Antigravity 主控 + Subagent 1~2 路并发）**：首次拆镜写词（`queued`）、返工修改（`feedback_queued`）、自检修复（`recheck_requested`）及 LibTV 或 Fast-Path 退回任务，由 Antigravity 桌面主控通过 `scripts/wait_next_ai_task.py` 维持 `"desktop"` 心跳并响应式唤醒：
+>    - 每次调用 `POST http://127.0.0.1:8787/api/agent/coordinator-claim` 领取最多 **1~2** 个 AI 镜头；
+>    - **一镜一专属子对话**：若 `desktopConversationId` 已有且 `canResumeDesktopSubagent` 为 true，则直接用 `send_message` 唤醒该镜头专属子对话；否则用 `invoke_subagent`（`TypeName="self"`）开启全新专属子对话，并立即调用 `POST /api/shots/{shot_id}/bind-conversation` 绑定 `conversationId`；
+>    - 每个单镜子对话在完成后直接调用 `POST /api/shots/{shot_id}/agent-update` 回写 `desktopConversationId` 与成片/画布结果（**严禁**在任何单镜子对话内再递归挂起队列监听）。
 
-1. **检查服务与桥接是否在线**（优先使用工作区 `tools/wash_queue_app`，否则回退桌面/应用目录下的 `洗片控制台.app/Contents/Resources/app`）：
+1. **检查服务与 Fast-Path 执行器是否在线**（优先使用工作区 `tools/wash_queue_app`，否则回退桌面/应用目录下的 `洗片控制台.app/Contents/Resources/app`）：
    ```bash
    APP_DIR="$( [ -d ./tools/wash_queue_app ] && pwd )/tools/wash_queue_app"
    [ -d "$APP_DIR" ] || APP_DIR="$HOME/Desktop/洗片控制台.app/Contents/Resources/app"
    [ -d "$APP_DIR" ] || APP_DIR="$HOME/Desktop/洗片控制台-同事版/洗片控制台.app/Contents/Resources/app"
    curl -sf http://127.0.0.1:8787/api/state >/dev/null || bash "$APP_DIR/launch.sh" --no-browser
    ```
-2. **手工核查待办或接手单镜**（无需挂常驻监听）：
+2. **桌面主控挂起响应式监听**：
    - 查看待办队列：`curl -sf http://127.0.0.1:8787/api/agent/pending`
-   - 手动签收单个镜头处理：`POST http://127.0.0.1:8787/api/shots/{shot_id}/claim`（获取 `claimToken`），完成后调用 `POST http://127.0.0.1:8787/api/shots/{shot_id}/agent-update`。
+   - 启动桌面心跳与待办阻塞等待（作为后台非守护命令 `WaitMsBeforeAsync=500`）：
+     `"$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/wait_next_ai_task.py" --timeout 3600`
+   - 桌面主控领单：`POST http://127.0.0.1:8787/api/agent/coordinator-claim`（`{"workerId":"desktop_coordinator","limit":2}`）
+   - 绑定单镜子对话：`POST http://127.0.0.1:8787/api/shots/{shot_id}/bind-conversation`（`{"conversationId":"<subagent_id>","surface":"desktop"}`）
 
 ---
 

@@ -37,7 +37,10 @@ from store import (
     QueueStore,
     build_canvas_url,
     get_platform_label,
+    is_fastpath_mechanical_candidate,
+    normalize_ai_dispatch_mode,
     normalize_platform,
+    resolve_desktop_conversation_id,
     run_preflight,
     sanitize_filename,
 )
@@ -125,6 +128,13 @@ class AgentPresenceTracker:
             "busy": False,
             "activeShotIds": [],
         }
+        self._desktop_meta: dict[str, Any] = {
+            "lastConversationId": "",
+            "lastRunAt": "",
+            "lastError": "",
+            "busy": False,
+            "activeShotIds": [],
+        }
 
     def is_paused(self) -> bool:
         return BRIDGE_PAUSED_FLAG.is_file()
@@ -191,7 +201,9 @@ class AgentPresenceTracker:
         last_error: str | None = None,
         shot_workers: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        wid = (watcher_id or mode or "agy_bridge").strip()[:80] or "agy_bridge"
+        clean_mode = "desktop" if str(mode or "").strip().lower() == "desktop" else "bridge"
+        default_wid = "desktop_coordinator" if clean_mode == "desktop" else "agy_bridge"
+        wid = (watcher_id or default_wid).strip()[:80] or default_wid
         ttl = max(5.0, min(float(ttl_sec or 40.0), 180.0))
         now = time.monotonic()
         wall_now = time.time()
@@ -200,23 +212,28 @@ class AgentPresenceTracker:
             self._prune_locked(now)
             self._watchers[wid] = {
                 "watcherId": wid,
-                "mode": "bridge",
+                "mode": clean_mode,
                 "busy": bool(busy),
                 "activeShotIds": active_clean,
                 "pid": int(pid) if pid else None,
                 "expiresAt": now + ttl,
                 "updatedAt": wall_now,
             }
-            self._bridge_meta["busy"] = bool(busy)
-            self._bridge_meta["activeShotIds"] = active_clean
+            meta = self._desktop_meta if clean_mode == "desktop" else self._bridge_meta
+            meta["busy"] = bool(busy)
+            meta["activeShotIds"] = active_clean
             if last_conversation_id is not None:
-                self._bridge_meta["lastConversationId"] = str(last_conversation_id).strip()
+                meta["lastConversationId"] = str(last_conversation_id).strip()
             if last_run_at is not None:
-                self._bridge_meta["lastRunAt"] = str(last_run_at).strip()
+                meta["lastRunAt"] = str(last_run_at).strip()
             if last_error is not None:
-                self._bridge_meta["lastError"] = str(last_error).strip()
+                meta["lastError"] = str(last_error).strip()
             if isinstance(shot_workers, dict):
-                next_workers: dict[str, dict[str, Any]] = {}
+                next_workers = {
+                    sid: rec
+                    for sid, rec in self._shot_workers.items()
+                    if str(rec.get("surface") or "bridge") != clean_mode
+                }
                 for k, v in shot_workers.items():
                     if not isinstance(v, dict):
                         continue
@@ -225,6 +242,7 @@ class AgentPresenceTracker:
                         continue
                     rec = dict(v)
                     rec["shotId"] = sid
+                    rec["surface"] = clean_mode
                     rec["heartbeatMono"] = now
                     rec["heartbeatWall"] = wall_now
                     next_workers[sid] = rec
@@ -236,9 +254,14 @@ class AgentPresenceTracker:
         if not wid:
             return
         with self._lock:
-            self._watchers.pop(wid, None)
-            if wid == "agy_bridge":
-                self._shot_workers.clear()
+            removed = self._watchers.pop(wid, None)
+            surface = str((removed or {}).get("mode") or ("desktop" if wid.startswith("desktop") else "bridge"))
+            if wid == "agy_bridge" or wid.startswith("desktop"):
+                self._shot_workers = {
+                    sid: rec
+                    for sid, rec in self._shot_workers.items()
+                    if str(rec.get("surface") or "bridge") != surface
+                }
 
     def inspect_shot_runtime(self, shot: dict[str, Any]) -> dict[str, Any]:
         sid = str(shot.get("id") or "").strip()
@@ -249,6 +272,11 @@ class AgentPresenceTracker:
         bridge_online = bool(snap.get("bridgeOnline"))
         bridge_paused = bool(snap.get("bridgePaused"))
         bridge_pid = snap.get("bridgePid")
+        ai_mode = str(snap.get("aiDispatchMode") or store.get_ai_dispatch_mode())
+        desktop_online = bool(snap.get("desktopCoordinatorOnline"))
+        claimed_by = str(shot.get("claimedBy") or "").strip()
+        is_fastpath_cand = is_fastpath_mechanical_candidate(shot)
+        desktop_conv_id = resolve_desktop_conversation_id(shot)
         wall_now = time.time()
 
         with self._lock:
@@ -276,16 +304,32 @@ class AgentPresenceTracker:
         suggested_action = "none"
 
         if is_processing:
-            if not bridge_online:
+            if claimed_by == "desktop_coordinator" or (ai_mode == "desktop_subagent" and claimed_by != "agy_bridge" and not worker):
+                if not desktop_online and elapsed_sec >= 45:
+                    health = "stalled"
+                    health_label = "🟡 桌面协同监听已离线"
+                    diagnosis = f"该镜头已由桌面一镜一对话接管（{elapsed_sec} 秒），但桌面监听脚本当前离线；可点击「↻ 刷新重试」恢复或等待桌面子对话回写。"
+                    suggested_action = "retry"
+                elif elapsed_sec >= 600:
+                    health = "slow"
+                    health_label = f"🟠 桌面单镜子对话已运行 {elapsed_sec} 秒"
+                    diagnosis = "该镜头专属子对话仍在执行中（可能包含出片或复杂排查）；可在 Antigravity 桌面端查看对应子对话，或点「↻ 刷新重试」。"
+                    suggested_action = "wait"
+                else:
+                    health = "running"
+                    health_label = "🟢 桌面单镜子对话处理中"
+                    diagnosis = f"正在 Antigravity 桌面端专属子对话中处理（已耗时 {elapsed_sec} 秒），完成后将自动回写队列状态。"
+                    suggested_action = "wait"
+            elif not bridge_online:
                 health = "stalled"
-                health_label = "🔴 后台桥接进程未运行"
-                diagnosis = "镜头仍标记为「处理中」，但后台桥接进程已离线；建议点「↻ 刷新重试」重新入队并启动执行。"
+                health_label = "🔴 后台执行器进程未运行"
+                diagnosis = "镜头仍标记为「处理中」，但后台执行器进程已离线；建议点「↻ 刷新重试」重新入队并启动执行。"
                 suggested_action = "retry"
             elif not worker:
                 if elapsed_sec >= 12:
                     health = "stalled"
                     health_label = "🔴 未检测到活跃 Worker（疑似中断）"
-                    diagnosis = f"桥接虽在线，但已过 {elapsed_sec} 秒仍未找到该镜头的活跃 Worker（可能桥接曾重启中断）；点「↻ 刷新重试」可立刻重跑。"
+                    diagnosis = f"执行器虽在线，但已过 {elapsed_sec} 秒仍未找到该镜头的活跃 Worker（可能进程曾重启中断）；点「↻ 刷新重试」可立刻重跑。"
                     suggested_action = "retry"
                 else:
                     health = "running"
@@ -313,21 +357,32 @@ class AgentPresenceTracker:
                 diagnosis = f"Worker 活跃运行中，已耗时 {elapsed_sec} 秒，最近 {idle_sec} 秒内有新输出。"
                 suggested_action = "wait"
         elif is_waiting:
-            if bridge_paused:
+            if ai_mode == "desktop_subagent" and not is_fastpath_cand:
+                if desktop_online:
+                    health = "queued"
+                    health_label = "⏳ 等待桌面一镜一对话接单"
+                    diagnosis = "当前处于「桌面一镜一对话模式」，Antigravity 桌面主控将按 1~2 路并发为该镜头开启或续接专属子对话。"
+                    suggested_action = "wait"
+                else:
+                    health = "offline"
+                    health_label = "🟡 等待桌面协同监听上线"
+                    diagnosis = "当前为「桌面一镜一对话模式」，需 AI 处理的镜头由桌面主控监听派发；可等待桌面主控接单，或切换至「独立 CLI 桥接」。"
+                    suggested_action = "wait"
+            elif bridge_paused:
                 health = "paused"
-                health_label = "⏸ 后台桥接已暂停"
-                diagnosis = "后台 4 路并发桥接处于暂停状态，任务暂时不会自动领单；点击右上角状态恢复桥接或点「↻ 重试」核查。"
+                health_label = "⏸ 后台执行器已暂停"
+                diagnosis = f"后台 {snap.get('maxWorkers', 2)} 路并发执行器处于暂停状态，任务暂时不会自动领单；点击右上角状态恢复执行器或点「↻ 重试」核查。"
                 suggested_action = "resume_bridge"
             elif not bridge_online:
                 health = "offline"
-                health_label = "🔴 后台桥接未连接"
-                diagnosis = "当前任务正在队列等待，但后台桥接尚未启动；请在右上角点击「一键重连（启动桥接）」。"
+                health_label = "🔴 后台执行器未连接"
+                diagnosis = "当前任务正在队列等待，但后台执行器尚未启动；请在右上角点击「重启本地执行器」。"
                 suggested_action = "resume_bridge"
             else:
                 health = "queued"
                 health_label = "⏳ 正在排队等待空闲槽位领单"
                 active_cnt = len(snap.get("activeShotIds") or [])
-                diagnosis = f"后台桥接正常在线（当前正在并发处理 {active_cnt}/{snap.get('maxWorkers', 4)} 个镜头），空闲后会立即自动领单执行。"
+                diagnosis = f"后台执行器正常在线（当前正在处理 {active_cnt}/{snap.get('maxWorkers', 2)} 个镜头），空闲后会立即自动领单执行。"
                 suggested_action = "wait"
 
         return {
@@ -343,21 +398,23 @@ class AgentPresenceTracker:
             "suggestedAction": suggested_action,
             "elapsedSec": elapsed_sec,
             "idleSec": idle_sec,
-            "phase": str(worker.get("phase") or ("排队待领单" if is_waiting else ("后台处理中" if is_processing else ""))),
+            "phase": str(worker.get("phase") or ("排队待领单" if is_waiting else ("桌面子对话处理中" if (claimed_by == "desktop_coordinator" and is_processing) else ("后台处理中" if is_processing else "")))),
             "stepCount": int(worker.get("stepCount") or 0),
             "stepType": str(worker.get("stepType") or ""),
             "lastNote": str(worker.get("lastNote") or shot.get("agentSummary") or ""),
             "recentSteps": list(worker.get("recentSteps") or []),
             "model": str(worker.get("model") or ""),
             "resumed": bool(worker.get("resumed")),
-            "conversationId": str(worker.get("conversationId") or shot.get("cliConversationId") or ""),
+            "conversationId": str(worker.get("conversationId") or desktop_conv_id or shot.get("cliConversationId") or ""),
+            "desktopConversationId": desktop_conv_id,
+            "aiDispatchMode": ai_mode,
             "agyPid": agy_pid,
             "agyPidAlive": agy_pid_alive,
             "bridgeOnline": bridge_online,
             "bridgePaused": bridge_paused,
             "bridgePid": bridge_pid,
             "claimedAt": str(shot.get("claimedAt") or ""),
-            "claimedBy": str(shot.get("claimedBy") or ""),
+            "claimedBy": claimed_by,
             "startedAtIso": str(worker.get("startedAtIso") or shot.get("claimedAt") or ""),
             "lastEventAtIso": str(worker.get("lastEventAtIso") or ""),
             "recentLogs": _tail_shot_bridge_logs(sid, limit=8),
@@ -369,51 +426,103 @@ class AgentPresenceTracker:
         wall_now = time.time()
         live_pid = _read_bridge_pid()
         paused = self.is_paused()
+        ai_mode = normalize_ai_dispatch_mode(
+            (state_data or {}).get("aiDispatchMode") if state_data is not None else store.get_ai_dispatch_mode()
+        )
         with self._lock:
             self._prune_locked(now)
             watchers = list(self._watchers.values())
-            bridge_watchers = [w for w in watchers if w["mode"] == "bridge"]
+            bridge_watchers = [w for w in watchers if w.get("mode") == "bridge"]
+            desktop_watchers = [w for w in watchers if w.get("mode") == "desktop"]
             bridge_online = bool(bridge_watchers) or (live_pid is not None and not paused)
+            desktop_online = bool(desktop_watchers)
             bridge_meta = dict(self._bridge_meta)
+            desktop_meta = dict(self._desktop_meta)
             workers_copy = {sid: dict(w) for sid, w in self._shot_workers.items()}
 
-        processing_ids = []
+        processing_ids: list[str] = []
         pending_count = 0
+        ai_pending_count = 0
+        fastpath_pending_count = 0
         if state_data:
             shots = state_data.get("shots")
             if isinstance(shots, list):
                 processing_ids = [s["id"] for s in shots if s.get("status") == "processing"]
-                pending_count = sum(1 for s in shots if s.get("status") in ACTIONABLE_STATUSES)
+                for s in shots:
+                    if s.get("status") in ACTIONABLE_STATUSES:
+                        pending_count += 1
+                        if is_fastpath_mechanical_candidate(s):
+                            fastpath_pending_count += 1
+                        else:
+                            ai_pending_count += 1
             else:
                 processing_ids = list(state_data.get("processingShotIds") or [])
                 pending_count = int(state_data.get("pendingCount", 0))
 
         bridge_active_ids = bridge_meta.get("activeShotIds") or []
-        any_busy = bool(processing_ids or bridge_active_ids or bridge_meta.get("busy"))
+        desktop_active_ids = desktop_meta.get("activeShotIds") or []
+        all_active_ids = sorted(set(processing_ids) | set(bridge_active_ids) | set(desktop_active_ids))
+        any_busy = bool(all_active_ids or bridge_meta.get("busy") or desktop_meta.get("busy"))
 
         agy_installed = bool(agent_bridge.find_agy_bin())
-        max_workers = int(getattr(agent_bridge, "MAX_WORKERS", 4) or 4)
-        if any_busy and bridge_online:
-            conn_state = "busy"
-            busy_count = len(set(processing_ids) | set(bridge_active_ids)) or 1
-            label = f"AI 并发处理中 ({busy_count})"
-            detail = f"后台桥接正在并发处理 {busy_count} 个镜头（{', '.join(processing_ids or bridge_active_ids)}）。"
-        elif paused:
-            conn_state = "paused"
-            label = "AI 桥接已暂停"
-            detail = f"后台 {max_workers} 路并发桥接已手动暂停；点击下方「一键重连（启动桥接）」即可恢复自动领单执行。"
-        elif bridge_online and not agy_installed:
-            conn_state = "bridge_ready"
-            label = "桥接待配置 CLI"
-            detail = "本地控制台已就绪；请先安装 Antigravity 并安装/关联 `agy` 命令行工具，以启用后台并发桥接与前台接手对话。"
-        elif bridge_online:
-            conn_state = "bridge_ready"
-            label = "AI 桥接已就绪"
-            detail = f"后台 {max_workers} 路并发桥接在线（agy CLI）；每个镜头独立会话互不阻塞，也可随时一键唤起前台窗口接手。"
+        max_workers = int(getattr(agent_bridge, "MAX_WORKERS", 2) or 2)
+        if ai_mode == "desktop_subagent":
+            if any_busy:
+                conn_state = "busy"
+                busy_count = len(all_active_ids) or 1
+                label = f"一镜一对话处理中 ({busy_count})"
+                detail = (
+                    f"桌面一镜一对话模式：正在处理 {busy_count} 个镜头（{', '.join(all_active_ids)}）。"
+                    "需 AI 思考任务由桌面专属子对话处理（1~2 并发），纯机械操作由本地 Fast-Path 直出。"
+                )
+            elif paused:
+                conn_state = "paused"
+                label = "本地 Fast-Path 已暂停"
+                detail = "本地 Fast-Path 执行器已手动暂停；点击「重启本地执行器」可恢复零 LLM 改词/出片直出。"
+            elif desktop_online and bridge_online:
+                conn_state = "bridge_ready"
+                label = "桌面一镜一对话在线"
+                detail = (
+                    "桌面一镜一对话与本地 Fast-Path 均在线：首次分析/返工/复检由 Antigravity 桌面主控开专属子对话执行，"
+                    "改词/出样片/转 1080P 由本地零 LLM 极速直出（无独立 CLI 登录弹窗）。"
+                )
+            elif desktop_online:
+                conn_state = "bridge_ready"
+                label = "桌面在线（Fast-Path 离线）"
+                detail = "桌面一镜一对话监听在线；本地 Fast-Path 执行器暂未启动，点击下方重启即可启用零 LLM 极速直出。"
+            elif bridge_online:
+                conn_state = "bridge_ready"
+                label = "一镜一对话 · 待桌面监听"
+                detail = (
+                    "本地 Fast-Path 执行器在线（可零 LLM 直出即梦改词/样片/1080P）；"
+                    "桌面监听脚本暂未挂载，请在 Antigravity 桌面主控中开启监听即可自动派发单镜子对话。"
+                )
+            else:
+                conn_state = "offline"
+                label = "桌面一镜一对话未连接"
+                detail = "桌面监听与本地 Fast-Path 执行器均未运行；可点击下方启动本地执行器并在桌面端开启监听。"
         else:
-            conn_state = "offline"
-            label = "AI 桥接未连接"
-            detail = "后台并发桥接进程未运行；点击下方「一键重连（启动桥接）」即可恢复自动领单执行。"
+            if any_busy and bridge_online:
+                conn_state = "busy"
+                busy_count = len(set(processing_ids) | set(bridge_active_ids)) or 1
+                label = f"AI 并发处理中 ({busy_count})"
+                detail = f"独立 CLI 桥接正在并发处理 {busy_count} 个镜头（{', '.join(processing_ids or bridge_active_ids)}）。"
+            elif paused:
+                conn_state = "paused"
+                label = "AI 桥接已暂停"
+                detail = f"后台 {max_workers} 路 CLI 桥接已手动暂停；点击下方「一键重连（启动执行器）」即可恢复。"
+            elif bridge_online and not agy_installed:
+                conn_state = "bridge_ready"
+                label = "桥接待配置 CLI"
+                detail = "当前为独立 CLI 桥接模式，但未检测到 `agy` 命令行工具；建议切换回「桌面一镜一对话」模式。"
+            elif bridge_online:
+                conn_state = "bridge_ready"
+                label = "独立 CLI 桥接就绪"
+                detail = f"后台 {max_workers} 路并发 CLI 桥接在线（agy CLI）；每个镜头独立 CLI 会话互不阻塞。"
+            else:
+                conn_state = "offline"
+                label = "AI 桥接未连接"
+                detail = "后台并发桥接进程未运行；点击下方「一键重连（启动执行器）」即可恢复。"
 
         worker_summaries: dict[str, dict[str, Any]] = {}
         for sid, w in workers_copy.items():
@@ -432,18 +541,23 @@ class AgentPresenceTracker:
             "state": conn_state,
             "label": label,
             "detail": detail,
+            "aiDispatchMode": ai_mode,
+            "desktopCoordinatorOnline": desktop_online,
+            "desktopActiveShotIds": desktop_active_ids,
+            "aiPendingCount": ai_pending_count,
+            "fastpathPendingCount": fastpath_pending_count,
             "agyInstalled": agy_installed,
             "bridgeOnline": bridge_online,
             "bridgePid": live_pid,
             "bridgePaused": paused,
             "maxWorkers": max_workers,
             "busy": any_busy,
-            "activeShotIds": sorted(set(processing_ids) | set(bridge_active_ids)),
+            "activeShotIds": all_active_ids,
             "processingShotIds": processing_ids,
             "pendingCount": pending_count,
             "lastConversationId": bridge_meta.get("lastConversationId", ""),
-            "lastRunAt": bridge_meta.get("lastRunAt", ""),
-            "lastError": bridge_meta.get("lastError", ""),
+            "lastRunAt": desktop_meta.get("lastRunAt") or bridge_meta.get("lastRunAt", ""),
+            "lastError": desktop_meta.get("lastError") or bridge_meta.get("lastError", ""),
             "shotWorkers": worker_summaries,
         }
 
@@ -960,6 +1074,7 @@ class AgentUpdateReq(BaseModel):
     revisionSummary: str | None = None
     revisionDirection: str | None = None
     conversationId: str | None = None
+    desktopConversationId: str | None = None
     claimToken: str | None = None
 
 
@@ -967,6 +1082,28 @@ class ClaimReq(BaseModel):
     workerId: str = "coordinator"
     limit: int = 10
     shotIds: list[str] | None = None
+    fastpathOnly: bool = False
+    aiOnly: bool = False
+
+
+class CoordinatorClaimReq(BaseModel):
+    workerId: str = "desktop_coordinator"
+    limit: int = 2
+    shotIds: list[str] | None = None
+
+
+class AiDispatchModeReq(BaseModel):
+    mode: str = "desktop_subagent"
+
+
+class ReleaseFastpathReq(BaseModel):
+    claimToken: str = ""
+    reason: str = ""
+
+
+class BindConvReq(BaseModel):
+    conversationId: str
+    surface: str = "desktop"
 
 
 class ClaimShotReq(BaseModel):
@@ -1378,6 +1515,20 @@ def set_auto_qa_config(req: AutoQaConfigReq) -> dict[str, Any]:
     return {"ok": True, "autoQaAfterRender": bool(updated.get("autoQaAfterRender", False))}
 
 
+@app.post("/api/config/ai-dispatch-mode")
+def set_ai_dispatch_mode_config(req: AiDispatchModeReq) -> dict[str, Any]:
+    try:
+        updated = store.set_ai_dispatch_mode(req.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    snap = agent_presence.snapshot(store.get_state())
+    return {
+        "ok": True,
+        "aiDispatchMode": updated.get("aiDispatchMode", "desktop_subagent"),
+        "agentStatus": snap,
+    }
+
+
 @app.post("/api/config/default-project")
 def set_default_project(req: DefaultProjectReq) -> dict[str, Any]:
     try:
@@ -1719,7 +1870,9 @@ def get_shot_handoff_context(shot_id: str, req: OpenShotChatReq | None = None) -
         "ok": True,
         "shotId": shot["id"],
         "cliConversationId": shot.get("cliConversationId", ""),
+        "desktopConversationId": resolve_desktop_conversation_id(shot),
         "canResumeCliChat": bool(shot.get("canResumeCliChat")),
+        "canResumeDesktopSubagent": bool(shot.get("canResumeDesktopSubagent")),
         "contextText": context_text,
     }
 
@@ -2055,10 +2208,52 @@ def restart_agent_bridge() -> dict[str, Any]:
     return {**res, "agentStatus": snap}
 
 
+@app.post("/api/shots/{shot_id}/release-fastpath")
+def release_fastpath_shot(shot_id: str, req: ReleaseFastpathReq) -> dict[str, Any]:
+    try:
+        shot = store.release_fastpath_claim(shot_id, claim_token=req.claimToken, reason=req.reason)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClaimConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/bind-conversation")
+def bind_shot_conversation_endpoint(shot_id: str, req: BindConvReq) -> dict[str, Any]:
+    try:
+        shot = store.bind_shot_conversation(shot_id, conversation_id=req.conversationId, surface=req.surface)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/agent/claim")
 def claim_agent_pending(req: ClaimReq | None = None) -> dict[str, Any]:
     body = req or ClaimReq()
-    res = store.claim_pending(worker_id=body.workerId, limit=body.limit, shot_ids=body.shotIds)
+    res = store.claim_pending(
+        worker_id=body.workerId,
+        limit=body.limit,
+        shot_ids=body.shotIds,
+        fastpath_only=bool(body.fastpathOnly),
+        ai_only=bool(body.aiOnly),
+    )
+    return {"ok": True, **res}
+
+
+@app.post("/api/agent/coordinator-claim")
+def claim_coordinator_pending(req: CoordinatorClaimReq | None = None) -> dict[str, Any]:
+    body = req or CoordinatorClaimReq()
+    res = store.claim_pending(
+        worker_id=body.workerId or "desktop_coordinator",
+        limit=max(1, min(int(body.limit or 2), 4)),
+        shot_ids=body.shotIds,
+        ai_only=True,
+    )
     return {"ok": True, **res}
 
 
@@ -2106,16 +2301,25 @@ def wait_events(
     since: int = Query(default=0),
     timeout: float = Query(default=20.0),
     actionable: bool = Query(default=False),
+    ai_only: bool = Query(default=False),
+    fastpath_only: bool = Query(default=False),
     watcher: str = Query(default=""),
     mode: str = Query(default=""),
 ) -> dict[str, Any]:
-    if watcher.strip() and mode.strip() == "bridge":
+    clean_mode = mode.strip()
+    if watcher.strip() and clean_mode in {"bridge", "desktop"}:
         agent_presence.record_heartbeat(
             watcher.strip(),
-            "bridge",
+            clean_mode,
             ttl_sec=max(float(timeout or 20.0) + 15.0, 35.0),
         )
-    return store.wait_for_events(since_seq=since, timeout=timeout, only_actionable=actionable)
+    return store.wait_for_events(
+        since_seq=since,
+        timeout=timeout,
+        only_actionable=actionable,
+        ai_only=ai_only,
+        fastpath_only=fastpath_only,
+    )
 
 
 if __name__ == "__main__":
