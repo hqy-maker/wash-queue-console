@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.13",
+  "version": "2026.11.16.14",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T23:12:37+08:00",
-  "changelog": "上线即梦 run_requested/final_requested 全确定性 Python 直出与 1080P 自动导出、出片后AI看片开关（默认极速直出）、以及 queued Fast-Path 精简提示词",
+  "publishedAt": "2026-11-16T23:16:55+08:00",
+  "changelog": "完善无原片纯图生视频镜头 Fast-Path 预建就绪判定与零深度捕捉指令",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

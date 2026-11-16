@@ -404,6 +404,7 @@ def _build_worker_prompt(
             f"- 你只需执行 **1 次** `read_file` 查看 `{dl_path}`，确认主体/运镜/画质/音频无硬伤，然后立刻调用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（带 `claimToken`、`status: \"{target_st}\"`、`resolveFeedbacks: true` 及简明 `agentSummary`）即可结束！\n\n"
         )
     elif is_jimeng and task_type == "queued" and prepped_dict:
+        has_src_video = bool(brief.get("sourceVideo") or prepped_dict.get("preuploadedSourceNodeId"))
         depth_id = str(prepped_dict.get("pretriggeredDepthNodeId") or "").strip()
         depth_status = str(prepped_dict.get("depthTriggerStatus") or "").strip()
         depth_reason = str(prepped_dict.get("depthTriggerReason") or "").strip()
@@ -414,21 +415,31 @@ def _build_worker_prompt(
         for ch in char_nodes:
             if isinstance(ch, dict) and ch.get("nodeId"):
                 ordered_refs.append(f"--ref node:{ch['nodeId']}")
-        if depth_id:
+        if has_src_video and depth_id:
             ordered_refs.append(f"--ref node:{depth_id}")
-        refs_cli_hint = " ".join(ordered_refs) if ordered_refs else "--ref node:<comp> ... --ref node:<depth>"
+        refs_cli_hint = " ".join(ordered_refs) if ordered_refs else "--ref node:<comp> ..."
         pid = str(shot.get("projectUuid") or "")
 
-        depth_hint = (
-            f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，只需查状态 `dreamina-canvas --non-interactive --format json node show --project-id {pid} --node-id {depth_id}` 等其 `status == success`！"
-            if depth_id
-            else f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {pid} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅脚本失败时才持 `chrome_ui` 锁走 Chrome MCP 手点。"
-        )
+        if not has_src_video:
+            depth_hint = "本镜未上传原片视频（纯图生视频/多图参考模式）：**无需触发或等待深度动作捕捉**，直接引用构图图与角色节点即可。"
+        elif depth_id:
+            depth_hint = (
+                f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，只需查状态 `dreamina-canvas --non-interactive --format json node show --project-id {pid} --node-id {depth_id}` 等其 `status == success`！"
+            )
+        else:
+            depth_hint = (
+                f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {pid} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅脚本失败时才持 `chrome_ui` 锁走 Chrome MCP 手点。"
+            )
         whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
         whiteout_hint = (
             f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
             if whiteout_req
             else "用 `read_file` 目视 `compImage`：仅出现真人清晰正面五官且未遮罩时才跑 `scripts/whiteout_mask.py`；否则直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）。"
+        )
+        src_line = (
+            f"  - 原片节点：`{prepped_dict.get('preuploadedSourceNodeId') or '未建'}` (`(1760, {row_y})`)\n"
+            if has_src_video
+            else "  - 原片节点：无（图+角色多模态直生视频）\n"
         )
         prebuild_section = (
             "## Fast-Path 画布预建与省流清单（务必遵守以极速完成）\n"
@@ -436,7 +447,7 @@ def _build_worker_prompt(
             "- 已就绪画布节点（**严禁重跑 `node find` 全表、重传素材或 `dreamina-canvas schema` / `auth status`**）：\n"
             f"  - 构图节点：`{comp_nid or '未建'}` (`(800, {row_y})`)\n"
             f"  - 角色参考：`{json.dumps(char_nodes, ensure_ascii=False)}`\n"
-            f"  - 原片节点：`{prepped_dict.get('preuploadedSourceNodeId') or '未建'}` (`(1760, {row_y})`)\n"
+            f"{src_line}"
             f"- 深度捕捉：{depth_hint}\n"
             f"- 涂白判断：{whiteout_hint}\n"
             "- 建样片与只读报价内联命令模板（若更换涂白图请替换第一个 `--ref node:`）：\n"

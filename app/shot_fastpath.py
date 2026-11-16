@@ -804,7 +804,9 @@ def inspect_dreamina_canvas_context(
             result["depthTriggerStatus"] = "fallback_needed"
             result["depthTriggerReason"] = str(dexc)
 
-    result["prebuildReady"] = bool(result.get("preuploadedSourceNodeId") and result.get("preuploadedCompNodeId"))
+    has_source = bool(str((shot.get("sourceVideo") or {}).get("filePath") or "").strip())
+    result["hasSourceVideo"] = has_source
+    result["prebuildReady"] = bool(result.get("preuploadedCompNodeId") and (not has_source or result.get("preuploadedSourceNodeId")))
     if warnings_list:
         result["canvasPrepWarning"] = "; ".join(warnings_list)
     return result
