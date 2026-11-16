@@ -101,8 +101,9 @@ def _load_bridge_settings() -> dict[str, Any]:
         "prePrepEnabled": _bool_opt("prePrepEnabled", "WASH_BRIDGE_PREPREP", True),
         "heavyModel": _str_opt("heavyModel", "WASH_BRIDGE_HEAVY_MODEL", ""),
         "fastModel": _str_opt("fastModel", "WASH_BRIDGE_FAST_MODEL", ""),
-        "heavyEffort": _str_opt("heavyEffort", "WASH_BRIDGE_HEAVY_EFFORT", "high"),
+        "heavyEffort": _str_opt("heavyEffort", "WASH_BRIDGE_HEAVY_EFFORT", "xhigh"),
         "midEffort": _str_opt("midEffort", "WASH_BRIDGE_MID_EFFORT", "medium"),
+        "recheckEffort": _str_opt("recheckEffort", "WASH_BRIDGE_RECHECK_EFFORT", "medium"),
         "fastEffort": _str_opt("fastEffort", "WASH_BRIDGE_FAST_EFFORT", "low"),
     }
 
@@ -150,39 +151,58 @@ def _discover_agy_models(agy_bin: str) -> set[str]:
         return set(found)
 
 
+def _normalize_effort(effort: str, default: str = "medium") -> str:
+    clean = (effort or "").strip().lower()
+    if clean == "extra":
+        clean = "xhigh"
+    return clean if clean in {"low", "medium", "high", "xhigh", "max"} else default
+
+
 def _resolve_compatible_effort(model: str, effort: str) -> str:
     """Align `--effort` with model-encoded tier suffixes to prevent CLI conflicts."""
     clean_model = (model or "").strip().lower()
-    clean_effort = (effort or "").strip().lower()
+    clean_effort = _normalize_effort(effort, default="")
     for tier in ("-xhigh", "-high", "-medium", "-low"):
         if clean_model.endswith(tier):
             return tier.lstrip("-")
     return clean_effort
 
 
+def _pick_hydrogen_model(target_effort: str, available_models: set[str]) -> str:
+    """Pick the matching Gemini 4 Hydrogen model for `target_effort` (no 3.8 Flash)."""
+    eff = _normalize_effort(target_effort, default="medium")
+    candidates = {
+        "xhigh": ("gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-high", "gemini-4-carbon-high"),
+        "high": ("gemini-4-hydrogen-high", "gemini-4-hydrogen-xhigh", "gemini-4-carbon-high"),
+        "medium": ("gemini-4-hydrogen-medium", "gemini-4-hydrogen-low", "gemini-4-carbon-medium", "gemini-4-argon-medium"),
+        "low": ("gemini-4-hydrogen-low", "gemini-4-hydrogen-medium", "gemini-4-carbon-low", "gemini-4-argon-low"),
+    }.get(eff, ("gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-high", "gemini-4-hydrogen-medium"))
+    for cand in candidates:
+        if cand in available_models:
+            return cand
+    return ""
+
+
 def _select_execution_profile(task_type: str, available_models: set[str], cfg: dict[str, Any]) -> tuple[str, str]:
-    """Return `(model, effort)` tailored to task complexity."""
-    if task_type in {"prompt_update_requested", "recheck_requested"}:
-        effort = cfg["fastEffort"] or "low"
-        model = cfg["fastModel"]
-        if not model:
-            candidates = {
-                "low": ("gemini-3.8-flash-low", "gemini-4-argon-low", "gemini-4-carbon-low", "gemini-3.8-flash-medium"),
-                "medium": ("gemini-3.8-flash-medium", "gemini-4-carbon-medium", "gemini-4-argon-medium", "gemini-3.8-flash-low"),
-            }.get(effort, ("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-4-argon-low"))
-            for cand in candidates:
-                if cand in available_models:
-                    model = cand
-                    break
+    """Return `(model, effort)` using Gemini 4 Hydrogen across all tasks."""
+    if task_type == "prompt_update_requested":
+        effort = _normalize_effort(cfg.get("fastEffort", "low"), default="low")
+        model = cfg["fastModel"] or _pick_hydrogen_model(effort, available_models)
+        return model, _resolve_compatible_effort(model, effort)
+
+    if task_type == "recheck_requested":
+        effort = _normalize_effort(cfg.get("recheckEffort") or cfg.get("fastEffort") or "medium", default="medium")
+        model = cfg["fastModel"] or _pick_hydrogen_model(effort, available_models)
         return model, _resolve_compatible_effort(model, effort)
 
     if task_type in {"run_requested", "final_requested"}:
-        effort = cfg["midEffort"] or "medium"
-        model = cfg["heavyModel"]
+        effort = _normalize_effort(cfg.get("midEffort", "medium"), default="medium")
+        model = cfg["heavyModel"] or _pick_hydrogen_model(effort, available_models)
         return model, _resolve_compatible_effort(model, effort)
 
-    effort = cfg["heavyEffort"] or "high"
-    model = cfg["heavyModel"]
+    # Prompt writing & revision tasks (`queued`, `feedback_queued`, etc.) -> Extra (`xhigh`)
+    effort = _normalize_effort(cfg.get("heavyEffort", "xhigh"), default="xhigh")
+    model = cfg["heavyModel"] or _pick_hydrogen_model(effort, available_models)
     return model, _resolve_compatible_effort(model, effort)
 
 
