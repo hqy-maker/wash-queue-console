@@ -199,7 +199,11 @@ def diagnose_error(
     }
 
 
-def infer_shot_stage_flags(shot: dict[str, Any]) -> dict[str, Any]:
+def infer_shot_stage_flags(
+    shot: dict[str, Any],
+    *,
+    has_changes: bool | None = None,
+) -> dict[str, Any]:
     """Compute consistent UI/API stage flags for 1080P promotion progress and passed state."""
     st = str(shot.get("status") or "")
     task = str(shot.get("processingTaskType") or "")
@@ -211,11 +215,41 @@ def infer_shot_stage_flags(shot: dict[str, Any]) -> dict[str, Any]:
         or (st == "processing" and task == "final_requested")
         or (st in {"queued", "processing", "needs_confirmation"} and pending_action == "promote_1080p")
     )
-    passed_final = bool(st in {"final_ready", "final_done"} or (has_final and st not in {"error", "feedback_queued", "prompt_update_requested", "run_requested"} and not final_in_progress))
+    reopened = bool(shot.get("finalModifiedReopened"))
+    modified_after_final = bool(
+        reopened
+        or (
+            has_final
+            and not final_in_progress
+            and st
+            in {
+                "ready_on_canvas",
+                "draft_ready",
+                "feedback_queued",
+                "prompt_update_requested",
+                "run_requested",
+                "recheck_requested",
+            }
+        )
+    )
+    passed_final = bool(
+        not final_in_progress
+        and not modified_after_final
+        and (
+            st in {"final_ready", "final_done"}
+            or (has_final and st not in {"error", "needs_confirmation"})
+        )
+    )
+    has_outdated_final = bool(has_final and modified_after_final and not final_in_progress)
+    draft_after_reopen = bool(shot.get("draftUpdatedSinceFinalReopen")) or bool(
+        has_outdated_final and st == "draft_ready" and (has_changes is False)
+    )
     return {
         "hasFinalVideo": has_final,
         "isFinalInProgress": final_in_progress,
         "isPassedFinal": passed_final,
+        "hasOutdatedFinal": has_outdated_final,
+        "draftUpdatedSinceFinalReopen": draft_after_reopen,
     }
 
 
@@ -363,7 +397,7 @@ def _decorate_shot_payload(shot: dict[str, Any]) -> dict[str, Any]:
     out["hasChangesSinceLastGeneration"] = has_changes
     out["generationChangeState"] = change_state
     out["generationChangeSummary"] = change_summary
-    out.update(infer_shot_stage_flags(out))
+    out.update(infer_shot_stage_flags(out, has_changes=has_changes))
     if st == "error":
         failed_task = str(out.get("lastFailedTask") or "").strip()
         if not failed_task and any(f.get("status") == "pending" for f in (out.get("feedbacks") or [])):
@@ -1482,6 +1516,7 @@ class QueueStore:
                         shot["previousPromptText"] = prev_prompt
                     shot["pendingPromptEdit"] = edited_clean
                     shot["promptText"] = edited_clean
+                self._mark_final_reopened_if_needed(shot)
                 self._clear_claim_fields(shot)
                 self._clear_error_fields(shot)
                 shot["status"] = "feedback_queued"
@@ -1576,6 +1611,7 @@ class QueueStore:
                     target_obj["whiteoutVersion"] = str(int(time.time() * 1000))
 
                 action_label = "还原原图" if is_reset else "保存手涂涂白图"
+                self._mark_final_reopened_if_needed(shot)
                 shot["updatedAt"] = now_iso()
                 shot.setdefault("revisions", []).append(
                     {"at": now_iso(), "actor": "user", "summary": f"{action_label}：{matched_tag}"}
@@ -1730,6 +1766,7 @@ class QueueStore:
                             revision_direction=shot["latestRevisionDirection"],
                         )
                 plat_label = get_platform_label(shot.get("platform"))
+                self._mark_final_reopened_if_needed(shot)
                 self._clear_claim_fields(shot)
                 self._clear_error_fields(shot)
                 shot["status"] = "run_requested"
@@ -1760,8 +1797,9 @@ class QueueStore:
                 plat_label = get_platform_label(shot.get("platform"))
                 prev_prompt = (shot.get("promptText") or shot.get("userPrompt") or "").strip()
                 cur_status = str(shot.get("status") or "ready_on_canvas")
+                self._mark_final_reopened_if_needed(shot)
                 if not shot.get("promptUpdatePrevStatus") and cur_status not in {"prompt_update_requested", "processing"}:
-                    shot["promptUpdatePrevStatus"] = cur_status
+                    shot["promptUpdatePrevStatus"] = self._safe_prompt_update_prev_status(shot, cur_status)
                 shot["previousPromptText"] = prev_prompt
                 shot["promptText"] = clean_prompt
                 shot["pendingPromptEdit"] = clean_prompt
@@ -1829,6 +1867,11 @@ class QueueStore:
                 )
                 eff_url = (canvas_url or "").strip() or build_canvas_url(clean_uuid, workspace_id, eff_platform)
                 plat_label = get_platform_label(eff_platform)
+                if (
+                    eff_platform != normalize_platform(shot.get("platform"))
+                    or clean_uuid != (shot.get("projectUuid") or "").strip()
+                ):
+                    self._mark_final_reopened_if_needed(shot)
                 shot["platform"] = eff_platform
                 shot["projectUuid"] = clean_uuid
                 shot["projectName"] = clean_name
@@ -1902,6 +1945,7 @@ class QueueStore:
                             previous_prompt_text=old_clean,
                             revision_direction=shot["latestRevisionDirection"],
                         )
+                self._mark_final_reopened_if_needed(shot)
                 self._clear_claim_fields(shot)
                 self._clear_error_fields(shot)
                 shot["status"] = "recheck_requested"
@@ -1961,6 +2005,20 @@ class QueueStore:
         for k in ("errorCode", "errorReason", "errorSolution", "errorDetail", "lastFailedTask"):
             shot.pop(k, None)
 
+    @staticmethod
+    def _mark_final_reopened_if_needed(shot: dict[str, Any]) -> None:
+        """Unlock a passed 1080P shot when the user explicitly modifies/reruns it while preserving archived finalVideo."""
+        has_final = bool((shot.get("finalVideo") or {}).get("mediaUrl"))
+        if has_final or str(shot.get("status") or "") in {"final_ready", "final_done"}:
+            shot["finalModifiedReopened"] = True
+            shot["draftUpdatedSinceFinalReopen"] = False
+
+    @staticmethod
+    def _safe_prompt_update_prev_status(shot: dict[str, Any], cur_status: str) -> str:
+        if cur_status in {"final_ready", "final_done"} or shot.get("finalModifiedReopened"):
+            return "draft_ready" if (shot.get("draftVideo") or {}).get("mediaUrl") else "ready_on_canvas"
+        return cur_status
+
     def recover_from_error(self, shot_id: str, mode: str = "retry") -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
         clean_mode = (mode or "retry").strip().lower()
@@ -1973,7 +2031,7 @@ class QueueStore:
                     jm = shot.get("jimengMeta") or {}
                     if isinstance(jm, dict) and jm.get("pendingAction") == "promote_1080p":
                         jm["pendingAction"] = ""
-                    if (shot.get("finalVideo") or {}).get("mediaUrl"):
+                    if (shot.get("finalVideo") or {}).get("mediaUrl") and not shot.get("finalModifiedReopened"):
                         target_status = "final_ready"
                     elif (shot.get("draftVideo") or {}).get("mediaUrl"):
                         target_status = "draft_ready"
@@ -2247,8 +2305,30 @@ class QueueStore:
                             if resolved.is_file() and DATA_ROOT.resolve() in resolved.parents:
                                 vobj["mediaUrl"] = to_media_url(resolved)
                                 vobj.setdefault("meta", run_preflight(resolved))
+                        vobj.setdefault("downloadedAt", now_iso())
                         shot[vid_field] = vobj
                         updated_result_video = copy.deepcopy(vobj)
+
+                if payload.get("finalVideo") is not None or (
+                    shot.get("status") in {"final_ready", "final_done"} and prev_task == "final_requested"
+                ):
+                    shot["finalModifiedReopened"] = False
+                    shot["draftUpdatedSinceFinalReopen"] = False
+                elif (
+                    shot.get("finalModifiedReopened")
+                    or (shot.get("finalVideo") or {}).get("mediaUrl")
+                ):
+                    if payload.get("draftVideo") is not None or (
+                        prev_task == "run_requested" and shot.get("status") == "draft_ready"
+                    ):
+                        shot["finalModifiedReopened"] = True
+                        shot["draftUpdatedSinceFinalReopen"] = True
+                    elif (
+                        shot.get("finalModifiedReopened")
+                        and prev_task != "final_requested"
+                        and shot.get("status") in {"final_ready", "final_done"}
+                    ):
+                        shot["status"] = "draft_ready" if (shot.get("draftVideo") or {}).get("mediaUrl") else "ready_on_canvas"
 
                 resolved_fbs: list[dict[str, Any]] = []
                 if payload.get("resolveFeedbacks"):
@@ -2443,10 +2523,13 @@ class QueueStore:
                         "meta": run_preflight(draft_path),
                         "downloadedAt": now_iso(),
                     }
-                    if shot["status"] in {"ready_on_canvas", "run_requested", "processing", "queued", "feedback_queued"}:
+                    if shot["status"] in {"ready_on_canvas", "run_requested", "processing", "queued", "feedback_queued", "final_ready", "final_done"}:
                         self._clear_claim_fields(shot)
                         shot["status"] = "draft_ready"
                         shot["agentSummary"] = f"已从 {plat_label} 下载 480P 样片到本地，可在右侧预览看片或对比原片。"
+                    if (shot.get("finalVideo") or {}).get("mediaUrl") or shot.get("finalModifiedReopened"):
+                        shot["finalModifiedReopened"] = True
+                        shot["draftUpdatedSinceFinalReopen"] = True
                     shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
                     shot["lastGeneratedAt"] = now_iso()
                     shot.setdefault("revisions", []).append(
@@ -2511,6 +2594,7 @@ class QueueStore:
                 shot["promptText"] = restored_prompt
                 rollback_dir = f"已回滚至 {target_ver}（{target_title}）" + (f"：{target_dir}" if target_dir else "")
                 shot["latestRevisionDirection"] = rollback_dir
+                self._mark_final_reopened_if_needed(shot)
 
                 plat_label = get_platform_label(shot.get("platform"))
                 has_canvas_node = bool(shot.get("libtvSampleNodeKey") or shot.get("libtvGroupKey"))
@@ -2519,7 +2603,7 @@ class QueueStore:
                         "prompt_update_requested",
                         "processing",
                     }:
-                        shot["promptUpdatePrevStatus"] = cur_status
+                        shot["promptUpdatePrevStatus"] = self._safe_prompt_update_prev_status(shot, cur_status)
                     shot["pendingPromptEdit"] = restored_prompt
                     self._clear_claim_fields(shot)
                     self._clear_error_fields(shot)

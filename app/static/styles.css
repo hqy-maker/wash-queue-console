@@ -2200,6 +2200,17 @@ button {
   margin-top: 8px;
 }
 
+.outdated-final-banner {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #92400e;
+  background: rgba(245, 158, 11, 0.11);
+  border: 1px solid rgba(245, 158, 11, 0.34);
+  border-radius: 8px;
+  padding: 8px 11px;
+  margin-top: 8px;
+}
+
 .passed-lock-badge {
   display: inline-flex;
   align-items: center;
@@ -2213,6 +2224,19 @@ button {
   border: 1px solid rgba(16, 185, 129, 0.35);
 }
 
+.outdated-final-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 650;
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.36);
+}
+
 /* Modals & Lightbox */
 .modal-backdrop {
   position: fixed;
@@ -2224,6 +2248,10 @@ button {
   align-items: center;
   justify-content: center;
   padding: 20px;
+}
+
+#confirmModal {
+  z-index: 1050;
 }
 
 .modal-card {

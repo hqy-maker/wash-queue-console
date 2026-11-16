@@ -37,6 +37,33 @@ function isPassedFinal(shot) {
   return ["final_ready", "final_done"].includes(shot.status);
 }
 
+function isOutdatedFinal(shot) {
+  if (!shot || isPassedFinal(shot) || isFinalInProgress(shot)) return false;
+  return Boolean(shot.hasOutdatedFinal);
+}
+
+function guardPassedFinalAction(
+  shot,
+  { actionName = "修改", consequenceText = "", okText = "", onProceed = null } = {}
+) {
+  if (typeof onProceed !== "function") return;
+  if (!isPassedFinal(shot)) {
+    return onProceed();
+  }
+  const finTime = shot.finalVideo?.downloadedAt || shot.lastGeneratedAt || shot.updatedAt || "已归档";
+  openConfirmModal({
+    title: `本镜头已定版（1080P 已过条），确定要${actionName}吗？`,
+    message:
+      `「${shot.id}」已完成 1080P 正片定版。${consequenceText ? consequenceText + "\n\n" : ""}` +
+      "确认后将解锁本镜修改，后续可继续生成新版 480P 样片并重转 1080P 正片（原 1080P 归档视频仍会保留用于对照）。",
+    meta: `镜头：${shot.id} · 当前定版时间：${finTime}`,
+    okText: okText || `确认解锁并${actionName}`,
+    cancelText: "取消（保持定版）",
+    danger: true,
+    onConfirm: onProceed,
+  });
+}
+
 function getDisplayStatusMeta(shot) {
   if (!shot) return { label: "", cls: "pill-muted" };
   if (isFinalInProgress(shot)) {
@@ -1367,93 +1394,114 @@ async function openImagePaintModal({ url, origUrl, caption, mode, slotTag, slotI
 
 async function savePaintedMask(syncToCanvas) {
   if (!paintState.isPaint || !paintState.workCanvas) return;
-  const saveLocalBtn = document.getElementById("paintSaveLocalBtn");
-  const savePrimaryBtn = document.getElementById("paintSavePrimaryBtn");
-  saveLocalBtn.disabled = true;
-  savePrimaryBtn.disabled = true;
-  const prevLabel = savePrimaryBtn.textContent;
-  savePrimaryBtn.textContent = "保存中…";
+  const isReset = paintState.wasResetToOriginal && paintState.strokes.length === 0;
 
-  try {
-    const isReset = paintState.wasResetToOriginal && paintState.strokes.length === 0;
-    const blob = await new Promise((resolve) =>
-      paintState.workCanvas.toBlob((b) => resolve(b), "image/png")
-    );
-    if (!blob) throw new Error("画布导出 PNG 失败");
+  const doSave = async () => {
+    const saveLocalBtn = document.getElementById("paintSaveLocalBtn");
+    const savePrimaryBtn = document.getElementById("paintSavePrimaryBtn");
+    saveLocalBtn.disabled = true;
+    savePrimaryBtn.disabled = true;
+    const prevLabel = savePrimaryBtn.textContent;
+    savePrimaryBtn.textContent = "保存中…";
 
-    if (paintState.mode === "builder") {
-      const item = state.builder.imageItems.find((x) => x.id === paintState.slotId);
-      if (!item) throw new Error("找不到要更新的素材图片");
-      if (!item.originalUrl) item.originalUrl = item.url;
-      const presetId = getBuilderItemPresetId(item);
-      if (presetId && !item.originalPresetId) {
-        item.originalPresetKind = "preset";
-        item.originalPresetId = presetId;
+    try {
+      const blob = await new Promise((resolve) =>
+        paintState.workCanvas.toBlob((b) => resolve(b), "image/png")
+      );
+      if (!blob) throw new Error("画布导出 PNG 失败");
+
+      if (paintState.mode === "builder") {
+        const item = state.builder.imageItems.find((x) => x.id === paintState.slotId);
+        if (!item) throw new Error("找不到要更新的素材图片");
+        if (!item.originalUrl) item.originalUrl = item.url;
+        const presetId = getBuilderItemPresetId(item);
+        if (presetId && !item.originalPresetId) {
+          item.originalPresetKind = "preset";
+          item.originalPresetId = presetId;
+        }
+        if (isReset) {
+          if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
+            URL.revokeObjectURL(item.url);
+          }
+          item.url = item.originalUrl;
+          if (item.originalFile) item.file = item.originalFile;
+          if (item.originalPresetKind === "preset" || item.originalPresetId) {
+            item.kind = "preset";
+            item.presetId = item.originalPresetId;
+          }
+          item.whiteoutApplied = false;
+          showToast("已还原为原图");
+        } else {
+          if (!item.originalFile && item.file) item.originalFile = item.file;
+          const baseName = String(item.label || "image").replace(/\.[^.]+$/, "");
+          const maskFile = new File([blob], `${baseName}_mask.png`, { type: "image/png" });
+          if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
+            URL.revokeObjectURL(item.url);
+          }
+          item.file = maskFile;
+          item.url = URL.createObjectURL(maskFile);
+          item.kind = "upload";
+          item.presetId = "";
+          item.whiteoutApplied = true;
+          preflightFileInBackground(maskFile, (meta) => {
+            item.meta = meta;
+            renderBuilderAssetStripOnly();
+          });
+          showToast("已应用手涂涂白");
+        }
+        closeLightbox();
+        renderBuilderView();
+        return;
       }
-      if (isReset) {
-        if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
-          URL.revokeObjectURL(item.url);
-        }
-        item.url = item.originalUrl;
-        if (item.originalFile) item.file = item.originalFile;
-        if (item.originalPresetKind === "preset" || item.originalPresetId) {
-          item.kind = "preset";
-          item.presetId = item.originalPresetId;
-        }
-        item.whiteoutApplied = false;
-        showToast("已还原为原图");
-      } else {
-        if (!item.originalFile && item.file) item.originalFile = item.file;
-        const baseName = String(item.label || "image").replace(/\.[^.]+$/, "");
-        const maskFile = new File([blob], `${baseName}_mask.png`, { type: "image/png" });
-        if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
-          URL.revokeObjectURL(item.url);
-        }
-        item.file = maskFile;
-        item.url = URL.createObjectURL(maskFile);
-        item.kind = "upload";
-        item.presetId = "";
-        item.whiteoutApplied = true;
-        preflightFileInBackground(maskFile, (meta) => {
-          item.meta = meta;
-          renderBuilderAssetStripOnly();
-        });
-        showToast("已应用手涂涂白");
-      }
+
+      const fd = new FormData();
+      fd.append("slot_tag", paintState.slotTag || "");
+      fd.append("slot_id", paintState.slotId || "");
+      fd.append("sync_to_canvas", syncToCanvas ? "true" : "false");
+      fd.append("is_reset", isReset ? "true" : "false");
+      fd.append("file", blob, `${paintState.slotTag || "mask"}.png`);
+
+      await apiJson(`/api/shots/${encodeURIComponent(paintState.shotId)}/mask-image`, {
+        method: "POST",
+        body: fd,
+      });
+      const shotRef = (state.data?.shots || []).find((s) => s.id === paintState.shotId);
+      const platLabel = getPlatformLabel(shotRef?.platform);
+      showToast(
+        isReset
+          ? "已还原原图"
+          : syncToCanvas
+          ? `已保存涂白图，并已通知 Agent 同步 ${platLabel} 画布`
+          : "已保存涂白图"
+      );
       closeLightbox();
-      renderBuilderView();
+      await refreshState();
+    } catch (err) {
+      showToast(`保存失败: ${err.message}`);
+    } finally {
+      saveLocalBtn.disabled = false;
+      savePrimaryBtn.disabled = false;
+      savePrimaryBtn.textContent = prevLabel;
+    }
+  };
+
+  if (paintState.mode !== "builder") {
+    const shotRef = (state.data?.shots || []).find((s) => s.id === paintState.shotId);
+    if (isPassedFinal(shotRef)) {
+      const actionName = isReset ? "还原原图" : syncToCanvas ? "保存涂白并同步画布" : "保存涂白修改";
+      const consequenceText = syncToCanvas
+        ? "确认保存涂白图后将解锁本镜并通知 Agent 替换画布对应参考图。"
+        : "确认保存涂白图后将解锁本镜素材状态，便于后续继续重新生成。";
+      guardPassedFinalAction(shotRef, {
+        actionName,
+        consequenceText,
+        okText: `确认解锁并${actionName}`,
+        onProceed: doSave,
+      });
       return;
     }
-
-    const fd = new FormData();
-    fd.append("slot_tag", paintState.slotTag || "");
-    fd.append("slot_id", paintState.slotId || "");
-    fd.append("sync_to_canvas", syncToCanvas ? "true" : "false");
-    fd.append("is_reset", isReset ? "true" : "false");
-    fd.append("file", blob, `${paintState.slotTag || "mask"}.png`);
-
-    await apiJson(`/api/shots/${encodeURIComponent(paintState.shotId)}/mask-image`, {
-      method: "POST",
-      body: fd,
-    });
-    const shotRef = (state.data?.shots || []).find((s) => s.id === paintState.shotId);
-    const platLabel = getPlatformLabel(shotRef?.platform);
-    showToast(
-      isReset
-        ? "已还原原图"
-        : syncToCanvas
-        ? `已保存涂白图，并已通知 Agent 同步 ${platLabel} 画布`
-        : "已保存涂白图"
-    );
-    closeLightbox();
-    await refreshState();
-  } catch (err) {
-    showToast(`保存失败: ${err.message}`);
-  } finally {
-    saveLocalBtn.disabled = false;
-    savePrimaryBtn.disabled = false;
-    savePrimaryBtn.textContent = prevLabel;
   }
+  await doSave();
 }
 
 function bindPaintModalEvents() {
@@ -3918,6 +3966,7 @@ function renderShotActionBarHtml(shot) {
 
   const finalInProgress = isFinalInProgress(shot);
   const passed = isPassedFinal(shot);
+  const outdatedFinal = isOutdatedFinal(shot);
 
   let primaryBtn = "";
   if (st === "draft" || st === "drafting") {
@@ -3946,6 +3995,8 @@ function renderShotActionBarHtml(shot) {
     ? `<span class="passed-lock-badge" title="该镜头已完成 1080P 正片，已过条">✓ 已过条 · 1080P 正片已定版</span>`
     : finalInProgress
     ? `<span class="pill pill-purple">⏳ 正在转为 1080P 正片</span>`
+    : outdatedFinal
+    ? `<span class="outdated-final-badge" title="已二次确认解锁定版修改，原有 1080P 正片仍保留对照">↺ 已解锁修改 · 旧版 1080P 已归档</span>`
     : "";
 
   return `
@@ -3967,13 +4018,20 @@ function renderVideoReviewCard(shot) {
   const draftVid = shot.draftVideo?.mediaUrl ? shot.draftVideo : null;
   const finalVid = shot.finalVideo?.mediaUrl ? shot.finalVideo : null;
   const hasBoth = Boolean(draftVid && finalVid);
+  const outdatedFinal = isOutdatedFinal(shot);
+  const draftRefreshed = Boolean(shot.draftUpdatedSinceFinalReopen);
+  const changeInfo = getEffectiveShotChangeInfo(shot);
   let activeVer = state.detailDraft.previewVersion;
-  if (activeVer === "auto") activeVer = finalVid ? "final" : "draft";
+  if (activeVer === "auto") {
+    activeVer = finalVid && !(outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)) ? "final" : "draft";
+  }
   if (activeVer === "final" && !finalVid) activeVer = "draft";
   if (activeVer === "draft" && !draftVid) activeVer = "final";
 
   const activeVid = activeVer === "final" ? finalVid : draftVid;
-  const activeLabel = activeVer === "final" ? "1080P 正片" : "480P 样片";
+  const draftTabLabel = outdatedFinal && draftRefreshed ? "新版 480P 样片" : "480P 样片";
+  const finalTabLabel = outdatedFinal ? "旧版 1080P 归档" : "1080P 正片";
+  const activeLabel = activeVer === "final" ? finalTabLabel : draftTabLabel;
   const srcVid = shot.sourceVideo?.mediaUrl ? shot.sourceVideo : null;
   const canCompare = Boolean(activeVid && srcVid);
   const isComparing = canCompare && Boolean(state.detailDraft.compareSource);
@@ -3981,8 +4039,8 @@ function renderVideoReviewCard(shot) {
   const versionTabsHtml = hasBoth
     ? `
       <div class="video-review-tabs">
-        <button type="button" class="btn btn-sm ${activeVer === "draft" ? "btn-primary" : "btn-secondary"}" data-preview-ver="draft">480P 样片</button>
-        <button type="button" class="btn btn-sm ${activeVer === "final" ? "btn-primary" : "btn-secondary"}" data-preview-ver="final">1080P 正片</button>
+        <button type="button" class="btn btn-sm ${activeVer === "draft" ? "btn-primary" : "btn-secondary"}" data-preview-ver="draft">${draftTabLabel}</button>
+        <button type="button" class="btn btn-sm ${activeVer === "final" ? "btn-primary" : "btn-secondary"}" data-preview-ver="final">${finalTabLabel}</button>
       </div>
     `
     : "";
@@ -4020,20 +4078,36 @@ function renderVideoReviewCard(shot) {
   const srcMetaStr = formatVideoMetaText(srcVid);
   const finalInProgress = isFinalInProgress(shot);
   const passed = isPassedFinal(shot);
-  const canApproveFinal = Boolean(draftVid && !finalVid && !finalInProgress && !passed);
+  const canApproveFinal = Boolean(
+    draftVid &&
+      !finalInProgress &&
+      !passed &&
+      (!finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)))
+  );
   const downloadName = `${shot.id}_${activeVer === "final" ? "1080p" : "480p"}.mp4`;
   const finalProgressBannerHtml = finalInProgress
     ? `<div class="final-progress-banner">⏳ <strong>正在转为 1080P 正片</strong>：${escapeHtml(shot.agentSummary || "已提交转正片队列，完成后将自动归档并标为「已过条」，无需重复点击。")}</div>`
     : "";
-  const passedBannerHtml = passed && finalVid
-    ? `<div class="passed-status-banner">✓ <strong>本镜已过条（1080P 正片已归档定版）</strong>，所有关键操作已加二次保护防误触。</div>`
-    : "";
+  const passedBannerHtml =
+    passed && finalVid
+      ? `<div class="passed-status-banner">✓ <strong>本镜已过条（1080P 正片已归档定版）</strong>，如需继续修改将弹出二次确认弹窗防误触。</div>`
+      : outdatedFinal && finalVid
+      ? `<div class="outdated-final-banner">↺ <strong>已解锁定版修改</strong>：上方可对照旧版 1080P 正片归档；${
+          draftRefreshed || !changeInfo.hasChanges
+            ? "新版 480P 样片已就绪，满意后点右下角「✦ 重新转 1080P 正片」即可重新定版。"
+            : "请先点上方「▶ 按新修改重新生成」产出新版 480P 样片，出片后即可重新转 1080P 正片。"
+        }</div>`
+      : "";
   const finalActionHtml = canApproveFinal
-    ? `<button id="approveFinalBtn" class="btn btn-primary btn-sm" type="button">✦ 转 1080P 正片</button>`
+    ? `<button id="approveFinalBtn" class="btn btn-primary btn-sm" type="button">${
+        finalVid && outdatedFinal ? "✦ 重新转 1080P 正片" : "✦ 转 1080P 正片"
+      }</button>`
     : finalInProgress
     ? `<button id="approveFinalBtn" class="btn btn-secondary btn-sm" type="button" disabled title="正片正在生成中，已锁定防误触">⏳ 转 1080P 正片中…</button>`
-    : passed || finalVid
+    : passed
     ? `<span class="passed-lock-badge" title="1080P 正片已完成归档">✓ 已过条 · 1080P 正片</span>`
+    : outdatedFinal
+    ? `<span class="outdated-final-badge" title="请先按新修改重新生成 480P 样片后再重新转 1080P 正片">↺ 待重洗 480P 后重转正片</span>`
     : "";
 
   return `
@@ -4253,7 +4327,7 @@ function bindDetailEvents(shot) {
     showToast("已还原提示词");
   });
 
-  document.getElementById("updatePromptBtn")?.addEventListener("click", async () => {
+  document.getElementById("updatePromptBtn")?.addEventListener("click", () => {
     const mentionItems = buildDetailMentionAssets(shot);
     state.detailPromptEditor?.syncAssets(mentionItems);
     const nextPrompt = (state.detailDraft.editedPrompt || "").trim();
@@ -4261,22 +4335,32 @@ function bindDetailEvents(shot) {
       showToast("提示词不能为空");
       return;
     }
-    const btn = document.getElementById("updatePromptBtn");
-    btn.disabled = true;
-    btn.textContent = "更新提交中…";
-    try {
-      await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/update-prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ promptText: state.detailDraft.editedPrompt }),
-      });
-      state.detailDraft.lastSyncedPrompt = state.detailDraft.editedPrompt;
-      showToast("已保存最新提示词，并已通知 Agent 同步更新画布");
-      await refreshState();
-    } catch (err) {
-      showToast(err.message);
-      updatePromptHeaderUi(shot);
-    }
+    const executeUpdatePrompt = async () => {
+      const btn = document.getElementById("updatePromptBtn");
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "更新提交中…";
+      }
+      try {
+        await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/update-prompt`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ promptText: state.detailDraft.editedPrompt }),
+        });
+        state.detailDraft.lastSyncedPrompt = state.detailDraft.editedPrompt;
+        showToast("已保存最新提示词，并已通知 Agent 同步更新画布");
+        await refreshState();
+      } catch (err) {
+        showToast(err.message);
+        updatePromptHeaderUi(shot);
+      }
+    };
+    guardPassedFinalAction(shot, {
+      actionName: "修改提示词并同步画布",
+      consequenceText: "确认后将保存新版提示词并同步到画布，随后可继续重新生成 480P 样片。",
+      okText: "确认解锁并同步画布",
+      onProceed: executeUpdatePrompt,
+    });
   });
 
   bindWhiteoutBarEvents({
@@ -4385,16 +4469,11 @@ function bindDetailEvents(shot) {
     const editedPrompt = getDetailEditedPromptIfChanged(shot);
     const info = getEffectiveShotChangeInfo(shot);
     if (isPassedFinal(shot)) {
-      const finTime = shot.finalVideo?.downloadedAt || shot.lastGeneratedAt || shot.updatedAt || "已归档";
-      openConfirmModal({
-        title: "本镜头已过条（1080P 正片已出），确定要重洗吗？",
-        message:
-          "该镜头已经完成 1080P 正片出片并标为「已过条」。若无必要不建议重新生成 480P 样片覆盖。",
-        meta: `镜头：${shot.id} · 正片时间：${finTime}\n确认重洗将按新/当前配置重新发起 480P 样片生成并消耗积分。`,
-        okText: "确定重洗 480P 样片",
-        cancelText: "取消（保持已过条）",
-        danger: true,
-        onConfirm: executeRunShot,
+      guardPassedFinalAction(shot, {
+        actionName: "重洗 480P 样片",
+        consequenceText: "确认重洗将按新/当前配置重新发起 480P 样片生成并消耗积分，出片后可重新定版 1080P。",
+        okText: "确定解锁并生成 480P",
+        onProceed: executeRunShot,
       });
       return;
     }
@@ -4487,7 +4566,7 @@ function bindDetailEvents(shot) {
     }
   });
 
-  document.getElementById("submitFeedbackBtn")?.addEventListener("click", async () => {
+  document.getElementById("submitFeedbackBtn")?.addEventListener("click", () => {
     const editedPrompt = getDetailEditedPromptIfChanged(shot);
     const promptChanged = Boolean(editedPrompt);
     const comment = state.detailDraft.comment.trim();
@@ -4498,38 +4577,51 @@ function bindDetailEvents(shot) {
       return;
     }
 
-    const btn = document.getElementById("submitFeedbackBtn");
-    btn.disabled = true;
-    btn.textContent = "提交中…";
-    try {
-      const fd = new FormData();
-      const autoComment = woParts.length
-        ? `${woTarget ? `${woTarget} ` : ""}${woParts.join(" + ")}`
-        : promptChanged
-        ? "按已修改提示词同步更新"
-        : "附带参考图";
-      fd.append("comment", comment || autoComment);
-      fd.append("tags_json", JSON.stringify(woParts));
-      fd.append("target_slot", woTarget);
-      fd.append("edited_prompt", promptChanged ? state.detailDraft.editedPrompt : "");
-      for (const att of state.detailDraft.attachments) {
-        fd.append("attachments", att.file);
+    const executeSubmitFeedback = async () => {
+      const btn = document.getElementById("submitFeedbackBtn");
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "提交中…";
       }
-      await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/feedback`, { method: "POST", body: fd });
-      showToast("已提交修改");
-      state.detailDraft.lastSyncedPrompt = state.detailDraft.editedPrompt;
-      state.detailDraft.comment = "";
-      state.detailDraft.commentTokens = "";
-      state.detailDraft.whiteoutParts = [];
-      state.detailDraft.whiteoutTarget = "";
-      clearDetailDraftAttachments();
-      await refreshState();
-    } catch (err) {
-      showToast(err.message);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "提交修改";
-    }
+      try {
+        const fd = new FormData();
+        const autoComment = woParts.length
+          ? `${woTarget ? `${woTarget} ` : ""}${woParts.join(" + ")}`
+          : promptChanged
+          ? "按已修改提示词同步更新"
+          : "附带参考图";
+        fd.append("comment", comment || autoComment);
+        fd.append("tags_json", JSON.stringify(woParts));
+        fd.append("target_slot", woTarget);
+        fd.append("edited_prompt", promptChanged ? state.detailDraft.editedPrompt : "");
+        for (const att of state.detailDraft.attachments) {
+          fd.append("attachments", att.file);
+        }
+        await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/feedback`, { method: "POST", body: fd });
+        showToast("已提交修改");
+        state.detailDraft.lastSyncedPrompt = state.detailDraft.editedPrompt;
+        state.detailDraft.comment = "";
+        state.detailDraft.commentTokens = "";
+        state.detailDraft.whiteoutParts = [];
+        state.detailDraft.whiteoutTarget = "";
+        clearDetailDraftAttachments();
+        await refreshState();
+      } catch (err) {
+        showToast(err.message);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "提交修改";
+        }
+      }
+    };
+
+    guardPassedFinalAction(shot, {
+      actionName: "提交修改",
+      consequenceText: "确认后将解锁本镜定版状态并通知 Agent 按修改意见更新画布，完成后可继续生成。",
+      okText: "确认解锁并提交修改",
+      onProceed: executeSubmitFeedback,
+    });
   });
 
   const handleResolveConfirm = async (decision) => {
@@ -4857,12 +4949,20 @@ function renderHistoryModal() {
 
   document.getElementById("rollbackVersionBtn")?.addEventListener("click", () => {
     if (!hasPrompt || matchesCurrent) return;
+    const isPassed = isPassedFinal(shot);
     openConfirmModal({
-      title: `回滚到 ${selected.version}？`,
-      message: `确定把「${shot.id}」的提示词恢复为「${selected.version} · ${selected.title}」吗？\n\n本次回滚不会删除任何既有对话记录（会追加一条回滚版本），并通知 Agent 同步回 ${getPlatformLabel(shot.platform)} 画布，不会自动触发消耗算力的 Run 生成。`,
+      title: isPassed
+        ? `本镜头已定版（1080P 已过条），确定回滚到 ${selected.version} 吗？`
+        : `回滚到 ${selected.version}？`,
+      message:
+        `确定把「${shot.id}」的提示词恢复为「${selected.version} · ${selected.title}」吗？\n\n` +
+        (isPassed
+          ? "确认后将解锁本镜定版并通知 Agent 同步该版提示词到画布，随后可继续重新生成（原 1080P 归档与所有对话记录仍保留）。"
+          : `本次回滚不会删除任何既有对话记录（会追加一条回滚版本），并通知 Agent 同步回 ${getPlatformLabel(shot.platform)} 画布，不会自动触发消耗算力的 Run 生成。`),
       meta: selected.revisionDirection ? `该版本修改方向：${selected.revisionDirection}` : "",
-      okText: `确认回滚到 ${selected.version}`,
-      cancelText: "再想想",
+      okText: isPassed ? `确认解锁并回滚到 ${selected.version}` : `确认回滚到 ${selected.version}`,
+      cancelText: isPassed ? "取消（保持定版）" : "再想想",
+      danger: isPassed,
       onConfirm: async () => {
         const res = await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/rollback`, {
           method: "POST",
@@ -5327,7 +5427,7 @@ function bindGlobalEvents() {
     }
   });
 
-  document.getElementById("topbarReprocessBtn").addEventListener("click", async () => {
+  document.getElementById("topbarReprocessBtn").addEventListener("click", () => {
     closeShotMoreMenu();
     const shot = (state.data?.shots || []).find((s) => s.id === state.selectedShotId);
     if (!shot) return;
@@ -5335,27 +5435,35 @@ function bindGlobalEvents() {
       showToast(`${shot.id} 已在重检队列中，等待 Agent 核查`);
       return;
     }
-    state.detailPromptEditor?.syncAssets(buildDetailMentionAssets(shot));
-    const baseline = getShotBaselinePrompt(shot);
-    const edited = state.detailDraft.editedPrompt || "";
-    const payload = { reason: "用户在控制台点击「重新处理·自检」" };
-    if (edited.trim() && edited.trim() !== baseline) {
-      payload.edited_prompt = edited;
-    }
-    try {
-      await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/reprocess`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (payload.edited_prompt) {
-        state.detailDraft.lastSyncedPrompt = edited;
+    const executeReprocess = async () => {
+      state.detailPromptEditor?.syncAssets(buildDetailMentionAssets(shot));
+      const baseline = getShotBaselinePrompt(shot);
+      const edited = state.detailDraft.editedPrompt || "";
+      const payload = { reason: "用户在控制台点击「重新处理·自检」" };
+      if (edited.trim() && edited.trim() !== baseline) {
+        payload.edited_prompt = edited;
       }
-      showToast(`已提交 ${shot.id} 一键重新处理与自检`);
-      await refreshState();
-    } catch (err) {
-      showToast(err.message);
-    }
+      try {
+        await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/reprocess`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (payload.edited_prompt) {
+          state.detailDraft.lastSyncedPrompt = edited;
+        }
+        showToast(`已提交 ${shot.id} 一键重新处理与自检`);
+        await refreshState();
+      } catch (err) {
+        showToast(err.message);
+      }
+    };
+    guardPassedFinalAction(shot, {
+      actionName: "重新处理并自检",
+      consequenceText: "确认后将解锁定版状态并通知 Agent 重新核查画布连线与配置。",
+      okText: "确认解锁并重检",
+      onProceed: executeReprocess,
+    });
   });
 
   document.getElementById("topbarDeleteShotBtn").addEventListener("click", () => {
@@ -5487,12 +5595,12 @@ function bindGlobalEvents() {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      if (!document.getElementById("lightboxModal")?.classList.contains("hidden")) {
-        closeLightbox();
-        return;
-      }
       if (state.confirmDialog?.open) {
         closeConfirmModal();
+        return;
+      }
+      if (!document.getElementById("lightboxModal")?.classList.contains("hidden")) {
+        closeLightbox();
         return;
       }
       if (state.historyModal?.open) {
