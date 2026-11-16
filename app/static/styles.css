@@ -881,6 +881,19 @@ button {
   border-top: 1px solid var(--border);
 }
 
+.ai-popover-launch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.ai-popover-launch .btn {
+  width: 100%;
+  justify-content: center;
+}
+
 .queue-pulse {
   font-size: 12px;
   padding: 4px 10px;
@@ -2978,6 +2991,54 @@ button {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.chat-split-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.chat-split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.chat-split-arrow {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: -1px;
+  padding: 0 7px;
+  min-width: 24px;
+}
+
+.chat-split-arrow.is-open {
+  border-color: var(--blue-border);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.chat-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: max-content;
+  min-width: 272px;
+  max-width: 340px;
+  z-index: 950;
+  background: var(--bg-popover);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-popover .more-menu-item {
+  white-space: nowrap;
 }
 
 /* 提示词编辑卡片：AI 理解的修改方向框 + 底部统一编辑操作栏 */

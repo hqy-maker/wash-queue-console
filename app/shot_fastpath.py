@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -21,7 +25,7 @@ from typing import Any
 import httpx
 
 import jimeng_bridge
-from store import SHOTS_DIR, get_platform_label, safe_prompt_update_prev_status
+from store import DATA_ROOT, SHOTS_DIR, get_platform_label, resolve_cli_conversation_id, safe_prompt_update_prev_status
 
 # Optional heavy media imports (PyAV + Pillow already live in .venv/runtime)
 try:
@@ -570,3 +574,263 @@ def try_fastpath_prompt_update(
         return {"handled": True, "summary": f"fastpath synced {sample_node_id} (draftVersion={draft_ver})"}
     except Exception as exc:
         return {"handled": False, "reason": f"fastpath_fallback: {exc}"}
+
+
+def find_agy_cli_bin() -> str | None:
+    home = Path.home()
+    candidates = [
+        os.environ.get("AGY_BIN", "").strip(),
+        shutil.which("agy") or "",
+        str(home / ".local" / "bin" / "agy"),
+        str(home / ".gemini" / "antigravity" / "bin" / "agy"),
+        "/Applications/Antigravity.app/Contents/Resources/app/bin/agy",
+        str(home / "Applications" / "Antigravity.app/Contents/Resources/app/bin/agy"),
+    ]
+    for cand in candidates:
+        if cand and Path(cand).is_file():
+            return cand
+    return None
+
+
+def build_shot_handoff_context(
+    shot: dict[str, Any],
+    *,
+    workspace_root: Path,
+    port: int = 8787,
+    user_note: str = "",
+) -> str:
+    """Build a concise, rich markdown context brief for foreground chat takeover on a single shot."""
+    sid = str(shot.get("id") or "").strip()
+    plat = str(shot.get("platform") or "libtv").strip().lower()
+    plat_label = get_platform_label(plat)
+    jm = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
+    src = shot.get("sourceVideo") or {}
+    comp = shot.get("compImage") or {}
+    draft = shot.get("draftVideo") or {}
+    final = shot.get("finalVideo") or {}
+    kf_path = SHOTS_DIR / sid / "source_keyframes.jpg"
+    audio_json = SHOTS_DIR / sid / "source_audio_summary.json"
+    conv_id = resolve_cli_conversation_id(shot)
+
+    lines = [
+        f"请帮我接手处理洗片控制台镜头 **{sid}**（当前状态：`{shot.get('status')}`，目标平台：**{plat_label}**）。",
+    ]
+    if user_note.strip():
+        lines.extend(["", f"### 我当前最需要你解决的问题", user_note.strip()])
+
+    lines.extend(
+        [
+            "",
+            "### 基本上下文",
+            f"- 所属场次：`{shot.get('scene') or '未分场'}`",
+            f"- 工作区：`{workspace_root}` | 控制台地址：`http://127.0.0.1:{port}`",
+            f"- 目标画布：`{shot.get('projectName') or '-'}` (`{shot.get('projectUuid') or '-'}`)",
+            f"- 画布链接：{shot.get('canvasUrl') or '-'}",
+            f"- 样片节点：`{jm.get('sampleNodeId') or jm.get('nodeId') or shot.get('libtvSampleNodeKey') or '-'}`",
+        ]
+    )
+    if jm.get("compNodeId") or jm.get("zdepthNodeId") or jm.get("finalNodeId") or shot.get("libtvGroupKey"):
+        lines.append(
+            f"- 关联节点：comp=`{jm.get('compNodeId') or '-'}` | depth=`{jm.get('zdepthNodeId') or '-'}` | "
+            f"final=`{jm.get('finalNodeId') or '-'}` | libtvGroup=`{shot.get('libtvGroupKey') or '-'}`"
+        )
+    if conv_id:
+        lines.append(f"- 最近后台 agy 会话 ID：`{conv_id}`（可参考历史记录）")
+
+    lines.extend(["", "### 本地素材与产物路径"])
+    if src.get("filePath"):
+        lines.append(f"- 原片视频：`{src['filePath']}`")
+    if kf_path.is_file():
+        lines.append(f"- 原片关键帧拼图：`{kf_path}`")
+    if audio_json.is_file():
+        lines.append(f"- 原片声波扫描：`{audio_json}`")
+    if comp.get("filePath"):
+        orig_note = f"（未涂白原图：`{comp['originalFilePath']}`）" if comp.get("originalFilePath") else ""
+        lines.append(f"- 当前构图图：`{comp['filePath']}`{orig_note}")
+    for idx, ch in enumerate(shot.get("charRefs") or [], start=2):
+        lines.append(f"- 图片{idx} ({ch.get('label') or '角色'}): `{ch.get('filePath') or '-'}`")
+    if draft.get("filePath"):
+        lines.append(f"- 当前 480P 样片：`{draft['filePath']}`")
+    if final.get("filePath"):
+        lines.append(f"- 归档 1080P 正片：`{final['filePath']}`")
+    prompt_file = str(shot.get("promptFilePath") or (workspace_root / "outputs" / f"{sid}_提示词.md"))
+    lines.append(f"- 提示词主文件：`{prompt_file}`")
+
+    if shot.get("errorReason") or shot.get("errorDetail"):
+        lines.extend(
+            [
+                "",
+                "### 最近报错诊断",
+                f"- 原因：{shot.get('errorReason') or '-'}",
+                f"- 建议：{shot.get('errorSolution') or '-'}",
+                f"- 原始详情：`{str(shot.get('errorDetail') or '')[:600]}`",
+            ]
+        )
+
+    pending_fbs = [f for f in (shot.get("feedbacks") or []) if isinstance(f, dict) and f.get("status") == "pending"]
+    if pending_fbs:
+        lines.extend(["", "### 当前待处理修改意见"])
+        for fb in pending_fbs:
+            lines.append(f"- [{fb.get('id')}] {fb.get('comment') or ''}")
+
+    if shot.get("latestRevisionDirection"):
+        lines.extend(["", f"### 最近一轮修改方向", str(shot.get("latestRevisionDirection"))])
+
+    cur_prompt = str(shot.get("promptText") or shot.get("userPrompt") or "").strip()
+    if cur_prompt:
+        lines.extend(["", "### 当前提示词正文", "```text", cur_prompt, "```"])
+
+    lines.extend(
+        [
+            "",
+            "### 协同约定",
+            f"- 修改并同步好画布后，请调用 `POST http://127.0.0.1:{port}/api/shots/{sid}/agent-update` 回写状态（如目前是人工前台修改，先 `POST /api/shots/{sid}/claim` 取 `claimToken` 再回写；**不要**运行任何队列常驻监听脚本）。",
+        ]
+    )
+    return "\n".join(lines).strip() + "\n"
+
+
+def launch_foreground_shot_chat(
+    shot: dict[str, Any],
+    *,
+    mode: str = "auto",
+    user_note: str = "",
+    port: int = 8787,
+    workspace_root: Path,
+    agy_bin: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Launch an interactive macOS Terminal foreground `agy` session resuming or starting fresh on this shot."""
+    sid = str(shot.get("id") or "").strip()
+    eff_mode = (mode or "auto").strip().lower()
+    if eff_mode not in {"auto", "resume", "new"}:
+        eff_mode = "auto"
+
+    conv_id = "" if eff_mode == "new" else resolve_cli_conversation_id(shot)
+    if eff_mode == "resume" and not conv_id:
+        raise RuntimeError(f"镜头 {sid} 暂无可续接的后台 agy 会话记录，请改用「新开独立前台对话」。")
+
+    if str(shot.get("status") or "") == "processing" and conv_id:
+        raise RuntimeError(f"后台桥接池正在处理 {sid}，请等待本轮完成或暂停后台桥接后再续接该会话。")
+
+    resolved_agy = agy_bin or find_agy_bin()
+    if not resolved_agy:
+        raise FileNotFoundError("未找到本机 agy 命令行工具，请先安装 Antigravity CLI，或改用「复制上下文并唤起 Antigravity 桌面端」。")
+
+    handoffs_dir = DATA_ROOT / "handoffs"
+    handoffs_dir.mkdir(parents=True, exist_ok=True)
+    safe_sid = re.sub(r"[^A-Za-z0-9._-]+", "_", sid).strip("_") or "shot"
+    ctx_file = handoffs_dir / f"{safe_sid}_context.txt"
+    ctx_text = build_shot_handoff_context(shot, workspace_root=workspace_root, port=port, user_note=user_note)
+    ctx_file.write_text(ctx_text, encoding="utf-8")
+
+    launcher = handoffs_dir / f"{safe_sid}_chat.command"
+    plat_label = get_platform_label(shot.get("platform"))
+    q_ws = shlex.quote(str(workspace_root))
+    q_agy = shlex.quote(str(resolved_agy))
+    q_ctx = shlex.quote(str(ctx_file))
+
+    script_lines = [
+        "#!/bin/zsh",
+        'export PATH="$HOME/.local/bin:$HOME/.libtv:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"',
+        f"cd {q_ws} || exit 1",
+        "clear",
+        'echo "=================================================="',
+        f'echo {shlex.quote(f"  洗片控制台 · 前台对话接手 [{sid}]")}',
+        f'echo {shlex.quote(f"  平台: {plat_label} | 状态: {shot.get("status") or "-"}")}',
+        'echo "  退出前台对话请按 Ctrl+D 或输入 /exit"',
+        'echo "=================================================="',
+        'echo ""',
+    ]
+    if conv_id:
+        q_conv = shlex.quote(conv_id)
+        script_lines.append(f'echo {shlex.quote(f"正在恢复该镜最近后台会话: {conv_id}")}')
+        if user_note.strip():
+            script_lines.append(f'echo {shlex.quote(f"提示: 本次补充关注点已保存至 {ctx_file}")}')
+        script_lines.append(f"exec {q_agy} --conversation {q_conv}")
+        launch_mode = "resume"
+    else:
+        script_lines.extend(
+            [
+                f'echo {shlex.quote(f"正在新开前台对话并注入 {sid} 完整上下文...")}',
+                f'PROMPT_CONTENT="$(cat {q_ctx})"',
+                f'exec {q_agy} -i "$PROMPT_CONTENT"',
+            ]
+        )
+        launch_mode = "new"
+
+    launcher.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+    os.chmod(launcher, 0o755)
+
+    if not dry_run:
+        proc = subprocess.run(
+            ["/usr/bin/open", "-a", "Terminal", str(launcher)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "无法打开 Terminal 前台窗口")
+
+    return {
+        "ok": True,
+        "shotId": sid,
+        "mode": launch_mode,
+        "conversationId": conv_id,
+        "contextPath": str(ctx_file),
+        "launcherPath": str(launcher),
+    }
+
+
+def launch_foreground_app_or_terminal(
+    *,
+    target: str = "antigravity",
+    workspace_root: Path,
+    agy_bin: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Open Antigravity Desktop GUI or a clean interactive Terminal `agy` window."""
+    clean_target = (target or "antigravity").strip().lower()
+    if clean_target == "terminal_agy":
+        clean_target = "terminal"
+    if clean_target not in {"terminal", "antigravity"}:
+        raise ValueError(f"不支持的启动目标: {target}")
+
+    if clean_target == "terminal":
+        resolved_agy = agy_bin or find_agy_bin()
+        if not resolved_agy:
+            raise FileNotFoundError("未找到 agy 命令行工具")
+        handoffs_dir = DATA_ROOT / "handoffs"
+        handoffs_dir.mkdir(parents=True, exist_ok=True)
+        launcher = handoffs_dir / "open_fresh_chat.command"
+        launcher.write_text(
+            "\n".join(
+                [
+                    "#!/bin/zsh",
+                    'export PATH="$HOME/.local/bin:$HOME/.libtv:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"',
+                    f"cd {shlex.quote(str(workspace_root))} || exit 1",
+                    "clear",
+                    'echo "=== Antigravity CLI 交互窗口（按 Ctrl+D 退出）==="',
+                    f"exec {shlex.quote(str(resolved_agy))}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(launcher, 0o755)
+        if not dry_run:
+            proc = subprocess.run(
+                ["/usr/bin/open", "-a", "Terminal", str(launcher)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "无法打开 Terminal 前台窗口")
+        return {"ok": True, "target": "terminal", "launcherPath": str(launcher)}
+
+    if not dry_run:
+        proc = subprocess.run(["/usr/bin/open", "-a", "Antigravity"], capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "未找到 Antigravity 桌面应用")
+    return {"ok": True, "target": "antigravity"}

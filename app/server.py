@@ -22,6 +22,7 @@ from pydantic import BaseModel
 import agent_bridge
 import jimeng_bridge
 import libtv_bridge
+import shot_fastpath
 from updater import update_manager
 from store import (
     ACTIONABLE_STATUSES,
@@ -62,12 +63,11 @@ def _read_bridge_pid() -> int | None:
 
 
 class AgentPresenceTracker:
-    """In-memory heartbeat & arbitration state between interactive Antigravity sessions and agy bridge."""
+    """In-memory heartbeat & health state for the background agy bridge pool."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._watchers: dict[str, dict[str, Any]] = {}
-        self._interactive_hold_until: float = 0.0
         self._bridge_meta: dict[str, Any] = {
             "lastConversationId": "",
             "lastRunAt": "",
@@ -91,15 +91,10 @@ class AgentPresenceTracker:
         for k in expired:
             self._watchers.pop(k, None)
 
-    def hold_interactive(self, seconds: float = 45.0) -> None:
-        now = time.monotonic()
-        with self._lock:
-            self._interactive_hold_until = max(self._interactive_hold_until, now + max(1.0, float(seconds or 45.0)))
-
     def record_heartbeat(
         self,
         watcher_id: str,
-        mode: str = "interactive",
+        mode: str = "bridge",
         *,
         busy: bool = False,
         active_shot_ids: list[str] | None = None,
@@ -109,8 +104,7 @@ class AgentPresenceTracker:
         last_run_at: str | None = None,
         last_error: str | None = None,
     ) -> dict[str, Any]:
-        wid = (watcher_id or mode or "watcher").strip()[:80] or "watcher"
-        clean_mode = "bridge" if str(mode or "").strip().lower() == "bridge" else "interactive"
+        wid = (watcher_id or mode or "agy_bridge").strip()[:80] or "agy_bridge"
         ttl = max(5.0, min(float(ttl_sec or 40.0), 180.0))
         now = time.monotonic()
         active_clean = [str(x).strip() for x in (active_shot_ids or []) if str(x).strip()]
@@ -118,24 +112,21 @@ class AgentPresenceTracker:
             self._prune_locked(now)
             self._watchers[wid] = {
                 "watcherId": wid,
-                "mode": clean_mode,
+                "mode": "bridge",
                 "busy": bool(busy),
                 "activeShotIds": active_clean,
                 "pid": int(pid) if pid else None,
                 "expiresAt": now + ttl,
                 "updatedAt": time.time(),
             }
-            if clean_mode == "interactive":
-                self._interactive_hold_until = max(self._interactive_hold_until, now + min(ttl, 45.0))
-            else:
-                self._bridge_meta["busy"] = bool(busy)
-                self._bridge_meta["activeShotIds"] = active_clean
-                if last_conversation_id is not None:
-                    self._bridge_meta["lastConversationId"] = str(last_conversation_id).strip()
-                if last_run_at is not None:
-                    self._bridge_meta["lastRunAt"] = str(last_run_at).strip()
-                if last_error is not None:
-                    self._bridge_meta["lastError"] = str(last_error).strip()
+            self._bridge_meta["busy"] = bool(busy)
+            self._bridge_meta["activeShotIds"] = active_clean
+            if last_conversation_id is not None:
+                self._bridge_meta["lastConversationId"] = str(last_conversation_id).strip()
+            if last_run_at is not None:
+                self._bridge_meta["lastRunAt"] = str(last_run_at).strip()
+            if last_error is not None:
+                self._bridge_meta["lastError"] = str(last_error).strip()
         return self.snapshot()
 
     def clear_watcher(self, watcher_id: str) -> None:
@@ -152,9 +143,7 @@ class AgentPresenceTracker:
         with self._lock:
             self._prune_locked(now)
             watchers = list(self._watchers.values())
-            interactive_watchers = [w for w in watchers if w["mode"] == "interactive"]
             bridge_watchers = [w for w in watchers if w["mode"] == "bridge"]
-            interactive_online = bool(interactive_watchers) or (now < self._interactive_hold_until)
             bridge_online = bool(bridge_watchers) or (live_pid is not None and not paused)
             bridge_meta = dict(self._bridge_meta)
 
@@ -173,42 +162,38 @@ class AgentPresenceTracker:
         any_busy = bool(processing_ids or bridge_active_ids or bridge_meta.get("busy"))
 
         agy_installed = bool(agent_bridge.find_agy_bin())
-        if any_busy and (interactive_online or bridge_online):
+        max_workers = int(getattr(agent_bridge, "MAX_WORKERS", 4) or 4)
+        if any_busy and bridge_online:
             conn_state = "busy"
             busy_count = len(set(processing_ids) | set(bridge_active_ids)) or 1
-            mode_tag = "对话" if interactive_online and not bridge_active_ids else "桥接"
-            label = f"AI {mode_tag}处理中 ({busy_count})"
-            detail = f"当前正在处理 {busy_count} 个镜头（{(', '.join(processing_ids or bridge_active_ids))}）。"
-        elif interactive_online:
-            conn_state = "interactive"
-            label = "AI 对话已连接"
-            detail = "当前 Antigravity 对话已挂起实时监听，后台桥接处于热备状态。"
+            label = f"AI 并发处理中 ({busy_count})"
+            detail = f"后台桥接正在并发处理 {busy_count} 个镜头（{', '.join(processing_ids or bridge_active_ids)}）。"
         elif paused:
             conn_state = "paused"
             label = "AI 桥接已暂停"
-            detail = "后台桥接已手动暂停；如需无人值守自动唤醒，可点击恢复启动。"
+            detail = f"后台 {max_workers} 路并发桥接已手动暂停；点击下方「一键重连（启动桥接）」即可恢复自动领单执行。"
         elif bridge_online and not agy_installed:
             conn_state = "bridge_ready"
             label = "桥接待配置 CLI"
-            detail = "本地控制台已就绪；请先安装 Antigravity 并安装/关联 `agy` 命令行工具，或在 Antigravity 对话中连接监听。"
+            detail = "本地控制台已就绪；请先安装 Antigravity 并安装/关联 `agy` 命令行工具，以启用后台并发桥接与前台接手对话。"
         elif bridge_online:
             conn_state = "bridge_ready"
             label = "AI 桥接已就绪"
-            detail = "独立后台桥接在线（agy CLI）；关闭 Antigravity 对话也能自动领单执行。"
+            detail = f"后台 {max_workers} 路并发桥接在线（agy CLI）；每个镜头独立会话互不阻塞，也可随时一键唤起前台窗口接手。"
         else:
             conn_state = "offline"
-            label = "AI 监听未连接"
-            detail = "暂无对话监听或后台桥接进程；点击下方「一键重连（启动桥接）」即可恢复自动连接。"
+            label = "AI 桥接未连接"
+            detail = "后台并发桥接进程未运行；点击下方「一键重连（启动桥接）」即可恢复自动领单执行。"
 
         return {
             "state": conn_state,
             "label": label,
             "detail": detail,
             "agyInstalled": agy_installed,
-            "interactiveOnline": interactive_online,
             "bridgeOnline": bridge_online,
             "bridgePid": live_pid,
             "bridgePaused": paused,
+            "maxWorkers": max_workers,
             "busy": any_busy,
             "activeShotIds": sorted(set(processing_ids) | set(bridge_active_ids)),
             "processingShotIds": processing_ids,
@@ -318,7 +303,7 @@ def stop_bridge_process(*, pause: bool = True) -> dict[str, Any]:
 
 def restart_bridge_process() -> dict[str, Any]:
     snap = agent_presence.snapshot(store.get_state())
-    if snap.get("busy") and snap.get("bridgeOnline") and not snap.get("interactiveOnline"):
+    if snap.get("busy") and snap.get("bridgeOnline"):
         active = "、".join(snap.get("activeShotIds") or [])
         raise HTTPException(
             status_code=409,
@@ -697,8 +682,8 @@ class LockReleaseReq(BaseModel):
 
 
 class HeartbeatReq(BaseModel):
-    watcherId: str = "watcher"
-    mode: str = "interactive"
+    watcherId: str = "agy_bridge"
+    mode: str = "bridge"
     busy: bool = False
     activeShotIds: list[str] | None = None
     pid: int | None = None
@@ -706,6 +691,17 @@ class HeartbeatReq(BaseModel):
     lastConversationId: str | None = None
     lastRunAt: str | None = None
     lastError: str | None = None
+
+
+class OpenShotChatReq(BaseModel):
+    mode: str = "auto"
+    note: str = ""
+    dryRun: bool = False
+
+
+class OpenAppReq(BaseModel):
+    target: str = "antigravity"
+    dryRun: bool = False
 
 
 @app.get("/")
@@ -749,6 +745,23 @@ def system_rollback_update() -> dict[str, Any]:
         return update_manager.rollback_update(workspace_root=WORKSPACE_ROOT, port=port, auto_restart=True)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/system/open-antigravity")
+def open_antigravity_window(req: OpenAppReq | None = None) -> dict[str, Any]:
+    body = req or OpenAppReq()
+    try:
+        res = shot_fastpath.launch_foreground_app_or_terminal(
+            target=body.target,
+            workspace_root=WORKSPACE_ROOT,
+            agy_bin=agent_bridge.find_agy_bin(),
+            dry_run=bool(body.dryRun),
+        )
+        return {"ok": True, **res}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (RuntimeError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/media/{rel_path:path}")
@@ -1264,6 +1277,54 @@ def recover_shot_error(shot_id: str, req: ErrorRecoverReq | None = None) -> dict
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/shots/{shot_id}/open-chat")
+def open_shot_foreground_chat(shot_id: str, req: OpenShotChatReq | None = None) -> dict[str, Any]:
+    body = req or OpenShotChatReq()
+    try:
+        shot = store.get_shot(shot_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    port = int(os.environ.get("WASH_APP_PORT", "8787"))
+    try:
+        res = shot_fastpath.launch_foreground_shot_chat(
+            shot,
+            mode=body.mode,
+            user_note=body.note,
+            port=port,
+            workspace_root=WORKSPACE_ROOT,
+            agy_bin=agent_bridge.find_agy_bin(),
+            dry_run=bool(body.dryRun),
+        )
+        return {"ok": True, **res}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (RuntimeError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/handoff-context")
+def get_shot_handoff_context(shot_id: str, req: OpenShotChatReq | None = None) -> dict[str, Any]:
+    body = req or OpenShotChatReq()
+    try:
+        shot = store.get_shot(shot_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    port = int(os.environ.get("WASH_APP_PORT", "8787"))
+    context_text = shot_fastpath.build_shot_handoff_context(
+        shot,
+        workspace_root=WORKSPACE_ROOT,
+        port=port,
+        user_note=body.note,
+    )
+    return {
+        "ok": True,
+        "shotId": shot["id"],
+        "cliConversationId": shot.get("cliConversationId", ""),
+        "canResumeCliChat": bool(shot.get("canResumeCliChat")),
+        "contextText": context_text,
+    }
+
+
 @app.get("/api/shots/{shot_id}")
 def get_shot_detail(shot_id: str) -> dict[str, Any]:
     try:
@@ -1499,8 +1560,6 @@ def restart_agent_bridge() -> dict[str, Any]:
 @app.post("/api/agent/claim")
 def claim_agent_pending(req: ClaimReq | None = None) -> dict[str, Any]:
     body = req or ClaimReq()
-    if (body.workerId or "").strip() != "agy_bridge":
-        agent_presence.hold_interactive(45.0)
     res = store.claim_pending(worker_id=body.workerId, limit=body.limit, shot_ids=body.shotIds)
     return {"ok": True, **res}
 
@@ -1542,10 +1601,10 @@ def wait_events(
     watcher: str = Query(default=""),
     mode: str = Query(default=""),
 ) -> dict[str, Any]:
-    if watcher.strip() and mode.strip() in {"interactive", "bridge"}:
+    if watcher.strip() and mode.strip() == "bridge":
         agent_presence.record_heartbeat(
             watcher.strip(),
-            mode.strip(),
+            "bridge",
             ttl_sec=max(float(timeout or 20.0) + 15.0, 35.0),
         )
     return store.wait_for_events(since_seq=since, timeout=timeout, only_actionable=actionable)

@@ -309,7 +309,7 @@ def _build_worker_prompt(
             f"2. {chrome_lock_rule}"
             "3. 若需积分确认请严格遵循 `credits-and-hitl.md`，并将 `nodeId` / `submitId` / `selectedResourceId`（严禁保存 token 或凭据）写入 `jimengMeta`；向用户交付样片时须明确提醒最长存储 7 天。\n"
             f"4. {callback_rule}"
-            "5. **禁止**在本 Worker 内启动 `watch_queue.py`。\n\n"
+            "5. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n\n"
         )
     else:
         skill_list = "（`libtv-seedance-batch`、`seedance-video-recreation`、`seedance-video-prompts`、`libtv-cli`）"
@@ -317,7 +317,7 @@ def _build_worker_prompt(
             "1. 多路并行时严禁调用 `libtv group use`，所有 `libtv` 命令显式传 `-p <projectUuid>`（与 `-g <groupKey>`）。\n"
             f"2. {chrome_lock_rule}"
             f"3. {callback_rule}"
-            "4. **禁止**在本 Worker 内启动 `watch_queue.py`。\n\n"
+            "4. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n\n"
         )
 
     if is_resume:
@@ -671,9 +671,6 @@ class BridgeRuntime:
                             continue
                         st = status_resp.json()
                         if st.get("bridgePaused"):
-                            _STOP_EVENT.wait(2.0)
-                            continue
-                        if st.get("interactiveOnline"):
                             _STOP_EVENT.wait(2.0)
                             continue
 

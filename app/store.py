@@ -260,6 +260,56 @@ def safe_prompt_update_prev_status(shot: dict[str, Any], cur_status: str) -> str
     return cur_status
 
 
+_SAFE_CONV_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,128}$")
+_CLI_STORE_ROOT = Path.home() / ".gemini" / "antigravity-cli"
+
+
+def _cli_session_exists(cid: str) -> bool:
+    clean = (cid or "").strip()
+    if not _SAFE_CONV_ID_RE.match(clean):
+        return False
+    db_file = _CLI_STORE_ROOT / "conversations" / f"{clean}.db"
+    brain_dir = _CLI_STORE_ROOT / "brain" / clean
+    return db_file.is_file() or brain_dir.is_dir()
+
+
+def resolve_cli_conversation_id(shot: dict[str, Any]) -> str:
+    """Find the most recent resumable `agy` CLI conversation ID for a shot."""
+    sid = str(shot.get("id") or "").strip()
+    candidates: list[str] = []
+    direct = str(shot.get("shotConversationId") or "").strip()
+    if direct:
+        candidates.append(direct)
+
+    convs_path = DATA_ROOT / "shot_conversations.json"
+    if sid and convs_path.is_file():
+        try:
+            convs = json.loads(convs_path.read_text(encoding="utf-8"))
+            rec = convs.get(sid) if isinstance(convs, dict) else None
+            if isinstance(rec, dict):
+                cid = str(rec.get("conversationId") or "").strip()
+                plat = normalize_platform(shot.get("platform"))
+                if cid and rec.get("platform", plat) == plat:
+                    candidates.append(cid)
+        except Exception:
+            pass
+
+    for item in reversed(shot.get("versionHistory") or []):
+        if isinstance(item, dict):
+            cid = str(item.get("conversationId") or "").strip()
+            if cid:
+                candidates.append(cid)
+
+    seen: set[str] = set()
+    for cid in candidates:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if _cli_session_exists(cid):
+            return cid
+    return ""
+
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
@@ -422,6 +472,9 @@ def _decorate_shot_payload(shot: dict[str, Any]) -> dict[str, Any]:
         out["errorReason"] = ""
         out["errorSolution"] = ""
         out["errorDetail"] = ""
+    cli_conv_id = resolve_cli_conversation_id(out)
+    out["cliConversationId"] = cli_conv_id
+    out["canResumeCliChat"] = bool(cli_conv_id)
     return out
 
 

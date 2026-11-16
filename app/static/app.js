@@ -107,6 +107,8 @@ const state = {
     onConfirm: null,
   },
   shotMoreOpen: false,
+  shotChatMenuOpen: false,
+  shotChatBusy: false,
   canvasPicker: {
     open: false,
     query: "",
@@ -2391,15 +2393,143 @@ function closeAiStatusPopover() {
   btn?.setAttribute("aria-expanded", "false");
 }
 
+function closeShotChatMenu() {
+  if (!state.shotChatMenuOpen) return;
+  state.shotChatMenuOpen = false;
+  document.getElementById("shotChatMenu")?.classList.add("hidden");
+  const btn = document.getElementById("shotChatMenuToggleBtn");
+  btn?.classList.remove("is-open");
+  btn?.setAttribute("aria-expanded", "false");
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // Fallback to execCommand copy below
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+async function openShotForegroundChat(shotId, mode = "auto", note = "", triggerBtn = null) {
+  if (!shotId || state.shotChatBusy) return;
+  closeShotChatMenu();
+  state.shotChatBusy = true;
+  const prevText = triggerBtn ? triggerBtn.textContent : "";
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = "唤起窗口中…";
+  }
+  try {
+    const res = await apiJson(`/api/shots/${encodeURIComponent(shotId)}/open-chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, note }),
+    });
+    if (res.mode === "resume") {
+      const shortId = res.conversationId ? `${res.conversationId.slice(0, 8)}…` : "";
+      showToast(`已打开终端前台窗口并续接原对话${shortId ? `（${shortId}）` : ""}`);
+    } else {
+      showToast("已打开终端独立前台对话，并带入本镜完整上下文");
+    }
+  } catch (err) {
+    showToast(err.message || "无法打开前台对话窗口");
+  } finally {
+    state.shotChatBusy = false;
+    if (triggerBtn && triggerBtn.isConnected) {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = prevText;
+    }
+  }
+}
+
+async function handoffShotToDesktopApp(shotId, note = "", triggerBtn = null) {
+  if (!shotId || state.shotChatBusy) return;
+  closeShotChatMenu();
+  state.shotChatBusy = true;
+  const prevText = triggerBtn ? triggerBtn.textContent : "";
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = "准备交接…";
+  }
+  try {
+    const ctxRes = await apiJson(`/api/shots/${encodeURIComponent(shotId)}/handoff-context`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    });
+    const copied = await copyTextToClipboard(ctxRes.contextText || "");
+    try {
+      await apiJson("/api/system/open-antigravity", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: "antigravity" }),
+      });
+      showToast(
+        copied
+          ? "已复制本镜完整上下文并唤起 Antigravity，请直接 Cmd+V 开聊"
+          : "已唤起 Antigravity 桌面端（若剪贴板受限可手动粘贴上下文）"
+      );
+    } catch (err) {
+      showToast(copied ? `已复制上下文到剪贴板，但唤起 Antigravity 失败：${err.message}` : err.message);
+    }
+  } catch (err) {
+    showToast(err.message || "准备交接上下文失败");
+  } finally {
+    state.shotChatBusy = false;
+    if (triggerBtn && triggerBtn.isConnected) {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = prevText;
+    }
+  }
+}
+
+async function launchForegroundAppWindow(target) {
+  if (state.aiActionPending) return;
+  state.aiActionPending = true;
+  renderAiStatusPopover();
+  try {
+    await apiJson("/api/system/open-antigravity", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target }),
+    });
+    showToast(target === "terminal_agy" ? "已打开独立终端前台 agy 对话" : "已唤起 Antigravity 桌面端窗口");
+  } catch (err) {
+    showToast(err.message || "唤起前台窗口失败");
+  } finally {
+    state.aiActionPending = false;
+    renderAiStatusPill();
+  }
+}
+
 function getAgentStatusMeta() {
   if (state.serverUnreachable) {
     return {
       state: "offline",
       label: "服务未连接",
       detail: "无法连接到本地控制台服务（127.0.0.1:8787）；请双击桌面「洗片控制台.app」启动后点下方刷新。",
-      interactiveOnline: false,
       bridgeOnline: false,
       bridgePaused: false,
+      maxWorkers: 4,
       busy: false,
       activeShotIds: [],
       pendingCount: 0,
@@ -2410,10 +2540,10 @@ function getAgentStatusMeta() {
     state.data?.agentStatus || {
       state: "offline",
       label: "AI 检查中…",
-      detail: "正在检查 Antigravity 对话监听与本地桥接状态…",
-      interactiveOnline: false,
+      detail: "正在检查后台 agy 并发桥接状态…",
       bridgeOnline: false,
       bridgePaused: false,
+      maxWorkers: 4,
       busy: false,
       activeShotIds: [],
       pendingCount: 0,
@@ -2429,8 +2559,6 @@ function renderAiStatusPill() {
   const stateCls =
     st.state === "busy"
       ? "is-busy"
-      : st.state === "interactive"
-      ? "is-interactive"
       : st.state === "bridge_ready"
       ? "is-bridge-ready"
       : st.state === "paused"
@@ -2479,7 +2607,7 @@ function renderAiStatusPopover() {
   const badgeCls =
     st.state === "busy"
       ? "pill-blue"
-      : st.state === "interactive" || st.state === "bridge_ready"
+      : st.state === "bridge_ready"
       ? "pill-green"
       : st.state === "paused"
       ? "pill-orange"
@@ -2504,20 +2632,30 @@ function renderAiStatusPopover() {
     }
   }
 
+  const launchHtml = !state.serverUnreachable
+    ? `
+      <div class="ai-popover-launch">
+        <button id="openTerminalAgyBtn" data-ai-action="open-terminal-agy" class="btn btn-secondary btn-sm" type="button" ${pendingAttr} title="在新终端窗口启动独立前台 agy 对话">💻 终端新开 agy</button>
+        <button id="openAntigravityAppBtn" data-ai-action="open-antigravity" class="btn btn-secondary btn-sm" type="button" ${pendingAttr} title="唤起 Antigravity 桌面客户端">🚀 打开 Antigravity</button>
+      </div>
+    `
+    : "";
+
   const nextHtml = `
     <div class="ai-popover-head">
-      <span class="ai-popover-title">Antigravity 自动连接状态</span>
+      <span class="ai-popover-title">Antigravity 并发桥接与前台接管</span>
       <span class="pill ${badgeCls}">${escapeHtml(st.label)}</span>
     </div>
     <div class="ai-popover-desc">${escapeHtml(st.detail || "")}</div>
     <div class="ai-popover-meta">
-      <div class="ai-popover-row"><span>对话实时监听</span><strong>${st.interactiveOnline ? "在线（优先接单）" : "未连接"}</strong></div>
       <div class="ai-popover-row"><span>本地 agy 桥接</span><strong>${state.serverUnreachable ? "服务未连接" : st.agyInstalled === false ? "未安装 agy CLI" : st.bridgePaused ? "已暂停" : st.bridgeOnline ? `运行中 (PID ${st.bridgePid || "-"})` : "未运行"}</strong></div>
+      <div class="ai-popover-row"><span>并发调度能力</span><strong>${st.maxWorkers || 4} 路独立会话（互不串线）</strong></div>
       <div class="ai-popover-row"><span>处理中 / 排队</span><strong>${escapeHtml(activeText)} / ${st.pendingCount || 0} 待办</strong></div>
-      <div class="ai-popover-row"><span>最近唤醒会话</span><strong>${escapeHtml(convShort)}${st.lastRunAt ? ` · ${escapeHtml(st.lastRunAt.slice(11))}` : ""}</strong></div>
+      <div class="ai-popover-row"><span>最近完成会话</span><strong>${escapeHtml(convShort)}${st.lastRunAt ? ` · ${escapeHtml(st.lastRunAt.slice(11))}` : ""}</strong></div>
     </div>
     ${st.lastError ? `<div class="ai-popover-err">最近异常：${escapeHtml(st.lastError)}</div>` : ""}
     <div class="ai-popover-actions">${actionsHtml}</div>
+    ${launchHtml}
   `;
 
   if (pop.dataset.renderedHtml !== nextHtml) {
@@ -2752,6 +2890,7 @@ function renderTopBar() {
     reprocessBtn?.classList.add("hidden");
     delBtn?.classList.add("hidden");
     closeShotMoreMenu();
+    closeShotChatMenu();
   } else {
     const shot = (d.shots || []).find((s) => s.id === state.selectedShotId);
     titleEl.textContent = shot ? shot.id : "镜头";
@@ -2779,6 +2918,7 @@ function renderTopBar() {
       reprocessBtn?.classList.add("hidden");
       delBtn?.classList.add("hidden");
       closeShotMoreMenu();
+      closeShotChatMenu();
     }
   }
 
@@ -3753,6 +3893,9 @@ function renderErrorBanner(shot) {
   const reason = shot.errorReason || "后台执行异常中断，已有提示词与素材仍安全保留。";
   const solution = shot.errorSolution || "点击下方「↻ 重试刚才操作」重新排队，或点「↩ 恢复到稳定状态」。";
   const detail = shot.errorDetail || (shot.agentSummary && shot.agentSummary !== reason ? shot.agentSummary : "");
+  const canResumeErr = Boolean(shot.canResumeCliChat && shot.cliConversationId);
+  const errChatLabel = canResumeErr ? "💬 接手原对话排查" : "💬 开新对话排查";
+  const errChatMode = canResumeErr ? "resume" : "new";
   return `
     <section class="error-banner" role="alert">
       <div class="error-banner-head">
@@ -3763,6 +3906,7 @@ function renderErrorBanner(shot) {
       <div class="error-banner-row error-banner-solution"><span class="error-banner-label">解决办法：</span>${escapeHtml(solution)}</div>
       ${detail ? `<div class="error-banner-detail">原始报错信息：${escapeHtml(detail)}</div>` : ""}
       <div class="error-banner-actions">
+        <button id="openChatFromErrorBtn" class="btn btn-secondary btn-sm" type="button" data-chat-mode="${errChatMode}" title="打开独立终端前台对话直接接手排查此报错">${errChatLabel}</button>
         <button id="restoreErrorBtn" class="btn btn-secondary btn-sm" type="button" title="仅清除出错标记，恢复成片或画布稳态">↩ 恢复到稳定状态</button>
         <button id="recheckFromErrorBtn" class="btn btn-secondary btn-sm" type="button" title="由 Agent 核查画布与提示词状态后修复">🛠 重新自检修复</button>
         <button id="retryErrorBtn" class="btn btn-primary btn-sm" type="button" title="按失败前的队列动作重新执行一次">↻ 重试刚才操作</button>
@@ -3964,6 +4108,27 @@ function renderShotActionBarHtml(shot) {
     ? `<button id="syncLibtvBtn" class="btn btn-secondary btn-sm" type="button" title="从 ${escapeHtml(platLabel)} 画布拉取最新生成的样片">↓ 同步成片</button>`
     : "";
 
+  const canResumeChat = Boolean(shot.canResumeCliChat && shot.cliConversationId);
+  const chatMainLabel = canResumeChat ? "💬 接手原对话" : "💬 前台开聊";
+  const chatMainMode = canResumeChat ? "resume" : "new";
+  const chatMainTitle = canResumeChat
+    ? `打开终端前台窗口，直接续接该镜头后台独立对话（${shot.cliConversationId.slice(0, 8)}…）`
+    : "打开终端独立前台 agy 对话，并自动带入本镜提示词、画布与参考素材上下文";
+  const resumeMenuBtn = canResumeChat
+    ? `<button id="chatResumeMenuBtn" class="more-menu-item" type="button" role="menuitem">💬 续接原对话（终端 · ${escapeHtml(shot.cliConversationId.slice(0, 8))}…）</button>`
+    : `<button id="chatResumeMenuBtn" class="more-menu-item" type="button" role="menuitem" disabled title="该镜头尚未沉淀后台 agy 会话（首次 AI 处理后即可续接）">💬 续接原对话（暂无记录）</button>`;
+
+  const chatSplitHtml = `
+    <div id="shotChatWrap" class="chat-split-wrap">
+      <button id="openShotChatMainBtn" class="btn btn-secondary btn-sm chat-split-main" type="button" data-chat-mode="${chatMainMode}" title="${escapeHtml(chatMainTitle)}">${chatMainLabel}</button>
+      <button id="shotChatMenuToggleBtn" class="btn btn-secondary btn-sm chat-split-arrow${state.shotChatMenuOpen ? " is-open" : ""}" type="button" aria-haspopup="menu" aria-expanded="${state.shotChatMenuOpen ? "true" : "false"}" title="更多前台转聊方式">▾</button>
+      <div id="shotChatMenu" class="chat-popover${state.shotChatMenuOpen ? "" : " hidden"}" role="menu" aria-label="转到前台独立对话选项">
+        ${resumeMenuBtn}
+        <button id="chatNewTerminalMenuBtn" class="more-menu-item" type="button" role="menuitem">🆕 新开独立前台对话（终端 agy）</button>
+        <button id="chatHandoffDesktopMenuBtn" class="more-menu-item" type="button" role="menuitem">📋 复制上下文 + 唤起 Antigravity</button>
+      </div>
+    </div>`;
+
   const finalInProgress = isFinalInProgress(shot);
   const passed = isPassedFinal(shot);
   const outdatedFinal = isOutdatedFinal(shot);
@@ -4008,6 +4173,7 @@ function renderShotActionBarHtml(shot) {
       <div class="shot-action-btns">
         ${historyBtn}
         ${syncBtn}
+        ${chatSplitHtml}
         ${primaryBtn}
       </div>
     </section>
@@ -4519,6 +4685,39 @@ function bindDetailEvents(shot) {
   };
   document.getElementById("syncLibtvBtn")?.addEventListener("click", (e) => handleSyncLibtv(e.currentTarget));
 
+  document.getElementById("openShotChatMainBtn")?.addEventListener("click", (e) => {
+    const btn = e.currentTarget;
+    openShotForegroundChat(shot.id, btn.dataset.chatMode || "auto", "", btn);
+  });
+
+  document.getElementById("shotChatMenuToggleBtn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeCanvasPopover();
+    closeAiStatusPopover();
+    closeUpdatePopover();
+    closeShotMoreMenu();
+    state.shotChatMenuOpen = !state.shotChatMenuOpen;
+    document.getElementById("shotChatMenu")?.classList.toggle("hidden", !state.shotChatMenuOpen);
+    const btn = document.getElementById("shotChatMenuToggleBtn");
+    btn?.classList.toggle("is-open", state.shotChatMenuOpen);
+    btn?.setAttribute("aria-expanded", state.shotChatMenuOpen ? "true" : "false");
+  });
+
+  document.getElementById("chatResumeMenuBtn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openShotForegroundChat(shot.id, "resume", "", document.getElementById("openShotChatMainBtn"));
+  });
+
+  document.getElementById("chatNewTerminalMenuBtn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openShotForegroundChat(shot.id, "new", "", document.getElementById("openShotChatMainBtn"));
+  });
+
+  document.getElementById("chatHandoffDesktopMenuBtn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    handoffShotToDesktopApp(shot.id, "", document.getElementById("openShotChatMainBtn"));
+  });
+
   document.getElementById("toggleCompareBtn")?.addEventListener("click", () => {
     state.detailDraft.compareSource = !state.detailDraft.compareSource;
     renderDetailView();
@@ -4662,6 +4861,16 @@ function bindDetailEvents(shot) {
       await refreshState();
     }
   };
+  document.getElementById("openChatFromErrorBtn")?.addEventListener("click", (e) => {
+    const btn = e.currentTarget;
+    const reason = (shot.errorReason || "后台执行异常中断").trim();
+    openShotForegroundChat(
+      shot.id,
+      btn.dataset.chatMode || "auto",
+      `当前镜头处于出错状态（${reason}），请直接帮我排查原因并决定修复或改写方案。`,
+      btn
+    );
+  });
   document.getElementById("retryErrorBtn")?.addEventListener("click", (e) =>
     handleRecoverError("retry", e.currentTarget, "重试中…", "已重新入队重试，等待 Agent 处理")
   );
@@ -4758,6 +4967,7 @@ function closeConfirmModal() {
 function openHistoryModal(shot, preferredVersionId = null) {
   if (!shot) return;
   closeShotMoreMenu();
+  closeShotChatMenu();
   const history = shot.versionHistory || [];
   const latest = history.length ? history[history.length - 1] : null;
   state.historyModal = {
@@ -5049,6 +5259,7 @@ function bindGlobalEvents() {
     closeCanvasPopover();
     closeUpdatePopover();
     closeShotMoreMenu();
+    closeShotChatMenu();
     state.aiStatusOpen = !state.aiStatusOpen;
     renderAiStatusPopover();
     if (state.aiStatusOpen) {
@@ -5061,6 +5272,7 @@ function bindGlobalEvents() {
     closeCanvasPopover();
     closeAiStatusPopover();
     closeShotMoreMenu();
+    closeShotChatMenu();
     state.updateMenuOpen = !state.updateMenuOpen;
     renderUpdatePopover();
     if (state.updateMenuOpen && !state.updateActionPending) {
@@ -5097,13 +5309,17 @@ function bindGlobalEvents() {
     const action = actionBtn.dataset.aiAction;
     if (action === "refresh") {
       await refreshAgentStatus();
-      showToast(state.serverUnreachable ? "仍未连接到本地服务 (127.0.0.1:8787)" : "已刷新 Antigravity 连接状态");
+      showToast(state.serverUnreachable ? "仍未连接到本地服务 (127.0.0.1:8787)" : "已刷新后台并发桥接状态");
     } else if (action === "stop") {
       await runAiBridgeAction("/api/agent/bridge/stop", "已暂停本地 agy 后台桥接");
     } else if (action === "start") {
       await runAiBridgeAction("/api/agent/bridge/start", "已重连并启动本地 agy 后台桥接");
     } else if (action === "restart") {
       await runAiBridgeAction("/api/agent/bridge/restart", "已重连本地 agy 后台桥接");
+    } else if (action === "open-terminal-agy") {
+      await launchForegroundAppWindow("terminal_agy");
+    } else if (action === "open-antigravity") {
+      await launchForegroundAppWindow("antigravity");
     }
   });
 
@@ -5114,6 +5330,7 @@ function bindGlobalEvents() {
     closeAiStatusPopover();
     closeUpdatePopover();
     closeShotMoreMenu();
+    closeShotChatMenu();
     switchPlatform(btn.dataset.platformBtn);
   });
 
@@ -5122,6 +5339,7 @@ function bindGlobalEvents() {
     closeAiStatusPopover();
     closeUpdatePopover();
     closeShotMoreMenu();
+    closeShotChatMenu();
     state.canvasPicker.open = !state.canvasPicker.open;
     if (!state.canvasPicker.open) state.canvasPicker.creating = false;
     renderCanvasPopover();
@@ -5135,6 +5353,7 @@ function bindGlobalEvents() {
     closeCanvasPopover();
     closeAiStatusPopover();
     closeUpdatePopover();
+    closeShotChatMenu();
     state.shotMoreOpen = !state.shotMoreOpen;
     document.getElementById("shotMoreMenu")?.classList.toggle("hidden", !state.shotMoreOpen);
     const btn = document.getElementById("shotMoreBtn");
@@ -5155,10 +5374,14 @@ function bindGlobalEvents() {
     if (state.shotMoreOpen && !e.target.closest("#shotMoreWrap")) {
       closeShotMoreMenu();
     }
+    if (state.shotChatMenuOpen && !e.target.closest("#shotChatWrap")) {
+      closeShotChatMenu();
+    }
   });
 
   document.getElementById("newShotNavBtn").addEventListener("click", () => {
     closeShotMoreMenu();
+    closeShotChatMenu();
     if (!state.builder.shotIdTouched) {
       state.builder.shotId = suggestNextShotId(state.data?.shots || []);
     }
@@ -5611,6 +5834,7 @@ function bindGlobalEvents() {
       closeAiStatusPopover();
       closeUpdatePopover();
       closeShotMoreMenu();
+      closeShotChatMenu();
       closePresetModal();
       return;
     }

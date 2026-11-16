@@ -38,7 +38,6 @@ APP_MANAGED_FILES = [
     "libtv_bridge.py",
     "jimeng_bridge.py",
     "agent_bridge.py",
-    "watch_queue.py",
     "launch.sh",
     "requirements.txt",
     "version.json",

@@ -2,45 +2,34 @@
 name: wash-queue-console
 description: >-
   本地「洗片控制台（Wash Queue Console）」与 LibTV / 即梦官网 Seedance 2.5 后台协同自动化协议。
-  只要用户在新对话中说“启动洗片监听”“连上洗片控制台”“看下洗片控制台”“处理控制台排片队列”
-  “有人在控制台点重新处理·自检”，或需要操作洗片控制台 `server.py` 服务、
-  `watch_queue.py` 队列监听器、`queue.json` 中的 queued / run_requested / prompt_update_requested / feedback_queued / final_requested / recheck_requested
+  只要用户需要操作洗片控制台 `server.py` 服务、`agent_bridge.py` 并发 Worker、前台接手调试镜头、
+  或处理 `queue.json` 中的 queued / run_requested / prompt_update_requested / feedback_queued / final_requested / recheck_requested
   任务时，立即触发并遵循本 skill。
 ---
 
 # 洗片控制台（Wash Queue Console）跨会话协同协议
 
-本工作区的桌面应用 `洗片控制台.app` 与本地服务 `server.py`（端口 `8787`，源码位于 `<workspace>/tools/wash_queue_app/` 或应用包内 `Contents/Resources/app/`）完全独立于单次对话运行；所有项目数据均持久化在当前工作区的 `wash_queue_data/` 目录（`queue.json`、`presets/` 与 `shots/`，具体路径也可从 `GET http://127.0.0.1:8787/api/state` 读取，且绝不上传或写入个人敏感路径）。
+本工作区的桌面应用 `洗片控制台.app` 与本地服务 `server.py`（端口 `8787`，源码位于 `<workspace>/tools/wash_queue_app/` 或应用包内 `Contents/Resources/app/`）完全独立运行；所有项目数据均持久化在当前工作区的 `wash_queue_data/` 目录（`queue.json`、`presets/` 与 `shots/`，具体路径也可从 `GET http://127.0.0.1:8787/api/state` 读取，且绝不上传或写入个人敏感路径）。
 
 ---
 
-## 1. 无会话自动桥接（`agent_bridge.py`）与跨对话接管
+## 1. 全自动后台并发桥接（`agent_bridge.py`）与单镜前台接手
 
 > [!IMPORTANT]
-> 本系统现已具备 **双模自动接单能力**：
-> 1. **无会话自动桥接（默认常驻）**：打开桌面 `洗片控制台.app` 或启动本地 8787 服务时，独立守护进程 `agent_bridge.py` 会同步启动并保持心跳；即使 **没有任何活跃 Antigravity 对话**，一旦队列出现待办事件，桥接器也会自动通过本机 `agy -p` 唤醒 Worker（最多 3 路并发）按本协议端到端执行并回写。
-> 2. **活跃对话优先接管**：当用户在活跃 Antigravity 对话中说“启动洗片监听 / 连上洗片控制台 / 处理排片队列”时，对话通过 `watch_queue.py --wait --mode interactive` 挂起监听；此时 `agent_bridge.py` 自动退让为热备状态，优先由当前活跃对话接单并发处理（顶栏状态灯同步显示「AI 对话已连接」或「AI 桥接已就绪」）。
->    *(注：若你是被 `agent_bridge.py` 唤醒的单镜 Worker，只需处理好当前分配到的镜头并调用 `agent-update`，**严禁**再启动 `watch_queue.py`。)*
+> 本系统采用 **独立多进程并发池（`agent_bridge.py`）+ 按需单镜前台接管**：
+> 1. **默认后台全自动并发**：打开 `洗片控制台.app` 或启动本地 8787 服务时，独立守护进程 `agent_bridge.py` 同步常驻（默认 4 路并发）。每来一个待办镜头，桥接池会自动按镜头分配独立干净的 `agy -p` 会话（并在同镜返工时用 `--conversation` 续接其专属对话）端到端执行并回写；纯改词同步优先走 Python 快速通道。
+> 2. **复杂镜前台人工接手**：若某个镜头疑难复杂或连续报错，用户在控制台点 **「💬 接手原对话 / 前台开聊」** 即可弹起 macOS Terminal 前台 `agy` 窗口，直接基于原会话或完整上下文简报和 AI 对话调试（**严禁**在任何单镜 Worker 内再递归挂起队列监听）。
 
-1. **定位应用目录并检查服务是否在线**（优先使用工作区 `tools/wash_queue_app`，否则回退桌面/应用目录下的 `洗片控制台.app/Contents/Resources/app`）：
+1. **检查服务与桥接是否在线**（优先使用工作区 `tools/wash_queue_app`，否则回退桌面/应用目录下的 `洗片控制台.app/Contents/Resources/app`）：
    ```bash
    APP_DIR="$( [ -d ./tools/wash_queue_app ] && pwd )/tools/wash_queue_app"
    [ -d "$APP_DIR" ] || APP_DIR="$HOME/Desktop/洗片控制台.app/Contents/Resources/app"
    [ -d "$APP_DIR" ] || APP_DIR="$HOME/Desktop/洗片控制台-同事版/洗片控制台.app/Contents/Resources/app"
-   PY_BIN="$APP_DIR/.venv/bin/python"
-   [ -x "$PY_BIN" ] || PY_BIN="$APP_DIR/../runtime/bin/python3.12"
    curl -sf http://127.0.0.1:8787/api/state >/dev/null || bash "$APP_DIR/launch.sh" --no-browser
    ```
-2. **立即检查并签收积压的待办任务**：
-   ```bash
-   "$PY_BIN" "$APP_DIR/watch_queue.py" --check --claim --limit 10
-   ```
-   - 退出码 `0`：已一次性将待办镜头原子签收为 `processing`（每条均带独立 `claimToken` 与 `processingTaskType`），立刻按下方「多任务并发调度协议」并行派生至少 **3 路以上** `self` subagent 同时处理，并立即挂起下一轮 `--wait` 监听后续插队任务。
-   - 退出码 `2`：暂无积压，挂起长期监听等待下一条事件：
-     ```bash
-     "$PY_BIN" "$APP_DIR/watch_queue.py" --wait --claim --limit 10
-     ```
-     （该命令阻塞直到 `queued` / `run_requested` / `prompt_update_requested` / `feedback_queued` / `final_requested` / `recheck_requested` 到来并自动原子签收为 `processing`，用后台 `run_command` 挂起即可，切勿轮询 sleep。）
+2. **手工核查待办或接手单镜**（无需挂常驻监听）：
+   - 查看待办队列：`curl -sf http://127.0.0.1:8787/api/agent/pending`
+   - 手动签收单个镜头处理：`POST http://127.0.0.1:8787/api/shots/{shot_id}/claim`（获取 `claimToken`），完成后调用 `POST http://127.0.0.1:8787/api/shots/{shot_id}/agent-update`。
 
 ---
 
@@ -64,7 +53,7 @@ description: >-
 ## 3. 四类待办状态的处理规范
 
 ### A. `queued`（新建排片）
-1. 读取 `shot` 全量元信息（`GET http://127.0.0.1:8787/api/shots/{id}` 或直接读 `watch_queue.py` 输出）：原视频 `sourceVideo`、有序图片列表 `compImage` + `charRefs`（序号即 `图片1..N`）、`whiteoutOptions`（`parts` / `targetSlot`）、`userPrompt`、`scene`。
+1. 读取 `shot` 全量元信息（`GET http://127.0.0.1:8787/api/shots/{id}` 或 Worker 简报）：原视频 `sourceVideo`、有序图片列表 `compImage` + `charRefs`（序号即 `图片1..N`）、`whiteoutOptions`（`parts` / `targetSlot`）、`userPrompt`、`scene`。
 2. 如需涂白（默认先检查 `whiteoutOptions.parts`，未勾选时仅做“最小必要人脸防阻塞涂白”；若已有手绘涂白稿 `filePath` 则直接使用）：用 `whiteout_mask.py` 或审慎遮罩生成洁白人脸/指定部位图，注意领口、围巾、肩部光影自然留存。
 3. 多模态直读原片（`read_file` 读取 `.mp4`）与参考图，撰写严格符合 `seedance-video-prompts` + `seedance-video-recreation` 的提示词并保存至 `outputs/{shot_id}_提示词.md`。
 4. 上传并连线到 LibTV 画布（遵循 `libtv-cli` 与 `libtv-seedance-batch`），设置 `mixedList`、`aspectRatio=21:9`、对齐原片整数秒、480P 样片模式，**不点击生成**；用 Chrome/截图核验画布节点连线与缩略图无误。
@@ -113,19 +102,17 @@ description: >-
 - 场次管理：`POST /api/scenes`、`POST /api/scenes/rename`、`DELETE /api/scenes?name=...`、`PATCH /api/shots/{shot_id}/scene`
 - Agent 回写结果与进度（并发必须带 `claimToken`）：`POST /api/shots/{shot_id}/agent-update`
 - 触发中断重检：`POST /api/shots/{shot_id}/reprocess`
-- 处理完毕或刚派发完并发 Worker 后，立即重新挂起 `watch_queue.py --wait --claim --limit 10`，确保后续插队任务随时并发接入。
+- 前台 Terminal / Antigravity 接手单镜：`POST /api/shots/{shot_id}/open-chat`、`POST /api/shots/{shot_id}/handoff-context`、`POST /api/system/open-antigravity`
 
 ---
 
-## 5. 多任务并发调度协议（至少 3 路并发）
+## 5. 多任务并发调度协议（独立桥接池 4 路并发）
 
-本系统支持 **>= 3 路任务真实并行执行**（Coordinator + Parallel Worker Subagents 模式）：
+本系统通过后台 `agent_bridge.py` 实现 **多路 `agy -p` 独立会话真并行执行**（每镜独享独立上下文与 `--conversation` 记忆）：
 
-1. **原子领单 + 立即并行派生（Coordinator）**
-   - 当一次有多个待办镜头（例如 `S04`、`S05`、`S06`），或上一批仍在运行而用户又新提交了镜头时：
-     - 使用 `watch_queue.py --check --claim --limit 10`（或 `POST /api/agent/claim`）原子把当前所有可执行镜头转为 `processing` 并获取各自 `claimToken`；
-     - 在**同一轮响应**中对每个已领单镜头调用一次 `invoke_subagent`（`TypeName: "self"`, `Model: "inherit"`），把 `shotId`、`processingTaskType`、`claimToken` 清晰写入各自的 Prompt，同时并发跑起（推荐并发上限 3–5 路；若积压超过 5 个，分批派生，每完成一路再补下一路）；
-     - 派生完后**立刻重新挂起 `watch_queue.py --wait --claim --limit 10`**（不要等这 3 路跑完才恢复监听），从而第 4、5 个新任务一提交就能直接派生新 Worker 插队并行，不再串行排队。
+1. **自动领单与并发执行**
+   - 桥接池自动调用 `POST /api/agent/claim`（`workerId: "agy_bridge"`）按空闲槽位签收可运行镜头，并为每镜启动独立进程执行；纯改词同步优先直走 `shot_fastpath.py` Python 快速通道。
+   - **禁止**在任何单镜 Worker 或前台接管对话内再挂起队列常驻监听。
 2. **禁止全局状态互相踩踏（LibTV CLI 隔离规则）**
    - `.libtv/project.json` 是单文件共享状态，**并发场景下严禁调用 `libtv group use`**；
    - 所有 `libtv` 命令（`group list` / `group create` / `upload` / `node` / `seedance` / `edge` 等）**必须显式传入 `-p <projectUuid>`（以及 `-g <groupKey>` 或明确 `nodeKey`）**。
