@@ -107,7 +107,9 @@ def _load_bridge_settings() -> dict[str, Any]:
         "prePrepEnabled": _bool_opt("prePrepEnabled", "WASH_BRIDGE_PREPREP", True),
         "heavyModel": _str_opt("heavyModel", "WASH_BRIDGE_HEAVY_MODEL", ""),
         "fastModel": _str_opt("fastModel", "WASH_BRIDGE_FAST_MODEL", ""),
-        "heavyEffort": _str_opt("heavyEffort", "WASH_BRIDGE_HEAVY_EFFORT", "xhigh"),
+        "heavyEffort": _str_opt("heavyEffort", "WASH_BRIDGE_HEAVY_EFFORT", "high"),
+        "creationEffort": _str_opt("creationEffort", "WASH_BRIDGE_CREATION_EFFORT", "medium"),
+        "feedbackResumeEffort": _str_opt("feedbackResumeEffort", "WASH_BRIDGE_FEEDBACK_RESUME_EFFORT", "medium"),
         "midEffort": _str_opt("midEffort", "WASH_BRIDGE_MID_EFFORT", "medium"),
         "recheckEffort": _str_opt("recheckEffort", "WASH_BRIDGE_RECHECK_EFFORT", "medium"),
         "fastEffort": _str_opt("fastEffort", "WASH_BRIDGE_FAST_EFFORT", "low"),
@@ -190,8 +192,15 @@ def _pick_hydrogen_model(target_effort: str, available_models: set[str]) -> str:
     return ""
 
 
-def _select_execution_profile(task_type: str, available_models: set[str], cfg: dict[str, Any]) -> tuple[str, str]:
-    """Return `(model, effort)` using Gemini 4 Hydrogen across all tasks."""
+def _select_execution_profile(
+    task_type: str,
+    available_models: set[str],
+    cfg: dict[str, Any],
+    *,
+    shot: dict[str, Any] | None = None,
+    is_resume: bool = False,
+) -> tuple[str, str]:
+    """Return `(model, effort)` tuned per task complexity for fast turnaround."""
     if task_type == "prompt_update_requested":
         effort = _normalize_effort(cfg.get("fastEffort", "low"), default="low")
         model = cfg["fastModel"] or _pick_hydrogen_model(effort, available_models)
@@ -207,8 +216,23 @@ def _select_execution_profile(task_type: str, available_models: set[str], cfg: d
         model = cfg["heavyModel"] or _pick_hydrogen_model(effort, available_models)
         return model, _resolve_compatible_effort(model, effort)
 
-    # Prompt writing & revision tasks (`queued`, `feedback_queued`, etc.) -> Extra (`xhigh`)
-    effort = _normalize_effort(cfg.get("heavyEffort", "xhigh"), default="xhigh")
+    work_mode = str((shot or {}).get("workMode") or "video_wash").strip().lower()
+    if work_mode == "video_creation":
+        effort = _normalize_effort(cfg.get("creationEffort", "medium"), default="medium")
+        model = cfg["heavyModel"] or _pick_hydrogen_model(effort, available_models)
+        return model, _resolve_compatible_effort(model, effort)
+
+    if task_type == "feedback_queued" and is_resume and shot:
+        pending_fbs = [f for f in (shot.get("feedbacks") or []) if isinstance(f, dict) and f.get("status") == "pending"]
+        has_media_attach = any(bool(f.get("attachments")) for f in pending_fbs)
+        has_wo = bool(((shot.get("whiteoutOptions") or {}).get("parts") or []))
+        if not has_media_attach and not has_wo:
+            effort = _normalize_effort(cfg.get("feedbackResumeEffort", "medium"), default="medium")
+            model = cfg["heavyModel"] or _pick_hydrogen_model(effort, available_models)
+            return model, _resolve_compatible_effort(model, effort)
+
+    # Full multi-modal wash prompt writing & visual revision -> high (or user-configured heavyEffort)
+    effort = _normalize_effort(cfg.get("heavyEffort", "high"), default="high")
     model = cfg["heavyModel"] or _pick_hydrogen_model(effort, available_models)
     return model, _resolve_compatible_effort(model, effort)
 
@@ -316,7 +340,8 @@ def _build_worker_prompt(
     if not pending_fbs and isinstance(shot.get("latestFeedback"), dict):
         pending_fbs = [shot["latestFeedback"]]
 
-    brief = {
+    prepped_in = prepped or {}
+    raw_brief: dict[str, Any] = {
         "id": shot.get("id"),
         "scene": shot.get("scene"),
         "platform": platform,
@@ -333,26 +358,30 @@ def _build_worker_prompt(
         "pendingPromptEdit": shot.get("pendingPromptEdit"),
         "promptUpdatePrevStatus": shot.get("promptUpdatePrevStatus"),
         "whiteoutOptions": shot.get("whiteoutOptions"),
-        "sourceVideo": (shot.get("sourceVideo") or {}).get("filePath"),
+        "sourceVideo": None if is_creation else (shot.get("sourceVideo") or {}).get("filePath"),
         "compImage": (shot.get("compImage") or {}).get("filePath"),
         "charRefs": shot.get("charRefs"),
-        "libtv": shot.get("libtv"),
-        "libtvGroupKey": shot.get("libtvGroupKey"),
-        "libtvSampleNodeKey": shot.get("libtvSampleNodeKey"),
-        "libtvFinalNodeKey": shot.get("libtvFinalNodeKey"),
-        "libtvMixedOrder": shot.get("libtvMixedOrder"),
-        "jimengMeta": shot.get("jimengMeta"),
         "promptFilePath": shot.get("promptFilePath"),
         "pendingFeedbacks": pending_fbs,
         "latestFeedback": shot.get("latestFeedback"),
-        "jimengCreditCeiling": (
+        "prepped": prepped_in,
+    }
+    if is_jimeng:
+        raw_brief["jimengMeta"] = shot.get("jimengMeta")
+        raw_brief["jimengCreditCeiling"] = (
             int(shot["jimengCreditCeiling"])
             if shot.get("jimengCreditCeiling") is not None
             else int(SETTINGS.get("jimengCreditCeiling") or 0)
-        ),
-        "prepped": prepped or {},
-        "depthCdpScriptPath": str(Path(__file__).resolve().parent / "scripts" / "dreamina_depth_cdp.py"),
-    }
+        )
+        if not is_creation and not prepped_in.get("pretriggeredDepthNodeId"):
+            raw_brief["depthCdpScriptPath"] = str(Path(__file__).resolve().parent / "scripts" / "dreamina_depth_cdp.py")
+    else:
+        raw_brief["libtv"] = shot.get("libtv")
+        raw_brief["libtvGroupKey"] = shot.get("libtvGroupKey")
+        raw_brief["libtvSampleNodeKey"] = shot.get("libtvSampleNodeKey")
+        raw_brief["libtvFinalNodeKey"] = shot.get("libtvFinalNodeKey")
+        raw_brief["libtvMixedOrder"] = shot.get("libtvMixedOrder")
+    brief = {k: v for k, v in raw_brief.items() if v not in (None, "", [], {})}
 
     if is_creation:
         chrome_lock_rule = (
@@ -467,21 +496,19 @@ def _build_worker_prompt(
             else ""
         )
 
+        commit_script = str(Path(__file__).resolve().parent / "scripts" / "jimeng_commit_sample.py")
+        py_bin = sys.executable
+
         if is_creation:
             creation_kind = str(prepped_dict.get("creationKind") or ("m2v" if ordered_refs else "t2v")).strip().lower()
             video_mode_flag = "t2v" if creation_kind == "t2v" or not ordered_refs else "m2v"
             gen_x = 800 if video_mode_flag == "t2v" else 3620
             refs_suffix = f" {refs_cli_hint}" if (video_mode_flag != "t2v" and refs_cli_hint) else ""
-            prompt_bind_tip = (
-                "<纯文生 Seedance 2.5 提示词，严禁出现 {{node:...}} 或 @图片 引用>"
-                if video_mode_flag == "t2v"
-                else "<写好的提示词，含 {{node:...}} 绑定>"
-            )
             whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
             if video_mode_flag == "t2v":
                 whiteout_hint = "无构图图（纯文生视频 `--mode t2v`），无需涂白与参考节点绑定。"
             elif whiteout_req:
-                whiteout_hint = f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
+                whiteout_hint = f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `--masked-comp-path` + `--whiteout-json`。"
             else:
                 whiteout_hint = "用 `read_file` 目视 `compImage`：仅出现真人清晰正面五官且未遮罩时才跑 `scripts/whiteout_mask.py`；否则直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）。"
             prebuild_section = (
@@ -493,10 +520,8 @@ def _build_worker_prompt(
                 "- 深度捕捉：**正常生成模式已跳过**（严禁上传原片或触发 Chrome 深度捕捉）。\n"
                 f"- 涂白判断：{whiteout_hint}\n"
                 f"{dur_rule_line}"
-                "- 建样片与只读报价内联命令模板：\n"
-                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode {video_mode_flag} --ratio 21:9 --resolution 480p --duration {dur_cli_token} --count 1 --x {gen_x} --y {row_y} --prompt \"{prompt_bind_tip}\"{refs_suffix}`（**严禁传 `--run`**）\n"
-                f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
-                f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
+                f"- 写完 `outputs/{shot.get('id')}_提示词.md` 后，**仅需 1 条命令**原子完成「建样片节点（不含 `--run`）+ 只读报价 + 回写 `ready_on_canvas`」：\n"
+                f"  `{py_bin} {commit_script} --shot-id {shot.get('id')} --claim-token {shot.get('claimToken')} --project-id {pid} --prompt-file outputs/{shot.get('id')}_提示词.md --mode {video_mode_flag} --duration {dur_cli_token} --x {gen_x} --y {row_y}{refs_suffix} --base-url {base_url} --revision-direction \"<一句话说明创作思路>\"`\n\n"
             )
         else:
             if not has_src_video:
@@ -511,7 +536,7 @@ def _build_worker_prompt(
                 )
             whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
             whiteout_hint = (
-                f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
+                f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `--masked-comp-path` + `--whiteout-json`。"
                 if whiteout_req
                 else "用 `read_file` 目视 `compImage`：仅出现真人清晰正面五官且未遮罩时才跑 `scripts/whiteout_mask.py`；否则直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）。"
             )
@@ -531,10 +556,8 @@ def _build_worker_prompt(
                 f"- 深度捕捉：{depth_hint}\n"
                 f"- 涂白判断：{whiteout_hint}\n"
                 f"{dur_rule_line}"
-                "- 建样片与只读报价内联命令模板（若更换涂白图请替换第一个 `--ref node:`）：\n"
-                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode m2v --ratio 21:9 --resolution 480p --duration {dur_cli_token} --count 1 --x 3620 --y {row_y} --prompt \"<写好的提示词，含 {{node:...}} 绑定>\" {refs_hint_nonempty}`（**严禁传 `--run`**）\n"
-                f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
-                f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
+                f"- 写完 `outputs/{shot.get('id')}_提示词.md` 后，**仅需 1 条命令**原子完成「建样片节点（不含 `--run`）+ 只读报价 + 回写 `ready_on_canvas`」（若更换涂白图请替换第一个 `--ref node:` 并加 `--masked-comp-path`/`--whiteout-json`）：\n"
+                f"  `{py_bin} {commit_script} --shot-id {shot.get('id')} --claim-token {shot.get('claimToken')} --project-id {pid} --prompt-file outputs/{shot.get('id')}_提示词.md --mode m2v --duration {dur_cli_token} --x 3620 --y {row_y} {refs_hint_nonempty} --base-url {base_url} --revision-direction \"<一句话说明改编/保留锚点>\"`\n\n"
             )
 
     recreation_skill = _resolve_skill_path("seedance-video-recreation")
@@ -1286,16 +1309,23 @@ class BridgeRuntime:
             if not agy_bin:
                 raise FileNotFoundError("本机未检测到 Antigravity agy CLI（安装 Antigravity 后重试）")
 
+            resume_id = ""
+            if SETTINGS["resumeByShot"] and task_type != "queued":
+                resume_id = self._get_shot_conversation_id(shot)
+
             avail_models = _discover_agy_models(agy_bin)
             if prepped.get("renderFastCompleted"):
                 eff = _normalize_effort(SETTINGS.get("fastEffort", "low"), default="low")
                 model = SETTINGS["fastModel"] or _pick_hydrogen_model(eff, avail_models)
                 effort = _resolve_compatible_effort(model, eff)
             else:
-                model, effort = _select_execution_profile(task_type, avail_models, SETTINGS)
-            resume_id = ""
-            if SETTINGS["resumeByShot"] and task_type != "queued":
-                resume_id = self._get_shot_conversation_id(shot)
+                model, effort = _select_execution_profile(
+                    task_type,
+                    avail_models,
+                    SETTINGS,
+                    shot=shot,
+                    is_resume=bool(resume_id),
+                )
 
             _log(f"{shot_id} dispatch profile model={model or 'default'} effort={effort} resume={resume_id or 'new'}")
             self._update_worker(
@@ -1417,8 +1447,11 @@ class BridgeRuntime:
                 _log(f"worker finished shot={shot_id} conv={conv_id}")
 
     def run_forever(self) -> int:
-        if not find_agy_bin():
+        agy_bin_init = find_agy_bin()
+        if not agy_bin_init:
             _log("WARNING: Antigravity agy CLI not found; waiting in standby")
+        else:
+            threading.Thread(target=_discover_agy_models, args=(agy_bin_init,), daemon=True).start()
 
         pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="agy-worker")
 
@@ -1426,7 +1459,7 @@ class BridgeRuntime:
             with httpx.Client(base_url=self.base_url, timeout=8.0) as hb_client:
                 while not _STOP_EVENT.is_set():
                     self._send_heartbeat(hb_client)
-                    _STOP_EVENT.wait(2.0 if self.active_ids() else 5.0)
+                    _STOP_EVENT.wait(3.0 if self.active_ids() else 10.0)
 
         hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         hb_thread.start()
@@ -1500,12 +1533,12 @@ class BridgeRuntime:
                             "/api/events/wait",
                             params={
                                 "since": since_seq,
-                                "timeout": 2.0,
+                                "timeout": 10.0,
                                 "actionable": "true",
                                 "watcher": "agy_bridge",
                                 "mode": "bridge",
                             },
-                            timeout=6.0,
+                            timeout=14.0,
                         )
                         if wait_resp.status_code == 200:
                             since_seq = int(wait_resp.json().get("eventSeq", since_seq))

@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import warnings
@@ -402,14 +403,41 @@ def _list_all_dreamina_items(project_uuid: str, max_pages: int = 12) -> list[dic
     return nodes_summary
 
 
+_LAYOUT_CACHE_LOCK = threading.Lock()
+_CANVAS_LAYOUT_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def _cache_canvas_nodes(project_uuid: str, nodes: list[dict[str, Any]]) -> None:
+    if not project_uuid or not nodes:
+        return
+    with _LAYOUT_CACHE_LOCK:
+        bucket = _CANVAS_LAYOUT_CACHE.setdefault(project_uuid, {})
+        for node in nodes:
+            if isinstance(node, dict) and node.get("nodeId"):
+                bucket[str(node["nodeId"])] = node
+
+
 def _compute_canvas_layouts(
     project_uuid: str,
     nodes_summary: list[dict[str, Any]],
+    *,
+    force_refresh_ids: set[str] | None = None,
 ) -> tuple[float, dict[str, dict[str, Any]]]:
     all_ids = [str(n.get("nodeId") or "").strip() for n in nodes_summary if n.get("nodeId")]
-    batches = [all_ids[i : i + 20] for i in range(0, len(all_ids), 20)]
+    force_ids = force_refresh_ids or set()
+    with _LAYOUT_CACHE_LOCK:
+        cached_bucket = dict(_CANVAS_LAYOUT_CACHE.get(project_uuid) or {})
+
+    missing_ids = [
+        nid
+        for nid in all_ids
+        if nid in force_ids or nid not in cached_bucket
+    ]
+    batches = [missing_ids[i : i + 20] for i in range(0, len(missing_ids), 20)]
     nodes_by_id: dict[str, dict[str, Any]] = {}
-    max_bottom = 0.0
+    for nid in all_ids:
+        if nid in cached_bucket and nid not in force_ids:
+            nodes_by_id[nid] = cached_bucket[nid]
 
     def _fetch_batch(chunk: list[str]) -> list[dict[str, Any]]:
         cmd = ["node", "show", "--project-id", project_uuid]
@@ -424,16 +452,21 @@ def _compute_canvas_layouts(
         return out_nodes
 
     if batches:
+        fetched_all: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
             for batch_nodes in pool.map(_fetch_batch, batches):
+                fetched_all.extend(batch_nodes)
                 for node in batch_nodes:
-                    nid = str(node.get("nodeId") or "")
-                    nodes_by_id[nid] = node
-                    lay = node.get("layout")
-                    if isinstance(lay, dict):
-                        y_val = float(lay.get("y") or 0.0)
-                        h_val = float(lay.get("height") or 320.0)
-                        max_bottom = max(max_bottom, y_val + h_val)
+                    nodes_by_id[str(node.get("nodeId") or "")] = node
+        _cache_canvas_nodes(project_uuid, fetched_all)
+
+    max_bottom = 0.0
+    for node in nodes_by_id.values():
+        lay = node.get("layout")
+        if isinstance(lay, dict):
+            y_val = float(lay.get("y") or 0.0)
+            h_val = float(lay.get("height") or 320.0)
+            max_bottom = max(max_bottom, y_val + h_val)
     return max_bottom, nodes_by_id
 
 
@@ -717,6 +750,8 @@ def inspect_dreamina_canvas_context(
                 comp_node_id = _create_canvas_media_node(
                     project_uuid, "image", f"{shot_id}-构图图", comp_res_id, 800, suggested_y
                 )
+                if comp_node_id:
+                    _cache_canvas_nodes(project_uuid, [{"nodeId": comp_node_id, "layout": {"x": 800, "y": suggested_y, "height": 320}}])
             except Exception as exc:
                 warnings_list.append(f"create comp node failed: {exc}")
 
@@ -738,6 +773,8 @@ def inspect_dreamina_canvas_context(
                     spec["nodeId"] = _create_canvas_media_node(
                         project_uuid, "image", spec["title"], crid, 800, cy
                     )
+                    if spec["nodeId"]:
+                        _cache_canvas_nodes(project_uuid, [{"nodeId": spec["nodeId"], "layout": {"x": 800, "y": cy, "height": 320}}])
                     spec["x"] = 800
                     spec["y"] = cy
                 except Exception as exc:
@@ -752,6 +789,8 @@ def inspect_dreamina_canvas_context(
                 source_node_id = _create_canvas_media_node(
                     project_uuid, "video", f"{shot_id}-原片", source_res_id, 1760, suggested_y
                 )
+                if source_node_id:
+                    _cache_canvas_nodes(project_uuid, [{"nodeId": source_node_id, "layout": {"x": 1760, "y": suggested_y, "height": 320}}])
             except Exception as exc:
                 warnings_list.append(f"create source node failed: {exc}")
 
@@ -781,31 +820,32 @@ def inspect_dreamina_canvas_context(
 
     # Release layout lock FIRST before attempting Chrome CDP `chrome_ui` lock (prevents lock ordering deadlock)
     source_node_id = str(result.get("preuploadedSourceNodeId") or jm.get("sourceNodeId") or "").strip()
-    ddc = _load_dreamina_depth_cdp()
-    if trigger_depth and not is_creation and source_node_id and ddc is not None:
-        try:
-            existing_depth = ddc.find_existing_depth_node(project_uuid, shot_id, source_node_id, items=nodes_summary or None)
-            if existing_depth and existing_depth.get("nodeId"):
-                result["pretriggeredDepthNodeId"] = str(existing_depth["nodeId"])
-                result["depthTriggerStatus"] = "already_existed"
-            elif preupload_source:
-                cdp_res = ddc.trigger_dreamina_depth_capture(
-                    project_uuid,
-                    shot_id,
-                    source_node_id,
-                    canvas_url=str(shot.get("canvasUrl") or jm.get("canvasUrl") or ""),
-                    base_url=base_url,
-                    existing_items=nodes_summary or None,
-                )
-                if cdp_res.get("ok") and cdp_res.get("depthNodeId"):
-                    result["pretriggeredDepthNodeId"] = str(cdp_res["depthNodeId"])
-                    result["depthTriggerStatus"] = "already_existed" if cdp_res.get("alreadyExisted") else "triggered_cdp"
-                else:
-                    result["depthTriggerStatus"] = "fallback_needed"
-                    result["depthTriggerReason"] = str(cdp_res.get("reason") or "unknown")
-        except Exception as dexc:
-            result["depthTriggerStatus"] = "fallback_needed"
-            result["depthTriggerReason"] = str(dexc)
+    if trigger_depth and not is_creation and source_node_id:
+        ddc = _load_dreamina_depth_cdp()
+        if ddc is not None:
+            try:
+                existing_depth = ddc.find_existing_depth_node(project_uuid, shot_id, source_node_id, items=nodes_summary or None)
+                if existing_depth and existing_depth.get("nodeId"):
+                    result["pretriggeredDepthNodeId"] = str(existing_depth["nodeId"])
+                    result["depthTriggerStatus"] = "already_existed"
+                elif preupload_source:
+                    cdp_res = ddc.trigger_dreamina_depth_capture(
+                        project_uuid,
+                        shot_id,
+                        source_node_id,
+                        canvas_url=str(shot.get("canvasUrl") or jm.get("canvasUrl") or ""),
+                        base_url=base_url,
+                        existing_items=nodes_summary or None,
+                    )
+                    if cdp_res.get("ok") and cdp_res.get("depthNodeId"):
+                        result["pretriggeredDepthNodeId"] = str(cdp_res["depthNodeId"])
+                        result["depthTriggerStatus"] = "already_existed" if cdp_res.get("alreadyExisted") else "triggered_cdp"
+                    else:
+                        result["depthTriggerStatus"] = "fallback_needed"
+                        result["depthTriggerReason"] = str(cdp_res.get("reason") or "unknown")
+            except Exception as dexc:
+                result["depthTriggerStatus"] = "fallback_needed"
+                result["depthTriggerReason"] = str(dexc)
 
     has_source = bool(str((shot.get("sourceVideo") or {}).get("filePath") or "").strip()) and not is_creation
     has_comp = comp_path.is_file()
@@ -859,31 +899,42 @@ def prepare_shot_artifacts(
     if target_dur is not None:
         out["targetDuration"] = target_dur
 
-    src_fp = str((shot.get("sourceVideo") or {}).get("filePath") or "").strip()
-    if src_fp and work_mode != "video_creation":
-        src_path = Path(src_fp)
-        kf_path = render_source_keyframes(src_path, shot_dir / "source_keyframes.jpg")
-        if kf_path is not None:
-            out["sourceKeyframesPath"] = str(kf_path)
-        audio_info = analyze_source_audio(
-            src_path,
-            shot_dir / "source_audio_summary.json",
-            out_wav=shot_dir / "source_audio.wav",
-        )
-        out["sourceAudioSummary"] = audio_info
-        if audio_info.get("audioFilePath"):
-            out["sourceAudioPath"] = audio_info["audioFilePath"]
-
     task_type = str(shot.get("processingTaskType") or shot.get("status") or "")
-    if str(shot.get("platform") or "").lower() == "jimeng" and task_type in {"queued", "recheck_requested"}:
-        out.update(
-            inspect_dreamina_canvas_context(
+    need_canvas = str(shot.get("platform") or "").lower() == "jimeng" and task_type in {"queued", "recheck_requested"}
+    src_fp = str((shot.get("sourceVideo") or {}).get("filePath") or "").strip()
+    need_video_prep = bool(src_fp and work_mode != "video_creation")
+
+    src_path = Path(src_fp) if need_video_prep else None
+    futures: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=3) as prep_pool:
+        if need_video_prep and src_path is not None:
+            futures["kf"] = prep_pool.submit(render_source_keyframes, src_path, shot_dir / "source_keyframes.jpg")
+            futures["aud"] = prep_pool.submit(
+                analyze_source_audio,
+                src_path,
+                shot_dir / "source_audio_summary.json",
+                shot_dir / "source_audio.wav",
+            )
+        if need_canvas:
+            futures["ctx"] = prep_pool.submit(
+                inspect_dreamina_canvas_context,
                 shot,
                 base_url=base_url,
                 preupload_source=preupload_source and (task_type == "queued"),
                 trigger_depth=(work_mode != "video_creation"),
             )
-        )
+
+    if "kf" in futures:
+        kf_path = futures["kf"].result()
+        if kf_path is not None:
+            out["sourceKeyframesPath"] = str(kf_path)
+    if "aud" in futures:
+        audio_info = futures["aud"].result()
+        out["sourceAudioSummary"] = audio_info
+        if audio_info.get("audioFilePath"):
+            out["sourceAudioPath"] = audio_info["audioFilePath"]
+    if "ctx" in futures:
+        out.update(futures["ctx"].result())
     return out
 
 

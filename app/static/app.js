@@ -6328,6 +6328,10 @@ function renderActiveView() {
 
 async function refreshState({ preserveEditing = false } = {}) {
   const prevSeq = state.eventSeq;
+  const prevDetailSnap =
+    preserveEditing && state.view === "detail" && state.selectedShotId
+      ? JSON.stringify((state.data?.shots || []).find((s) => s.id === state.selectedShotId) || null)
+      : "";
   state.data = await apiJson("/api/state");
   state.eventSeq = state.data.eventSeq || prevSeq;
   if (!state.builder.shotIdTouched && document.activeElement?.id !== "builderShotId") {
@@ -6347,6 +6351,14 @@ async function refreshState({ preserveEditing = false } = {}) {
   }
   if (preserveEditing && (state.view === "builder" || isUserActivelyEditing())) {
     return;
+  }
+  if (preserveEditing && state.view === "detail" && state.selectedShotId && prevDetailSnap) {
+    const nextDetailSnap = JSON.stringify(
+      (state.data?.shots || []).find((s) => s.id === state.selectedShotId) || null
+    );
+    if (nextDetailSnap === prevDetailSnap) {
+      return;
+    }
   }
   if (state.view === "builder") renderBuilderView();
   else renderDetailView();
