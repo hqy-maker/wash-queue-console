@@ -90,6 +90,22 @@ def _parse_credit_ceiling(raw: Any, default: int = 0) -> int:
 DEFAULT_JIMENG_CREDIT_CEILING = _parse_credit_ceiling(os.environ.get("WASH_JIMENG_CREDIT_CEILING"), default=0)
 
 
+def _parse_bool_flag(raw: Any, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return default
+    clean = str(raw).strip().lower()
+    if clean in {"1", "true", "yes", "on"}:
+        return True
+    if clean in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+DEFAULT_AUTO_QA_AFTER_RENDER = _parse_bool_flag(os.environ.get("WASH_AUTO_QA_AFTER_RENDER"), default=False)
+
+
 def normalize_platform(raw: str | None) -> str:
     clean = (raw or "").strip().lower()
     if clean in {"jimeng", "dreamina", "即梦", "即梦官网"}:
@@ -1216,6 +1232,23 @@ class QueueStore:
             return q
 
     @staticmethod
+    def _get_auto_qa_after_render(q: dict[str, Any]) -> bool:
+        if "autoQaAfterRender" in q and q.get("autoQaAfterRender") is not None:
+            return _parse_bool_flag(q.get("autoQaAfterRender"), default=DEFAULT_AUTO_QA_AFTER_RENDER)
+        return DEFAULT_AUTO_QA_AFTER_RENDER
+
+    def set_auto_qa_after_render(self, enabled: bool) -> dict[str, Any]:
+        clean_val = bool(enabled)
+        with self._lock:
+            q = self._load_queue()
+            q["autoQaAfterRender"] = clean_val
+            self._save_queue(
+                q,
+                {"type": "auto_qa_after_render_changed", "autoQaAfterRender": clean_val},
+            )
+            return q
+
+    @staticmethod
     def _decorate_shot(q: dict[str, Any], shot: dict[str, Any]) -> dict[str, Any]:
         return _decorate_shot_payload(shot, export_config=_extract_export_config(q))
 
@@ -1334,6 +1367,7 @@ class QueueStore:
                 "sceneExportDirs": export_cfg["sceneExportDirs"],
                 "autoSyncExport": export_cfg["autoSyncExport"],
                 "jimengCreditCeiling": self._get_jimeng_credit_ceiling(q),
+                "autoQaAfterRender": self._get_auto_qa_after_render(q),
                 "eventSeq": q.get("eventSeq", 1),
                 "events": q.get("events", [])[-20:],
                 "scenes": q.get("scenes", []),
@@ -2914,10 +2948,12 @@ class QueueStore:
             ][:max_items]
             digest = self._build_digest(targets)
             ceiling = self._get_jimeng_credit_ceiling(q)
+            auto_qa = self._get_auto_qa_after_render(q)
             claimed = []
             for s in targets:
                 c = self._claim_shot_obj(s, worker_id)
                 c["jimengCreditCeiling"] = ceiling
+                c["autoQaAfterRender"] = auto_qa
                 claimed.append(c)
             if claimed:
                 clean_worker = (worker_id or "coordinator").strip()[:80] or "coordinator"
@@ -2938,6 +2974,7 @@ class QueueStore:
                 "defaultProjectName": q.get("defaultProjectName", DEFAULT_PROJECT_NAME),
                 "defaultWorkspaceId": q.get("defaultWorkspaceId", DEFAULT_WORKSPACE_ID),
                 "jimengCreditCeiling": ceiling,
+                "autoQaAfterRender": auto_qa,
                 "claimedCount": len(claimed),
                 "remainingPendingCount": remaining_pending,
                 "processingCount": len(processing_ids),
@@ -2951,6 +2988,7 @@ class QueueStore:
         with self._lock:
             q = self._load_queue()
             ceiling = self._get_jimeng_credit_ceiling(q)
+            auto_qa = self._get_auto_qa_after_render(q)
             for shot in q["shots"]:
                 if shot["id"] != sid:
                     continue
@@ -2960,6 +2998,7 @@ class QueueStore:
                     )
                 claimed_copy = self._claim_shot_obj(shot, worker_id)
                 claimed_copy["jimengCreditCeiling"] = ceiling
+                claimed_copy["autoQaAfterRender"] = auto_qa
                 self._save_queue(
                     q,
                     {

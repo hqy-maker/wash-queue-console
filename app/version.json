@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.12",
+  "version": "2026.11.16.13",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T22:47:34+08:00",
-  "changelog": "修复 Dreamina node show 单批 25 节点超限问题（改为 20 节点并发批查），实测 114 节点画布秒级精准算出行高",
+  "publishedAt": "2026-11-16T23:12:37+08:00",
+  "changelog": "上线即梦 run_requested/final_requested 全确定性 Python 直出与 1080P 自动导出、出片后AI看片开关（默认极速直出）、以及 queued Fast-Path 精简提示词",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

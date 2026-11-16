@@ -926,6 +926,10 @@ class JimengCreditCeilingReq(BaseModel):
     creditCeiling: int = 0
 
 
+class AutoQaConfigReq(BaseModel):
+    autoQaAfterRender: bool = False
+
+
 class AgentUpdateReq(BaseModel):
     status: str | None = None
     platform: str | None = None
@@ -1365,6 +1369,12 @@ def start_jimeng_auth_login() -> dict[str, Any]:
 def set_jimeng_credit_ceiling(req: JimengCreditCeilingReq) -> dict[str, Any]:
     updated = store.set_jimeng_credit_ceiling(req.creditCeiling)
     return {"ok": True, "jimengCreditCeiling": int(updated.get("jimengCreditCeiling", 0))}
+
+
+@app.post("/api/config/auto-qa")
+def set_auto_qa_config(req: AutoQaConfigReq) -> dict[str, Any]:
+    updated = store.set_auto_qa_after_render(req.autoQaAfterRender)
+    return {"ok": True, "autoQaAfterRender": bool(updated.get("autoQaAfterRender", False))}
 
 
 @app.post("/api/config/default-project")

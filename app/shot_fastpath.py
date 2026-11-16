@@ -11,6 +11,7 @@ Design goals:
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import math
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 import warnings
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +39,14 @@ with warnings.catch_warnings():
 import httpx
 
 import jimeng_bridge
-from store import DATA_ROOT, SHOTS_DIR, get_platform_label, resolve_cli_conversation_id, safe_prompt_update_prev_status
+from store import (
+    DATA_ROOT,
+    SHOTS_DIR,
+    get_platform_label,
+    resolve_cli_conversation_id,
+    run_preflight,
+    safe_prompt_update_prev_status,
+)
 
 # Optional heavy media imports (PyAV + Pillow already live in .venv/runtime)
 try:
@@ -983,6 +992,627 @@ def try_fastpath_prompt_update(
         return {"handled": True, "summary": f"fastpath synced {sample_node_id} (draftVersion={draft_ver})"}
     except Exception as exc:
         return {"handled": False, "reason": f"fastpath_fallback: {exc}"}
+
+
+def _run_dreamina_json_raw(args: list[str], timeout: int = 45) -> tuple[int, dict[str, Any], str]:
+    proc = jimeng_bridge._run_dreamina(args, timeout=timeout)
+    payload = jimeng_bridge._extract_json(proc)
+    raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    return proc.returncode, payload, raw
+
+
+def _post_agent_update(base_url: str, shot_id: str, body: dict[str, Any], timeout: float = 15.0) -> str:
+    with httpx.Client(base_url=base_url, timeout=timeout) as client:
+        resp = client.post(f"/api/shots/{shot_id}/agent-update", json=body)
+        if resp.status_code == 409:
+            return "conflict"
+        resp.raise_for_status()
+        return "ok"
+
+
+def _claim_still_valid(base_url: str, shot_id: str, claim_token: str) -> bool:
+    if not base_url or not claim_token:
+        return True
+    try:
+        with httpx.Client(base_url=base_url, timeout=8.0) as client:
+            r = client.get(f"/api/shots/{shot_id}")
+            if r.status_code != 200:
+                return True
+            shot = r.json().get("shot") or {}
+            return shot.get("status") == "processing" and str(shot.get("claimToken") or "") == claim_token
+    except Exception:
+        return True
+
+
+def _extract_resource_id_from_op(data: dict[str, Any]) -> tuple[str, str]:
+    """Return `(resource_id, terminal_error)` from `operation wait` payload if terminal."""
+    sub_err = data.get("submissionError") if isinstance(data.get("submissionError"), dict) else None
+    if sub_err and sub_err.get("message"):
+        return "", str(sub_err.get("message"))
+    resources = [r for r in (data.get("resources") or []) if isinstance(r, dict)]
+    for res in resources:
+        st = str(res.get("state") or "").lower()
+        if st in {"failed", "error", "rejected"}:
+            msg = str(res.get("message") or "").strip()
+            if not msg and isinstance(res.get("diagnostics"), list) and res["diagnostics"]:
+                msg = str((res["diagnostics"][0] or {}).get("detail") or "")
+            return "", msg or "即梦云端生成失败"
+    for res in resources:
+        rid = str(res.get("resourceId") or "").strip()
+        st = str(res.get("state") or "").lower()
+        if rid and st in {"success", "succeeded", "completed", ""}:
+            return rid, ""
+    top_rid = str(data.get("resourceId") or "").strip()
+    top_state = str(data.get("state") or "").lower()
+    if top_state in {"failed", "error", "rejected"}:
+        return "", str(data.get("reason") or "即梦云端生成失败")
+    if top_rid and top_state in {"success", "succeeded", "completed", ""}:
+        return top_rid, ""
+    return "", ""
+
+
+def _wait_dreamina_operation_resource(
+    project_uuid: str,
+    submit_id: str,
+    *,
+    target_node_id: str = "",
+    prev_resource_id: str = "",
+    base_url: str = "",
+    shot_id: str = "",
+    claim_token: str = "",
+    max_wait_sec: int = 720,
+    check_cancelled: Any = None,
+) -> tuple[str, str, str]:
+    """Wait in cancellable 75s chunks; returns `(status, resource_id, error_msg)` where status in ok/failed/conflict/timeout."""
+    deadline = time.monotonic() + max_wait_sec
+    while time.monotonic() < deadline:
+        if check_cancelled and check_cancelled():
+            return "conflict", "", "cancelled"
+        if not _claim_still_valid(base_url, shot_id, claim_token):
+            return "conflict", "", "claim_replaced"
+        chunk_sec = max(15, min(75, int(deadline - time.monotonic())))
+        rc, payload, _ = _run_dreamina_json_raw(
+            [
+                "operation",
+                "wait",
+                submit_id,
+                "--project-id",
+                project_uuid,
+                "--timeout",
+                f"{chunk_sec}s",
+                "--interval",
+                "5s",
+            ],
+            timeout=chunk_sec + 25,
+        )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if data:
+            rid, ferr = _extract_resource_id_from_op(data)
+            if ferr:
+                return "failed", "", ferr
+            if rid:
+                return "ok", rid, ""
+        # Check node directly between wait chunks
+        if target_node_id:
+            try:
+                sres = _run_dreamina_json(["node", "show", "--project-id", project_uuid, "--node-id", target_node_id], timeout=20)
+                nodes = (sres.get("data") or {}).get("nodes") or []
+                node = (nodes[0] or {}).get("node") if nodes and isinstance(nodes[0], dict) else None
+                if isinstance(node, dict):
+                    nst = str(node.get("status") or "").lower()
+                    for res in reversed(node.get("resources") or []):
+                        if isinstance(res, dict) and str(res.get("status") or "").lower() == "success":
+                            cand_rid = str(res.get("resourceId") or "").strip()
+                            if cand_rid and cand_rid != prev_resource_id:
+                                return "ok", cand_rid, ""
+                    if nst in {"failed", "error"}:
+                        return "failed", "", f"节点 {target_node_id} 云端生成失败"
+            except Exception:
+                pass
+        if rc not in {0, 20}:
+            time.sleep(3.0)
+    return "timeout", "", f"等待即梦云端生成超时（超过 {max_wait_sec}s）"
+
+
+def _download_dreamina_mp4(project_uuid: str, resource_id: str, dest_path: Path) -> tuple[dict[str, Any], str, int]:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.parent / f".tmp_{dest_path.stem}_{uuid.uuid4().hex[:8]}.mp4"
+    try:
+        _run_dreamina_json(
+            ["resource", "download", resource_id, "--project-id", project_uuid, "-o", str(tmp_path)],
+            timeout=180,
+        )
+        if not tmp_path.is_file() or tmp_path.stat().st_size < 10000:
+            raise RuntimeError(f"下载视频文件异常或过小: {tmp_path}")
+        os.replace(tmp_path, dest_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    meta = run_preflight(dest_path)
+    raw_bytes = dest_path.read_bytes()
+    sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    return meta, sha256, len(raw_bytes)
+
+
+def try_fastpath_jimeng_run(
+    shot: dict[str, Any],
+    *,
+    base_url: str,
+    workspace_root: Path,
+    progress_cb: Any = None,
+    check_cancelled: Any = None,
+) -> dict[str, Any]:
+    """Deterministically execute `run_requested` on Dreamina (quote -> confirm -> run -> wait -> download -> preflight)."""
+    sid = str(shot.get("id") or "").strip()
+    claim_token = str(shot.get("claimToken") or "").strip()
+    platform = str(shot.get("platform") or "libtv").strip().lower()
+    if platform != "jimeng":
+        return {"handled": False, "reason": "non_jimeng_platform"}
+    if not jimeng_bridge.get_auth_status().get("authenticated"):
+        return {"handled": False, "reason": "jimeng_not_authenticated"}
+
+    jm = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
+    project_uuid = str(shot.get("projectUuid") or jm.get("projectId") or "").strip()
+    sample_node_id = str(jm.get("sampleNodeId") or jm.get("nodeId") or shot.get("libtvSampleNodeKey") or "").strip()
+    credit_ceiling = int(shot.get("jimengCreditCeiling") or 0)
+    auto_qa = bool(shot.get("autoQaAfterRender"))
+
+    if not project_uuid or not sample_node_id.startswith("node_"):
+        return {"handled": False, "reason": "missing_project_or_sample_node"}
+
+    def _note(phase: str, msg: str) -> None:
+        if progress_cb:
+            progress_cb(phase, msg)
+
+    # Sync pending manual prompt edits first if present cleanly
+    pending_edit = str(shot.get("pendingPromptEdit") or "").strip()
+    if pending_edit:
+        if _UNRESOLVED_AT_RE.search(pending_edit):
+            return {"handled": False, "reason": "pending_prompt_has_unresolved_at_mentions"}
+        sync_copy = dict(shot)
+        sync_copy["promptText"] = pending_edit
+        # Reuse node edit verification cleanly without finalizing status yet
+        try:
+            show_res = _run_dreamina_json(["node", "show", "--project-id", project_uuid, "--node-id", sample_node_id], timeout=25)
+            nodes = (show_res.get("data") or {}).get("nodes") or []
+            node = (nodes[0] or {}).get("node") if nodes and isinstance(nodes[0], dict) else None
+            if not isinstance(node, dict):
+                return {"handled": False, "reason": "sample_node_not_found"}
+            gen = node.get("generation") if isinstance(node.get("generation"), dict) else {}
+            refs = [r for r in (gen.get("references") or []) if isinstance(r, dict) and r.get("id")]
+            existing_node_ids = {str(r.get("id") or "") for r in refs if r.get("kind") == "node"}
+            if not set(_NODE_TAG_RE.findall(pending_edit)).issubset(existing_node_ids):
+                return {"handled": False, "reason": "pending_prompt_references_new_node"}
+            cmd = ["node", "edit", "video", "--project-id", project_uuid, "--node-id", sample_node_id, "--mode", str(gen.get("mode") or jm.get("mode") or "m2v"), "--prompt", pending_edit]
+            for flag, val in (("--model", gen.get("model") or jm.get("model")), ("--ratio", gen.get("ratio") or jm.get("ratio")), ("--resolution", gen.get("resolution") or jm.get("resolution"))):
+                if val:
+                    cmd.extend([flag, str(val)])
+            dur = gen.get("durationSeconds") or jm.get("duration")
+            if dur:
+                cmd.extend(["--duration", str(int(round(float(dur))))])
+            if int(gen.get("outputCount") or 1) > 0:
+                cmd.extend(["--count", str(int(gen.get("outputCount") or 1))])
+            for ref in refs:
+                cmd.extend(["--ref", f"{'res' if ref.get('kind') == 'resource' else 'node'}:{ref['id']}"])
+            _run_dreamina_json(cmd, timeout=35)
+            cur_prompt_file = str(shot.get("promptFilePath") or "").strip()
+            md_path = Path(cur_prompt_file) if cur_prompt_file else (workspace_root / "outputs" / f"{sid}_提示词.md")
+            _sync_prompt_markdown(md_path, sid, pending_edit, get_platform_label(platform))
+        except Exception as exc:
+            return {"handled": False, "reason": f"prompt_sync_fallback: {exc}"}
+
+    try:
+        _note("核对即梦报价", f"正在核对 {sample_node_id} 实时积分报价…")
+        q_res = _run_dreamina_json(["node", "quote", "--project-id", project_uuid, "--node-id", sample_node_id], timeout=25)
+        q_data = q_res.get("data") or {}
+        quoted_cost = q_data.get("totalMaxCredits")
+        if quoted_cost is None and isinstance(q_data.get("items"), list) and q_data["items"]:
+            quoted_cost = (q_data["items"][0] or {}).get("maxCredits")
+        conf_required = bool(q_data.get("confirmationRequired"))
+        draft_ver = q_data.get("draftVersion")
+
+        if conf_required and (credit_ceiling <= 0 or quoted_cost is None or int(quoted_cost) > credit_ceiling):
+            return {"handled": False, "reason": f"quote_requires_manual_confirm (cost={quoted_cost}, ceiling={credit_ceiling})"}
+
+        # Check whether recovering an unsubmitted awaiting_user confirmation submitId
+        submit_id = ""
+        if (
+            jm.get("pendingAction") in {"run_sample", "node_run", ""}
+            and jm.get("submitId")
+            and not jm.get("selectedResourceId")
+            and jm.get("confirmationState") in {"awaiting_user", "needs_confirmation", "submitted"}
+        ):
+            submit_id = str(jm["submitId"]).strip()
+        if not submit_id:
+            submit_id = str(uuid.uuid4())
+
+        credit_token = ""
+        if conf_required:
+            _note("自动确认积分", f"报价 {quoted_cost} <= {credit_ceiling} 上限，自动确认额度…")
+            conf_res = _run_dreamina_json(
+                [
+                    "node",
+                    "confirm",
+                    "--project-id",
+                    project_uuid,
+                    "--node-id",
+                    sample_node_id,
+                    "--credit-ceiling",
+                    str(credit_ceiling),
+                ],
+                timeout=25,
+            )
+            credit_token = str((conf_res.get("data") or {}).get("creditConfirmationToken") or "").strip()
+            if not credit_token:
+                return {"handled": False, "reason": "confirm_returned_empty_token"}
+
+        run_cmd = [
+            "node",
+            "run",
+            "--project-id",
+            project_uuid,
+            "--node-id",
+            sample_node_id,
+            "--submit-id",
+            submit_id,
+        ]
+        if credit_token:
+            run_cmd.extend(["--credit-token", credit_token])
+        else:
+            run_cmd.append("--yes")
+
+        _note("提交云端生成", f"提交 480P 样片生成（submitId: {submit_id[:8]}…）…")
+        rc, rpayload, rraw = _run_dreamina_json_raw(run_cmd, timeout=45)
+        if rc != 0 or not rpayload.get("ok"):
+            return {"handled": False, "reason": f"node_run_fallback rc={rc}: {rraw[:180]}"}
+    except Exception as exc:
+        return {"handled": False, "reason": f"pre_submit_fallback: {exc}"}
+
+    # Submitted successfully on Dreamina! Never fall back to re-submitting blindly from here onward.
+    mid_meta: dict[str, Any] = {
+        "submitId": submit_id,
+        "operationRef": submit_id,
+        "pendingAction": "node_run",
+        "confirmationState": "submitted",
+        "selectedResourceId": "",
+    }
+    if quoted_cost is not None:
+        mid_meta["quotedCredits"] = quoted_cost
+        mid_meta["quotedMaxCredits"] = quoted_cost
+        mid_meta["minimumCreditCeiling"] = quoted_cost
+    if draft_ver is not None:
+        mid_meta["draftVersion"] = draft_ver
+    st_upd = _post_agent_update(
+        base_url,
+        sid,
+        {
+            "claimToken": claim_token,
+            "status": "processing",
+            "jimengMeta": mid_meta,
+            "agentSummary": f"⚡ 快速通道已按 {credit_ceiling} 上限自动确认（报价 {quoted_cost or '-'} 积分）并提交 480P 生成，等待云端出片…",
+        },
+    )
+    if st_upd == "conflict":
+        return {"handled": True, "conflict": True, "summary": "409 claimToken conflict"}
+
+    _note("等待 480P 出片", f"等待即梦云端出片（submitId: {submit_id[:8]}…）…")
+    prev_res_id = str(jm.get("downloadedResourceId") or jm.get("selectedResourceId") or "").strip()
+    wstatus, res_id, werr = _wait_dreamina_operation_resource(
+        project_uuid,
+        submit_id,
+        target_node_id=sample_node_id,
+        prev_resource_id=prev_res_id,
+        base_url=base_url,
+        shot_id=sid,
+        claim_token=claim_token,
+        max_wait_sec=720,
+        check_cancelled=check_cancelled,
+    )
+    if wstatus == "conflict":
+        return {"handled": True, "conflict": True, "summary": werr}
+    if wstatus != "ok" or not res_id:
+        _post_agent_update(
+            base_url,
+            sid,
+            {
+                "claimToken": claim_token,
+                "status": "error",
+                "errorReason": werr or "等待即梦 480P 生成失败",
+                "errorDetail": werr,
+                "agentSummary": f"480P 样片生成异常：{werr}",
+            },
+        )
+        return {"handled": True, "summary": f"failed after submit: {werr}"}
+
+    _note("下载 480P 样片", f"已出片（{res_id[:8]}…），正在下载到本地…")
+    draft_path = SHOTS_DIR / sid / "draft_480p.mp4"
+    try:
+        meta, sha256, byte_len = _download_dreamina_mp4(project_uuid, res_id, draft_path)
+    except Exception as exc:
+        _post_agent_update(
+            base_url,
+            sid,
+            {
+                "claimToken": claim_token,
+                "status": "error",
+                "errorReason": f"下载 480P 样片失败：{exc}",
+                "errorDetail": str(exc),
+                "agentSummary": f"480P 已生成但下载失败：{exc}",
+            },
+        )
+        return {"handled": True, "summary": f"download failed: {exc}"}
+
+    w = int(meta.get("width") or 0)
+    h = int(meta.get("height") or 0)
+    dur = float(meta.get("durationSec") or 0.0)
+    done_meta = {
+        "submitId": submit_id,
+        "operationRef": submit_id,
+        "selectedResourceId": res_id,
+        "downloadedResourceId": res_id,
+        "pendingAction": "",
+        "confirmationState": "completed",
+        "retentionNotice": "样片最长存储 7 天，过期后不可再生成正片",
+    }
+    if quoted_cost is not None:
+        done_meta["quotedCredits"] = quoted_cost
+        done_meta["quotedMaxCredits"] = quoted_cost
+
+    draft_vid_obj = {
+        "filePath": str(draft_path),
+        "mediaUrl": f"/media/shots/{sid}/draft_480p.mp4",
+        "remoteUrl": "",
+        "watermark": False,
+        "resourceId": res_id,
+        "sha256": sha256,
+        "bytes": byte_len,
+        "width": w,
+        "height": h,
+        "durationSec": dur,
+    }
+
+    if not auto_qa:
+        summary_msg = (
+            f"⚡ 快速通道已完成 480P 样片生成与下载（{w}×{h}，{dur:.1f}s，报价 {quoted_cost or '-'} 积分）；"
+            "提醒：即梦样片最长保存 7 天，请在控制台直接看片并在有效期内转 1080P。"
+        )
+        upd_body: dict[str, Any] = {
+            "claimToken": claim_token,
+            "status": "draft_ready",
+            "draftVideo": draft_vid_obj,
+            "jimengMeta": done_meta,
+            "resolveFeedbacks": True,
+            "agentSummary": summary_msg,
+            "revisionSummary": f"Python 快速通道直出 480P 样片（{res_id[:8]}…）",
+        }
+        if pending_edit:
+            upd_body["promptText"] = pending_edit
+            md_path = Path(str(shot.get("promptFilePath") or "").strip() or (workspace_root / "outputs" / f"{sid}_提示词.md"))
+            upd_body["promptFilePath"] = str(md_path)
+        _post_agent_update(base_url, sid, upd_body)
+        return {"handled": True, "summary": f"fastpath 480p draft_ready ({res_id[:8]})"}
+
+    # Auto QA mode: save draft info first and hand off solely the downloaded mp4 to lightweight AI inspection
+    _post_agent_update(
+        base_url,
+        sid,
+        {
+            "claimToken": claim_token,
+            "status": "processing",
+            "draftVideo": draft_vid_obj,
+            "jimengMeta": done_meta,
+            "agentSummary": "480P 样片已下载到本地，正在唤醒轻量 AI 进行视听自检…",
+        },
+    )
+    return {
+        "handled": False,
+        "preppedOverride": {
+            "renderFastCompleted": True,
+            "downloadedVideoPath": str(draft_path),
+            "downloadedResourceId": res_id,
+            "quotedCredits": quoted_cost,
+            "targetFinalStatus": "draft_ready",
+            "videoResolution": f"{w}×{h} ({dur:.1f}s)",
+        },
+        "reason": "auto_qa_after_render_enabled",
+    }
+
+
+def try_fastpath_jimeng_final(
+    shot: dict[str, Any],
+    *,
+    base_url: str,
+    workspace_root: Path,
+    progress_cb: Any = None,
+    check_cancelled: Any = None,
+) -> dict[str, Any]:
+    """Deterministically promote a Dreamina sample video to 1080P and download/export it without LLM overhead."""
+    sid = str(shot.get("id") or "").strip()
+    claim_token = str(shot.get("claimToken") or "").strip()
+    platform = str(shot.get("platform") or "libtv").strip().lower()
+    if platform != "jimeng":
+        return {"handled": False, "reason": "non_jimeng_platform"}
+    if not jimeng_bridge.get_auth_status().get("authenticated"):
+        return {"handled": False, "reason": "jimeng_not_authenticated"}
+
+    jm = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
+    project_uuid = str(shot.get("projectUuid") or jm.get("projectId") or "").strip()
+    sample_node_id = str(jm.get("sampleNodeId") or jm.get("nodeId") or shot.get("libtvSampleNodeKey") or "").strip()
+    credit_ceiling = int(shot.get("jimengCreditCeiling") or 0)
+    auto_qa = bool(shot.get("autoQaAfterRender"))
+
+    if not project_uuid or not sample_node_id.startswith("node_"):
+        return {"handled": False, "reason": "missing_project_or_sample_node"}
+    if credit_ceiling <= 0:
+        return {"handled": False, "reason": "no_auto_credit_ceiling"}
+
+    def _note(phase: str, msg: str) -> None:
+        if progress_cb:
+            progress_cb(phase, msg)
+
+    promote_submit_id = str(uuid.uuid4())
+    try:
+        _note("提交 1080P 转正", f"按 {credit_ceiling} 积分上限提交 {sample_node_id} 转 1080P…")
+        rc, payload, raw = _run_dreamina_json_raw(
+            [
+                "node",
+                "promote",
+                "video-sample",
+                "--project-id",
+                project_uuid,
+                "--node-id",
+                sample_node_id,
+                "--resolution",
+                "1080p",
+                "--title",
+                f"{sid}-正片",
+                "--submit-id",
+                promote_submit_id,
+                "--credit-ceiling",
+                str(credit_ceiling),
+                "--yes",
+            ],
+            timeout=45,
+        )
+        if rc != 0 or not payload.get("ok"):
+            return {"handled": False, "reason": f"promote_fallback rc={rc}: {raw[:180]}"}
+        pdata = payload.get("data") or {}
+        final_nid = str(pdata.get("nodeId") or "").strip()
+        promote_submit_id = str(pdata.get("submitId") or promote_submit_id).strip()
+        quoted_cost = pdata.get("totalMaxCredits") or pdata.get("authorizedCredits")
+    except Exception as exc:
+        return {"handled": False, "reason": f"promote_submit_exc: {exc}"}
+
+    mid_meta = {
+        "promoteSubmitId": promote_submit_id,
+        "pendingAction": "promote_1080p",
+    }
+    if final_nid:
+        mid_meta["finalNodeId"] = final_nid
+    if quoted_cost is not None:
+        mid_meta["promoteQuotedMaxCredits"] = quoted_cost
+    upd_mid: dict[str, Any] = {
+        "claimToken": claim_token,
+        "status": "processing",
+        "jimengMeta": mid_meta,
+        "agentSummary": f"⚡ 快速通道已提交 1080P 转正（节点 {final_nid or '-'}，额度 <= {credit_ceiling} 积分），正在等待云端超清出片…",
+    }
+    if final_nid:
+        upd_mid["libtvFinalNodeKey"] = final_nid
+    if _post_agent_update(base_url, sid, upd_mid) == "conflict":
+        return {"handled": True, "conflict": True, "summary": "409 claimToken conflict"}
+
+    _note("等待 1080P 出片", f"等待即梦 1080P 转正完成（submitId: {promote_submit_id[:8]}…）…")
+    prev_fin_res_id = str(jm.get("finalResourceId") or "").strip()
+    wstatus, final_res_id, werr = _wait_dreamina_operation_resource(
+        project_uuid,
+        promote_submit_id,
+        target_node_id=final_nid,
+        prev_resource_id=prev_fin_res_id,
+        base_url=base_url,
+        shot_id=sid,
+        claim_token=claim_token,
+        max_wait_sec=780,
+        check_cancelled=check_cancelled,
+    )
+    if wstatus == "conflict":
+        return {"handled": True, "conflict": True, "summary": werr}
+    if wstatus != "ok" or not final_res_id:
+        _post_agent_update(
+            base_url,
+            sid,
+            {
+                "claimToken": claim_token,
+                "status": "error",
+                "errorReason": werr or "等待即梦 1080P 转正失败",
+                "errorDetail": werr,
+                "agentSummary": f"1080P 转正失败：{werr}",
+            },
+        )
+        return {"handled": True, "summary": f"promote wait failed: {werr}"}
+
+    _note("下载 1080P 正片", f"正在下载 1080P 正片并同步至本地导出目录…")
+    final_path = SHOTS_DIR / sid / "final_1080p.mp4"
+    try:
+        meta, sha256, byte_len = _download_dreamina_mp4(project_uuid, final_res_id, final_path)
+    except Exception as exc:
+        _post_agent_update(
+            base_url,
+            sid,
+            {
+                "claimToken": claim_token,
+                "status": "error",
+                "errorReason": f"下载 1080P 正片失败：{exc}",
+                "errorDetail": str(exc),
+                "agentSummary": f"1080P 已转出但下载失败：{exc}",
+            },
+        )
+        return {"handled": True, "summary": f"final download failed: {exc}"}
+
+    w = int(meta.get("width") or 0)
+    h = int(meta.get("height") or 0)
+    dur = float(meta.get("durationSec") or 0.0)
+    done_meta = {
+        "finalNodeId": final_nid,
+        "promoteSubmitId": promote_submit_id,
+        "finalResourceId": final_res_id,
+        "pendingAction": "",
+        "confirmationState": "completed",
+    }
+    if quoted_cost is not None:
+        done_meta["promoteQuotedMaxCredits"] = quoted_cost
+
+    final_vid_obj = {
+        "filePath": str(final_path),
+        "mediaUrl": f"/media/shots/{sid}/final_1080p.mp4",
+        "remoteUrl": "",
+        "watermark": False,
+        "resourceId": final_res_id,
+        "sha256": sha256,
+        "bytes": byte_len,
+        "width": w,
+        "height": h,
+        "durationSec": dur,
+    }
+
+    if not auto_qa:
+        done_body: dict[str, Any] = {
+            "claimToken": claim_token,
+            "status": "final_ready",
+            "finalVideo": final_vid_obj,
+            "jimengMeta": done_meta,
+            "agentSummary": f"⚡ 快速通道已完成 1080P 正片转正、下载与导出同步（{w}×{h}，{dur:.1f}s，消耗额度 <= {quoted_cost or credit_ceiling} 积分）。",
+            "revisionSummary": f"Python 快速通道直出 1080P 正片（{final_res_id[:8]}…）",
+        }
+        if final_nid:
+            done_body["libtvFinalNodeKey"] = final_nid
+        _post_agent_update(base_url, sid, done_body)
+        return {"handled": True, "summary": f"fastpath 1080p final_ready ({final_res_id[:8]})"}
+
+    _post_agent_update(
+        base_url,
+        sid,
+        {
+            "claimToken": claim_token,
+            "status": "processing",
+            "finalVideo": final_vid_obj,
+            "jimengMeta": done_meta,
+            "agentSummary": "1080P 正片已下载并同步导出目录，正在唤醒轻量 AI 进行成片核验…",
+        },
+    )
+    return {
+        "handled": False,
+        "preppedOverride": {
+            "renderFastCompleted": True,
+            "downloadedVideoPath": str(final_path),
+            "downloadedResourceId": final_res_id,
+            "finalNodeId": final_nid,
+            "quotedCredits": quoted_cost,
+            "targetFinalStatus": "final_ready",
+            "videoResolution": f"{w}×{h} ({dur:.1f}s)",
+        },
+        "reason": "auto_qa_after_render_enabled",
+    }
 
 
 def find_agy_cli_bin() -> str | None:

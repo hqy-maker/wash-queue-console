@@ -618,6 +618,22 @@ button {
   color: var(--text-secondary);
 }
 
+.jimeng-autoqa-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 2px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.jimeng-autoqa-row input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--blue);
+}
+
 .canvas-search-input {
   flex: 1;
   min-width: 0;

@@ -2244,6 +2244,7 @@ function renderCanvasPopover() {
   const curWsId = state.data?.platformDefaults?.libtv?.workspaceId || state.data?.defaultWorkspaceId || "";
   const curWsLabel = state.data?.platformDefaults?.libtv?.projectName || state.data?.defaultProjectName || "当前工作区";
   const curCeiling = Number(state.data?.jimengCreditCeiling ?? 0) || 0;
+  const curAutoQa = Boolean(state.data?.autoQaAfterRender);
   const jimengAccountBarHtml =
     activePlat === "jimeng" && jimengSt.authenticated
       ? `
@@ -2260,6 +2261,10 @@ function renderCanvasPopover() {
               <button id="saveJimengCeilingBtn" class="btn btn-secondary btn-sm" type="button">保存</button>
             </div>
           </div>
+          <label class="jimeng-autoqa-row" title="关闭（默认极速）：480P/1080P 由后台 Python 直接下载并同步就绪，省去 AI 看片耗时与费用；开启：下载后再唤起轻量 AI 自检写评语">
+            <input id="autoQaAfterRenderToggle" type="checkbox" ${curAutoQa ? "checked" : ""} />
+            <span>出片后自动 AI 看片自检（关闭=极速直出）</span>
+          </label>
         </div>
       `
       : "";
@@ -2339,6 +2344,25 @@ function renderCanvasPopover() {
   saveCeilingBtn?.addEventListener("click", (e) => {
     e.stopPropagation();
     submitCreditCeiling();
+  });
+
+  const autoQaToggle = document.getElementById("autoQaAfterRenderToggle");
+  autoQaToggle?.addEventListener("click", (e) => e.stopPropagation());
+  autoQaToggle?.addEventListener("change", async (e) => {
+    e.stopPropagation();
+    const enabled = Boolean(autoQaToggle.checked);
+    try {
+      const res = await apiJson("/api/config/auto-qa", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ autoQaAfterRender: enabled }),
+      });
+      if (state.data) state.data.autoQaAfterRender = Boolean(res.autoQaAfterRender);
+      showToast(enabled ? "已开启：出片下载后自动唤醒轻量 AI 看片自检" : "已切换为极速直出：480P/1080P 下载完直接就绪");
+    } catch (err) {
+      autoQaToggle.checked = !enabled;
+      showToast(err.message);
+    }
   });
 
   const searchInp = document.getElementById("canvasSearchInput");

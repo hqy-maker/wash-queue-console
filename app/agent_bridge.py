@@ -394,34 +394,69 @@ def _build_worker_prompt(
         )
 
     prebuild_section = ""
-    if is_jimeng and task_type == "queued" and prepped_dict:
+    render_qa_only = bool(prepped_dict.get("renderFastCompleted") and prepped_dict.get("downloadedVideoPath"))
+    if render_qa_only:
+        dl_path = str(prepped_dict.get("downloadedVideoPath") or "")
+        target_st = str(prepped_dict.get("targetFinalStatus") or "draft_ready")
+        prebuild_section = (
+            "## 轻量看片自检模式（Python 快速通道已完成提交、等待与下载）\n"
+            f"- 严禁再次运行 `dreamina-canvas` 下单、重复报价或重复下载！成片已落盘 `{dl_path}`（规格 `{prepped_dict.get('videoResolution') or '-'}`）。\n"
+            f"- 你只需执行 **1 次** `read_file` 查看 `{dl_path}`，确认主体/运镜/画质/音频无硬伤，然后立刻调用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（带 `claimToken`、`status: \"{target_st}\"`、`resolveFeedbacks: true` 及简明 `agentSummary`）即可结束！\n\n"
+        )
+    elif is_jimeng and task_type == "queued" and prepped_dict:
         depth_id = str(prepped_dict.get("pretriggeredDepthNodeId") or "").strip()
         depth_status = str(prepped_dict.get("depthTriggerStatus") or "").strip()
         depth_reason = str(prepped_dict.get("depthTriggerReason") or "").strip()
+        row_y = int(round(float(prepped_dict.get("suggestedRowY") or 0)))
+        comp_nid = str(prepped_dict.get("preuploadedCompNodeId") or "").strip()
+        char_nodes = prepped_dict.get("preuploadedCharRefNodes") or []
+        ordered_refs = [f"--ref node:{comp_nid}"] if comp_nid else []
+        for ch in char_nodes:
+            if isinstance(ch, dict) and ch.get("nodeId"):
+                ordered_refs.append(f"--ref node:{ch['nodeId']}")
+        if depth_id:
+            ordered_refs.append(f"--ref node:{depth_id}")
+        refs_cli_hint = " ".join(ordered_refs) if ordered_refs else "--ref node:<comp> ... --ref node:<depth>"
+        pid = str(shot.get("projectUuid") or "")
+
         depth_hint = (
-            f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，直接 `dreamina-canvas node show --project-id {shot.get('projectUuid')} --node-id {depth_id}` 确认其进入 `success`（若仍在运行可用 `operation wait` 或短轮询等待）！"
+            f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，只需查状态 `dreamina-canvas --non-interactive --format json node show --project-id {pid} --node-id {depth_id}` 等其 `status == success`！"
             if depth_id
-            else f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：请先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {shot.get('projectUuid')} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅当脚本仍返回失败时再持 `chrome_ui` 锁走 Chrome MCP 手点。"
+            else f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {pid} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅脚本失败时才持 `chrome_ui` 锁走 Chrome MCP 手点。"
         )
         whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
         whiteout_hint = (
-            f"用户明确勾选了涂白部位 `{whiteout_req}`，必须对 `compImage` 运行 `scripts/whiteout_mask.py` 生成 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
+            f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
             if whiteout_req
-            else "请直接用 `read_file` 目视 `compImage`：仅当画面出现真实真人正面五官/清晰人脸且尚未遮罩时，才调用 `scripts/whiteout_mask.py` 涂白并上传 `{shot.get('id')}-构图遮罩图`；若无明确人脸（大景/背影/局部/已遮罩/机械动物），**直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）**。"
+            else "用 `read_file` 目视 `compImage`：仅出现真人清晰正面五官且未遮罩时才跑 `scripts/whiteout_mask.py`；否则直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）。"
         )
         prebuild_section = (
             "## Fast-Path 画布预建与省流清单（务必遵守以极速完成）\n"
-            f"- `prepped.prebuildReady`: `{bool(prepped_dict.get('prebuildReady'))}`，行坐标 `suggestedRowY = {prepped_dict.get('suggestedRowY')}`\n"
-            "- 已自动在画布放好（严禁重复 `node find` 全表或重复 `resource upload`）：\n"
-            f"  - 构图节点：`{prepped_dict.get('preuploadedCompNodeId') or '未建'}`（坐标 `(800, {prepped_dict.get('suggestedRowY')})`）\n"
-            f"  - 角色参考节点：`{json.dumps(prepped_dict.get('preuploadedCharRefNodes') or [], ensure_ascii=False)}`\n"
-            f"  - 原片节点：`{prepped_dict.get('preuploadedSourceNodeId') or '未建'}`（坐标 `(1760, {prepped_dict.get('suggestedRowY')})`）\n"
-            f"- 深度动作捕捉：{depth_hint}\n"
+            f"- `prepped.prebuildReady`: `{bool(prepped_dict.get('prebuildReady'))}`，`suggestedRowY = {row_y}`\n"
+            "- 已就绪画布节点（**严禁重跑 `node find` 全表、重传素材或 `dreamina-canvas schema` / `auth status`**）：\n"
+            f"  - 构图节点：`{comp_nid or '未建'}` (`(800, {row_y})`)\n"
+            f"  - 角色参考：`{json.dumps(char_nodes, ensure_ascii=False)}`\n"
+            f"  - 原片节点：`{prepped_dict.get('preuploadedSourceNodeId') or '未建'}` (`(1760, {row_y})`)\n"
+            f"- 深度捕捉：{depth_hint}\n"
             f"- 涂白判断：{whiteout_hint}\n"
-            f"- 样片创建位点：等 `{depth_id or 'depthNodeId'}` 状态 `success` 后，直接执行 `dreamina-canvas node create video` 创建 `{shot.get('id')}-样片` 置于 `--x 3620 --y {int(round(float(prepped_dict.get('suggestedRowY') or 0)))}`，严格按参考顺序传 `--reference-node`（先构图节点、再 charRefs、最后景深视频），然后只读 `node quote`，**严禁传 `--run`**，完成后立刻 `agent-update` 回写 `ready_on_canvas`。\n\n"
+            "- 建样片与只读报价内联命令模板（若更换涂白图请替换第一个 `--ref node:`）：\n"
+            f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode m2v --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x 3620 --y {row_y} --prompt \"<写好的提示词，含 {{node:...}} 绑定>\" {refs_cli_hint}`（**严禁传 `--run`**）\n"
+            f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
+            f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
         )
 
-    if is_resume:
+    recreation_skill = _resolve_skill_path("seedance-video-recreation")
+    prompts_skill = _resolve_skill_path("seedance-video-prompts")
+    if render_qa_only:
+        intro = (
+            f"镜头 **{shot.get('id')}** 已由后台 Python 快速通道完成即梦生成与下载，你只需极速核查一次成片并回写结果（**无需阅读任何 Skill 文档，无需调用 Dreamina CLI**）：\n\n"
+        )
+    elif is_jimeng and task_type == "queued" and prepped_dict.get("prebuildReady") and not is_resume:
+        intro = (
+            "你是由洗片控制台唤醒的 Fast-Path Worker Agent（素材预上传、节点布局与 720P 深度捕捉已前置完成）。\n"
+            f"为极大提速：**跳过阅读 `wash-queue-console`、`dreamina-canvas-cli`、`zdepth-video` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；直接按 `{recreation_skill}` 与 `{prompts_skill}` 规范，看关键帧拼图/构图图/按需听轻量化音频写好提示词并落盘，随后按下方内联命令建样片节点、只读报价并回写完成：\n\n"
+        )
+    elif is_resume:
         intro = (
             f"你正在续接镜头 **{shot.get('id')}** 的专属独立对话（`--conversation` 已保留前序素材、剧情与画布认知，无需从头重学无关镜头）。\n"
             f"请直接处理本次新下发的 **{task_type}** 增量任务：\n\n"
@@ -1055,6 +1090,7 @@ class BridgeRuntime:
         err_msg = ""
         last_status = ""
         try:
+            prepped: dict[str, Any] = {}
             if SETTINGS["fastPathEnabled"] and task_type == "prompt_update_requested":
                 self._update_worker(shot_id, phase="快速同步提示词", lastNote="直接同步提示词到画布节点…", step_note="执行确定性提示词快速同步")
                 fp_res = shot_fastpath.try_fastpath_prompt_update(
@@ -1064,9 +1100,39 @@ class BridgeRuntime:
                     _log(f"{shot_id} fast-path completed: {fp_res.get('summary')}")
                     return
                 _log(f"{shot_id} fast-path skipped ({fp_res.get('reason')}); falling back to agy")
+            elif (
+                SETTINGS["fastPathEnabled"]
+                and str(shot.get("platform") or "").lower() == "jimeng"
+                and task_type in {"run_requested", "final_requested"}
+            ):
+                def _fp_progress(ph: str, msg: str) -> None:
+                    self._update_worker(shot_id, phase=ph, lastNote=msg, step_note=msg)
 
-            prepped: dict[str, Any] = {}
-            if SETTINGS["prePrepEnabled"] and task_type in {"queued", "recheck_requested"}:
+                def _fp_cancelled() -> bool:
+                    with self._lock:
+                        return _STOP_EVENT.is_set() or (bool(claim_token) and claim_token in self._cancelled_tokens)
+
+                fp_fn = (
+                    shot_fastpath.try_fastpath_jimeng_final
+                    if task_type == "final_requested"
+                    else shot_fastpath.try_fastpath_jimeng_run
+                )
+                fp_res = fp_fn(
+                    shot,
+                    base_url=self.base_url,
+                    workspace_root=WORKSPACE_ROOT,
+                    progress_cb=_fp_progress,
+                    check_cancelled=_fp_cancelled,
+                )
+                if fp_res.get("handled"):
+                    _log(f"{shot_id} {task_type} fast-path completed: {fp_res.get('summary')}")
+                    return
+                if isinstance(fp_res.get("preppedOverride"), dict):
+                    prepped = dict(fp_res["preppedOverride"])
+                else:
+                    _log(f"{shot_id} {task_type} fast-path skipped ({fp_res.get('reason')}); falling back to agy")
+
+            if not prepped and SETTINGS["prePrepEnabled"] and task_type in {"queued", "recheck_requested"}:
                 is_jimeng_queued = str(shot.get("platform") or "").lower() == "jimeng" and task_type == "queued"
                 self._update_worker(
                     shot_id,
@@ -1091,7 +1157,12 @@ class BridgeRuntime:
                 raise FileNotFoundError("本机未检测到 Antigravity agy CLI（安装 Antigravity 后重试）")
 
             avail_models = _discover_agy_models(agy_bin)
-            model, effort = _select_execution_profile(task_type, avail_models, SETTINGS)
+            if prepped.get("renderFastCompleted"):
+                eff = _normalize_effort(SETTINGS.get("fastEffort", "low"), default="low")
+                model = SETTINGS["fastModel"] or _pick_hydrogen_model(eff, avail_models)
+                effort = _resolve_compatible_effort(model, eff)
+            else:
+                model, effort = _select_execution_profile(task_type, avail_models, SETTINGS)
             resume_id = ""
             if SETTINGS["resumeByShot"] and task_type != "queued":
                 resume_id = self._get_shot_conversation_id(shot)
