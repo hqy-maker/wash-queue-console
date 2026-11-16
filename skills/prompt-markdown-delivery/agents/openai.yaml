@@ -1,0 +1,6 @@
+interface:
+  display_name: "提示词 Markdown 协作"
+  short_description: "提示词默认交付 Markdown 主文件，支持右侧选区批注并持续修改同一文件"
+  default_prompt: "使用 $prompt-markdown-delivery，将完整提示词保存为 Markdown 主文件供我在右侧批注，后续按评论更新同一个文件。"
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,17 @@
+{
+  "version": "2026.11.16.1",
+  "repo": "hqy-maker/wash-queue-console",
+  "branch": "main",
+  "publishedAt": "2026-11-16T17:19:52+08:00",
+  "changelog": "初始 GitHub 热更新版本：支持即梦官网 / LibTV 双平台切换、构图涂白回显与原图对比、报错诊断一键恢复、1080P 已过条锁定及历史版本回滚。",
+  "skillsIncluded": [
+    "wash-queue-console",
+    "dreamina-canvas-cli",
+    "libtv-cli",
+    "libtv-seedance-batch",
+    "seedance-video-prompts",
+    "seedance-video-recreation",
+    "zdepth-video",
+    "prompt-markdown-delivery"
+  ]
+}

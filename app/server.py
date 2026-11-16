@@ -1,0 +1,1558 @@
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+import agent_bridge
+import jimeng_bridge
+import libtv_bridge
+from updater import update_manager
+from store import (
+    ACTIONABLE_STATUSES,
+    APP_ROOT,
+    DATA_ROOT,
+    SHOTS_DIR,
+    WORKSPACE_ROOT,
+    ClaimConflictError,
+    QueueStore,
+    build_canvas_url,
+    get_platform_label,
+    normalize_platform,
+    run_preflight,
+    sanitize_filename,
+)
+
+HOME_DIR = Path.home()
+BRIDGE_SCRIPT = APP_ROOT / "agent_bridge.py"
+BRIDGE_PID_PATH = DATA_ROOT / "bridge.pid"
+BRIDGE_LOG_PATH = DATA_ROOT / "bridge.log"
+BRIDGE_PAUSED_FLAG = DATA_ROOT / ".bridge_paused"
+
+
+def _read_bridge_pid() -> int | None:
+    if not BRIDGE_PID_PATH.is_file():
+        return None
+    try:
+        pid = int(BRIDGE_PID_PATH.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        return None
+
+
+class AgentPresenceTracker:
+    """In-memory heartbeat & arbitration state between interactive Antigravity sessions and agy bridge."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._watchers: dict[str, dict[str, Any]] = {}
+        self._interactive_hold_until: float = 0.0
+        self._bridge_meta: dict[str, Any] = {
+            "lastConversationId": "",
+            "lastRunAt": "",
+            "lastError": "",
+            "busy": False,
+            "activeShotIds": [],
+        }
+
+    def is_paused(self) -> bool:
+        return BRIDGE_PAUSED_FLAG.is_file()
+
+    def set_paused(self, paused: bool) -> None:
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        if paused:
+            BRIDGE_PAUSED_FLAG.write_text("1\n", encoding="utf-8")
+        elif BRIDGE_PAUSED_FLAG.is_file():
+            BRIDGE_PAUSED_FLAG.unlink()
+
+    def _prune_locked(self, now: float) -> None:
+        expired = [k for k, v in self._watchers.items() if now >= float(v.get("expiresAt", 0.0))]
+        for k in expired:
+            self._watchers.pop(k, None)
+
+    def hold_interactive(self, seconds: float = 45.0) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._interactive_hold_until = max(self._interactive_hold_until, now + max(1.0, float(seconds or 45.0)))
+
+    def record_heartbeat(
+        self,
+        watcher_id: str,
+        mode: str = "interactive",
+        *,
+        busy: bool = False,
+        active_shot_ids: list[str] | None = None,
+        pid: int | None = None,
+        ttl_sec: float = 40.0,
+        last_conversation_id: str | None = None,
+        last_run_at: str | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, Any]:
+        wid = (watcher_id or mode or "watcher").strip()[:80] or "watcher"
+        clean_mode = "bridge" if str(mode or "").strip().lower() == "bridge" else "interactive"
+        ttl = max(5.0, min(float(ttl_sec or 40.0), 180.0))
+        now = time.monotonic()
+        active_clean = [str(x).strip() for x in (active_shot_ids or []) if str(x).strip()]
+        with self._lock:
+            self._prune_locked(now)
+            self._watchers[wid] = {
+                "watcherId": wid,
+                "mode": clean_mode,
+                "busy": bool(busy),
+                "activeShotIds": active_clean,
+                "pid": int(pid) if pid else None,
+                "expiresAt": now + ttl,
+                "updatedAt": time.time(),
+            }
+            if clean_mode == "interactive":
+                self._interactive_hold_until = max(self._interactive_hold_until, now + min(ttl, 45.0))
+            else:
+                self._bridge_meta["busy"] = bool(busy)
+                self._bridge_meta["activeShotIds"] = active_clean
+                if last_conversation_id is not None:
+                    self._bridge_meta["lastConversationId"] = str(last_conversation_id).strip()
+                if last_run_at is not None:
+                    self._bridge_meta["lastRunAt"] = str(last_run_at).strip()
+                if last_error is not None:
+                    self._bridge_meta["lastError"] = str(last_error).strip()
+        return self.snapshot()
+
+    def clear_watcher(self, watcher_id: str) -> None:
+        wid = (watcher_id or "").strip()
+        if not wid:
+            return
+        with self._lock:
+            self._watchers.pop(wid, None)
+
+    def snapshot(self, state_data: dict[str, Any] | None = None) -> dict[str, Any]:
+        now = time.monotonic()
+        live_pid = _read_bridge_pid()
+        paused = self.is_paused()
+        with self._lock:
+            self._prune_locked(now)
+            watchers = list(self._watchers.values())
+            interactive_watchers = [w for w in watchers if w["mode"] == "interactive"]
+            bridge_watchers = [w for w in watchers if w["mode"] == "bridge"]
+            interactive_online = bool(interactive_watchers) or (now < self._interactive_hold_until)
+            bridge_online = bool(bridge_watchers) or (live_pid is not None and not paused)
+            bridge_meta = dict(self._bridge_meta)
+
+        processing_ids = []
+        pending_count = 0
+        if state_data:
+            shots = state_data.get("shots")
+            if isinstance(shots, list):
+                processing_ids = [s["id"] for s in shots if s.get("status") == "processing"]
+                pending_count = sum(1 for s in shots if s.get("status") in ACTIONABLE_STATUSES)
+            else:
+                processing_ids = list(state_data.get("processingShotIds") or [])
+                pending_count = int(state_data.get("pendingCount", 0))
+
+        bridge_active_ids = bridge_meta.get("activeShotIds") or []
+        any_busy = bool(processing_ids or bridge_active_ids or bridge_meta.get("busy"))
+
+        agy_installed = bool(agent_bridge.find_agy_bin())
+        if any_busy and (interactive_online or bridge_online):
+            conn_state = "busy"
+            busy_count = len(set(processing_ids) | set(bridge_active_ids)) or 1
+            mode_tag = "对话" if interactive_online and not bridge_active_ids else "桥接"
+            label = f"AI {mode_tag}处理中 ({busy_count})"
+            detail = f"当前正在处理 {busy_count} 个镜头（{(', '.join(processing_ids or bridge_active_ids))}）。"
+        elif interactive_online:
+            conn_state = "interactive"
+            label = "AI 对话已连接"
+            detail = "当前 Antigravity 对话已挂起实时监听，后台桥接处于热备状态。"
+        elif paused:
+            conn_state = "paused"
+            label = "AI 桥接已暂停"
+            detail = "后台桥接已手动暂停；如需无人值守自动唤醒，可点击恢复启动。"
+        elif bridge_online and not agy_installed:
+            conn_state = "bridge_ready"
+            label = "桥接待配置 CLI"
+            detail = "本地控制台已就绪；请先安装 Antigravity 并安装/关联 `agy` 命令行工具，或在 Antigravity 对话中连接监听。"
+        elif bridge_online:
+            conn_state = "bridge_ready"
+            label = "AI 桥接已就绪"
+            detail = "独立后台桥接在线（agy CLI）；关闭 Antigravity 对话也能自动领单执行。"
+        else:
+            conn_state = "offline"
+            label = "AI 监听未连接"
+            detail = "暂无对话监听或后台桥接进程；点击下方「一键重连（启动桥接）」即可恢复自动连接。"
+
+        return {
+            "state": conn_state,
+            "label": label,
+            "detail": detail,
+            "agyInstalled": agy_installed,
+            "interactiveOnline": interactive_online,
+            "bridgeOnline": bridge_online,
+            "bridgePid": live_pid,
+            "bridgePaused": paused,
+            "busy": any_busy,
+            "activeShotIds": sorted(set(processing_ids) | set(bridge_active_ids)),
+            "processingShotIds": processing_ids,
+            "pendingCount": pending_count,
+            "lastConversationId": bridge_meta.get("lastConversationId", ""),
+            "lastRunAt": bridge_meta.get("lastRunAt", ""),
+            "lastError": bridge_meta.get("lastError", ""),
+        }
+
+
+agent_presence = AgentPresenceTracker()
+_BRIDGE_PROC_LOCK = threading.Lock()
+_BRIDGE_CHILDREN: list[subprocess.Popen[Any]] = []
+_BRIDGE_LAST_SPAWN_AT = 0.0
+
+
+def _reap_bridge_children_locked() -> int | None:
+    global _BRIDGE_CHILDREN
+    alive: list[subprocess.Popen[Any]] = []
+    running_pid: int | None = None
+    for proc in _BRIDGE_CHILDREN:
+        if proc.poll() is None:
+            alive.append(proc)
+            running_pid = proc.pid
+    _BRIDGE_CHILDREN = alive
+    return running_pid
+
+
+def ensure_bridge_running(*, clear_paused: bool = False) -> dict[str, Any]:
+    global _BRIDGE_LAST_SPAWN_AT
+    with _BRIDGE_PROC_LOCK:
+        if clear_paused:
+            agent_presence.set_paused(False)
+        elif agent_presence.is_paused():
+            return {"ok": True, "started": False, "reason": "paused", "pid": _read_bridge_pid()}
+
+        child_pid = _reap_bridge_children_locked()
+        existing_pid = child_pid or _read_bridge_pid()
+        if existing_pid is not None:
+            return {"ok": True, "started": False, "alreadyRunning": True, "pid": existing_pid}
+
+        if not BRIDGE_SCRIPT.is_file():
+            return {"ok": False, "started": False, "error": f"缺少桥接脚本: {BRIDGE_SCRIPT}"}
+
+        now = time.monotonic()
+        if now - _BRIDGE_LAST_SPAWN_AT < 1.0:
+            return {"ok": True, "started": False, "reason": "spawning", "pid": None}
+
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        extra_path = f"{HOME_DIR / '.local' / 'bin'}:{HOME_DIR / '.libtv'}:{APP_ROOT / 'bin'}:/opt/homebrew/bin:/usr/local/bin"
+        env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
+        env["WASH_APP_PORT"] = str(env.get("WASH_APP_PORT") or "8787")
+        with BRIDGE_LOG_PATH.open("a", encoding="utf-8") as log_fh:
+            proc = subprocess.Popen(
+                [sys.executable, str(BRIDGE_SCRIPT), "--port", env["WASH_APP_PORT"]],
+                cwd=str(APP_ROOT),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=log_fh,
+                start_new_session=True,
+                close_fds=True,
+            )
+        _BRIDGE_CHILDREN.append(proc)
+        _BRIDGE_LAST_SPAWN_AT = time.monotonic()
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if BRIDGE_PID_PATH.is_file() and _read_bridge_pid() is not None:
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    return {"ok": True, "started": True, "pid": proc.pid}
+
+
+def stop_bridge_process(*, pause: bool = True) -> dict[str, Any]:
+    with _BRIDGE_PROC_LOCK:
+        if pause:
+            agent_presence.set_paused(True)
+        child_pid = _reap_bridge_children_locked()
+        pid = child_pid or _read_bridge_pid()
+        stopped = False
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stopped = True
+            except OSError:
+                stopped = False
+            deadline = time.monotonic() + 2.6
+            while time.monotonic() < deadline:
+                _reap_bridge_children_locked()
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
+        if BRIDGE_PID_PATH.is_file() and _read_bridge_pid() is None:
+            try:
+                BRIDGE_PID_PATH.unlink()
+            except OSError:
+                pass
+        agent_presence.clear_watcher("agy_bridge")
+        return {"ok": True, "stopped": stopped, "pid": pid}
+
+
+def restart_bridge_process() -> dict[str, Any]:
+    snap = agent_presence.snapshot(store.get_state())
+    if snap.get("busy") and snap.get("bridgeOnline") and not snap.get("interactiveOnline"):
+        active = "、".join(snap.get("activeShotIds") or [])
+        raise HTTPException(
+            status_code=409,
+            detail=f"后台桥接正在处理镜头（{active or '运行中'}），请等待当前任务完成后再重连。",
+        )
+    stop_res = stop_bridge_process(pause=False)
+    start_res = ensure_bridge_running(clear_paused=True)
+    return {**start_res, "restarted": True, "previousPid": stop_res.get("pid")}
+
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    stop_supervisor = threading.Event()
+
+    def _supervisor_loop() -> None:
+        while not stop_supervisor.is_set():
+            if os.environ.get("WASH_AUTO_BRIDGE", "1") != "0" and not agent_presence.is_paused():
+                try:
+                    with _BRIDGE_PROC_LOCK:
+                        alive_pid = _reap_bridge_children_locked() or _read_bridge_pid()
+                    if alive_pid is None:
+                        ensure_bridge_running(clear_paused=False)
+                except Exception:
+                    pass
+            stop_supervisor.wait(3.0)
+
+    if os.environ.get("WASH_AUTO_BRIDGE", "1") != "0" and not agent_presence.is_paused():
+        try:
+            ensure_bridge_running(clear_paused=False)
+        except Exception:
+            pass
+    supervisor = threading.Thread(target=_supervisor_loop, name="bridge-supervisor", daemon=True)
+    supervisor.start()
+    if os.environ.get("WASH_AUTO_CHECK_UPDATE", "1") != "0":
+        def _boot_update_check() -> None:
+            time.sleep(1.5)
+            try:
+                update_manager.get_status(force_refresh=True)
+            except Exception:
+                pass
+        threading.Thread(target=_boot_update_check, name="boot-update-check", daemon=True).start()
+    try:
+        yield
+    finally:
+        stop_supervisor.set()
+
+
+app = FastAPI(title="SHZ 洗片控制台", version="1.0.0", lifespan=_app_lifespan)
+
+
+class ResourceLockManager:
+    """TTL-guarded in-process mutex manager for serializing brief shared UI/layout steps."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._locks: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _clean_name(lock_name: str) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", (lock_name or "").strip()).strip("_")[:80]
+        if not cleaned:
+            raise ValueError("锁名称不能为空")
+        return cleaned
+
+    def _evict_expired_locked(self, now: float) -> None:
+        expired = [k for k, v in self._locks.items() if now >= float(v["expiresAt"])]
+        for k in expired:
+            self._locks.pop(k, None)
+
+    def acquire(
+        self,
+        lock_name: str,
+        owner: str = "worker",
+        ttl_sec: float = 90.0,
+        wait_sec: float = 30.0,
+    ) -> dict[str, Any]:
+        key = self._clean_name(lock_name)
+        clean_owner = (owner or "worker").strip()[:80] or "worker"
+        ttl = max(5.0, min(float(ttl_sec or 90.0), 300.0))
+        wait = max(0.0, min(float(wait_sec or 30.0), 60.0))
+        deadline = time.monotonic() + wait
+
+        with self._cv:
+            while True:
+                now = time.monotonic()
+                self._evict_expired_locked(now)
+                existing = self._locks.get(key)
+                if existing is None:
+                    token = uuid.uuid4().hex[:12]
+                    self._locks[key] = {
+                        "owner": clean_owner,
+                        "token": token,
+                        "expiresAt": now + ttl,
+                        "acquiredAt": time.time(),
+                    }
+                    return {
+                        "ok": True,
+                        "acquired": True,
+                        "lock": key,
+                        "owner": clean_owner,
+                        "token": token,
+                        "ttlSec": round(ttl, 2),
+                    }
+                remaining = deadline - now
+                if remaining <= 0:
+                    return {
+                        "ok": False,
+                        "acquired": False,
+                        "lock": key,
+                        "heldBy": existing["owner"],
+                        "expiresInSec": round(max(0.0, float(existing["expiresAt"]) - now), 2),
+                    }
+                until_expire = max(0.05, float(existing["expiresAt"]) - now)
+                self._cv.wait(timeout=min(remaining, until_expire))
+
+    def release(self, lock_name: str, token: str = "") -> dict[str, Any]:
+        key = self._clean_name(lock_name)
+        clean_token = (token or "").strip()
+        with self._cv:
+            now = time.monotonic()
+            self._evict_expired_locked(now)
+            existing = self._locks.get(key)
+            if existing is None:
+                return {"ok": True, "released": False, "lock": key, "reason": "not_held"}
+            if clean_token and existing["token"] != clean_token:
+                return {
+                    "ok": False,
+                    "released": False,
+                    "conflict": True,
+                    "lock": key,
+                    "heldBy": existing["owner"],
+                }
+            self._locks.pop(key, None)
+            self._cv.notify_all()
+            return {"ok": True, "released": True, "lock": key}
+
+    def list_active(self) -> list[dict[str, Any]]:
+        with self._cv:
+            now = time.monotonic()
+            self._evict_expired_locked(now)
+            return [
+                {
+                    "lock": k,
+                    "owner": v["owner"],
+                    "expiresInSec": round(max(0.0, float(v["expiresAt"]) - now), 2),
+                }
+                for k, v in self._locks.items()
+            ]
+
+
+resource_locks = ResourceLockManager()
+store = QueueStore()
+
+STATIC_DIR = APP_ROOT / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+_PROJECT_CACHES: dict[str, dict[str, Any]] = {
+    "libtv": {"fetchedAt": 0.0, "projects": []},
+    "jimeng": {"fetchedAt": 0.0, "projects": []},
+}
+
+
+def _get_projects_cached(
+    platform: str = "libtv",
+    force: bool = False,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    plat = normalize_platform(platform)
+    cache = _PROJECT_CACHES[plat]
+    now = time.monotonic()
+    if not force and cache["projects"] and (now - float(cache["fetchedAt"]) < 60.0):
+        return cache["projects"], None, False
+    try:
+        if plat == "jimeng":
+            projects = jimeng_bridge.list_projects()
+        else:
+            raw_list = libtv_bridge.list_projects()
+            projects = [{**p, "platform": "libtv"} for p in raw_list]
+        if projects or plat == "jimeng":
+            cache["projects"] = projects
+            cache["fetchedAt"] = now
+        return cache["projects"], None, False
+    except (jimeng_bridge.JimengAuthRequiredError, libtv_bridge.LibtvAuthRequiredError) as exc:
+        return cache["projects"], str(exc), True
+    except Exception as exc:
+        return cache["projects"], str(exc), False
+
+mimetypes.add_type("video/mp4", ".mp4")
+mimetypes.add_type("video/quicktime", ".mov")
+mimetypes.add_type("image/webp", ".webp")
+
+
+def _guess_mime(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    return mime or "application/octet-stream"
+
+
+def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 262144) -> Iterator[bytes]:
+    remaining = end - start + 1
+    with path.open("rb") as fh:
+        fh.seek(start)
+        while remaining > 0:
+            chunk = fh.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def _stream_media_file(request: Request, target: Path) -> Response:
+    size = target.stat().st_size
+    mime = _guess_mime(target)
+    range_header = request.headers.get("range")
+    base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-cache"}
+
+    if not range_header or size == 0:
+        return FileResponse(target, media_type=mime, headers=base_headers)
+
+    match = re.match(r"^bytes=(\d*)-(\d*)$", range_header.strip())
+    if not match:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+
+    start_str, end_str = match.groups()
+    if not start_str and not end_str:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+
+    if start_str == "":
+        suffix = int(end_str)
+        start = max(0, size - suffix)
+        end = size - 1
+    else:
+        start = int(start_str)
+        end = int(end_str) if end_str else size - 1
+
+    if start >= size or end < start:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    end = min(end, size - 1)
+
+    headers = {
+        **base_headers,
+        "Content-Range": f"bytes {start}-{end}/{size}",
+        "Content-Length": str(end - start + 1),
+    }
+    return StreamingResponse(
+        _iter_file_range(target, start, end),
+        status_code=206,
+        media_type=mime,
+        headers=headers,
+    )
+
+
+class PlatformSwitchReq(BaseModel):
+    platform: str
+
+
+class DefaultProjectReq(BaseModel):
+    projectUuid: str
+    projectName: str = ""
+    workspaceId: str | int | None = None
+    platform: str = ""
+    canvasUrl: str = ""
+
+
+class ProjectCreateReq(BaseModel):
+    name: str
+    platform: str = ""
+    workspaceId: str | int | None = "0"
+    createWorkspace: bool = False
+    description: str = ""
+    setAsDefault: bool = True
+
+
+class ShotProjectReq(BaseModel):
+    projectUuid: str = ""
+    projectName: str = ""
+    canvasUrl: str = ""
+    workspaceId: str | int | None = None
+    platform: str | None = None
+    setAsDefault: bool = True
+
+
+class PromptUpdateReq(BaseModel):
+    promptText: str
+    note: str = ""
+
+
+class PresetPatchReq(BaseModel):
+    name: str | None = None
+    scene: str | None = None
+    roleHint: str | None = None
+    libtvNodeKey: str | None = None
+    projectUuid: str | None = None
+
+
+class ReprocessReq(BaseModel):
+    reason: str = ""
+    edited_prompt: str | None = None
+
+
+class RunShotReq(BaseModel):
+    edited_prompt: str | None = None
+
+
+class RollbackReq(BaseModel):
+    versionId: str
+    syncToCanvas: bool = True
+
+
+class ShotSceneReq(BaseModel):
+    scene: str = ""
+
+
+class SceneCreateReq(BaseModel):
+    name: str = ""
+
+
+class SceneRenameReq(BaseModel):
+    oldName: str = ""
+    newName: str = ""
+
+
+class ErrorRecoverReq(BaseModel):
+    mode: str = "retry"
+
+
+class AgentUpdateReq(BaseModel):
+    status: str | None = None
+    platform: str | None = None
+    projectUuid: str | None = None
+    projectName: str | None = None
+    canvasUrl: str | None = None
+    promptText: str | None = None
+    promptFilePath: str | None = None
+    libtvGroupKey: str | None = None
+    libtvSampleNodeKey: str | None = None
+    libtvFinalNodeKey: str | None = None
+    sourceLibtvNodeKey: str | None = None
+    depthLibtvNodeKey: str | None = None
+    compLibtvNodeKey: str | None = None
+    charLibtvNodeKeys: dict[str, str] | None = None
+    libtvMixedOrder: list[dict[str, Any]] | None = None
+    jimengMeta: dict[str, Any] | None = None
+    agentSummary: str | None = None
+    errorReason: str | None = None
+    errorSolution: str | None = None
+    errorDetail: str | None = None
+    whiteoutUpdates: list[dict[str, Any]] | None = None
+    confirmationRequest: dict[str, Any] | None = None
+    draftVideo: dict[str, Any] | None = None
+    finalVideo: dict[str, Any] | None = None
+    resolveFeedbacks: bool = False
+    revisionSummary: str | None = None
+    revisionDirection: str | None = None
+    conversationId: str | None = None
+    claimToken: str | None = None
+
+
+class ClaimReq(BaseModel):
+    workerId: str = "coordinator"
+    limit: int = 10
+    shotIds: list[str] | None = None
+
+
+class ClaimShotReq(BaseModel):
+    workerId: str = "worker"
+
+
+class LockAcquireReq(BaseModel):
+    owner: str = "worker"
+    ttlSec: float = 90.0
+    waitSec: float = 30.0
+
+
+class LockReleaseReq(BaseModel):
+    token: str = ""
+
+
+class HeartbeatReq(BaseModel):
+    watcherId: str = "watcher"
+    mode: str = "interactive"
+    busy: bool = False
+    activeShotIds: list[str] | None = None
+    pid: int | None = None
+    ttlSec: float = 40.0
+    lastConversationId: str | None = None
+    lastRunAt: str | None = None
+    lastError: str | None = None
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "version": update_manager.current_version(),
+        "workspaceRoot": str(WORKSPACE_ROOT),
+        "dataRoot": str(DATA_ROOT),
+    }
+
+
+@app.get("/api/system/update-status")
+def system_update_status(refresh: bool = Query(default=False)) -> dict[str, Any]:
+    return update_manager.get_status(force_refresh=bool(refresh))
+
+
+@app.post("/api/system/check-update")
+def system_check_update() -> dict[str, Any]:
+    return update_manager.get_status(force_refresh=True)
+
+
+@app.post("/api/system/apply-update")
+def system_apply_update() -> dict[str, Any]:
+    port = int(os.environ.get("WASH_APP_PORT", "8787"))
+    try:
+        return update_manager.apply_update(workspace_root=WORKSPACE_ROOT, port=port, auto_restart=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/system/rollback-update")
+def system_rollback_update() -> dict[str, Any]:
+    port = int(os.environ.get("WASH_APP_PORT", "8787"))
+    try:
+        return update_manager.rollback_update(workspace_root=WORKSPACE_ROOT, port=port, auto_restart=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/media/{rel_path:path}")
+def serve_media(rel_path: str, request: Request) -> Response:
+    target = (DATA_ROOT / rel_path).resolve()
+    root = DATA_ROOT.resolve()
+    if root not in target.parents or not target.is_file():
+        raise HTTPException(status_code=404, detail="媒体文件不存在")
+    return _stream_media_file(request, target)
+
+
+@app.get("/api/state")
+def get_state(refresh_projects: bool = Query(default=False)) -> dict[str, Any]:
+    state = store.get_state()
+    default_plat = normalize_platform(state.get("defaultPlatform"))
+    pdefs = state.get("platformDefaults") or {}
+
+    libtv_status = libtv_bridge.get_auth_status(force=refresh_projects)
+    jimeng_status = jimeng_bridge.get_auth_status(force=refresh_projects)
+
+    libtv_projects: list[dict[str, Any]] = list(_PROJECT_CACHES["libtv"]["projects"])
+    libtv_err: str | None = None
+    libtv_auth_req = not bool(libtv_status.get("authenticated"))
+    if libtv_status.get("authenticated"):
+        libtv_projects, libtv_err, libtv_auth_req = _get_projects_cached(
+            "libtv", force=refresh_projects or not libtv_projects
+        )
+        if libtv_auth_req:
+            libtv_status = libtv_bridge.get_auth_status(force=True)
+        elif not (pdefs.get("libtv") or {}).get("projectUuid") and libtv_projects:
+            first_lt = libtv_projects[0]
+            updated_q = store.set_default_project(
+                first_lt["uuid"],
+                first_lt.get("name") or first_lt["uuid"],
+                workspace_id=first_lt.get("workspaceId") if first_lt.get("workspaceId") is not None else "",
+                platform="libtv",
+                canvas_url=first_lt.get("url") or "",
+            )
+            state["platformDefaults"] = updated_q.get("platformDefaults", pdefs)
+            if default_plat == "libtv":
+                state["defaultProjectUuid"] = updated_q.get("defaultProjectUuid", "")
+                state["defaultProjectName"] = updated_q.get("defaultProjectName", "")
+                state["defaultWorkspaceId"] = updated_q.get("defaultWorkspaceId", "")
+    elif default_plat == "libtv":
+        libtv_err = str(libtv_status.get("detail") or "LibTV 尚未登录")
+
+    if not libtv_projects:
+        ldef = state.get("platformDefaults", pdefs).get("libtv") or {}
+        if ldef.get("projectUuid"):
+            libtv_projects = [
+                {
+                    "uuid": ldef["projectUuid"],
+                    "name": ldef.get("projectName") or ldef["projectUuid"],
+                    "url": ldef.get("canvasUrl") or build_canvas_url(ldef["projectUuid"], platform="libtv"),
+                    "platform": "libtv",
+                }
+            ]
+
+    jimeng_projects: list[dict[str, Any]] = list(_PROJECT_CACHES["jimeng"]["projects"])
+    jimeng_err: str | None = None
+    jimeng_auth_req = not bool(jimeng_status.get("authenticated"))
+    if default_plat == "jimeng" or refresh_projects or jimeng_status.get("authenticated"):
+        if jimeng_status.get("authenticated"):
+            jimeng_projects, jimeng_err, jimeng_auth_req = _get_projects_cached(
+                "jimeng", force=refresh_projects or not jimeng_projects
+            )
+            if jimeng_auth_req:
+                jimeng_status = jimeng_bridge.get_auth_status(force=True)
+        elif default_plat == "jimeng":
+            jimeng_err = str(jimeng_status.get("detail") or "即梦官网尚未登录授权")
+
+    active_projects = jimeng_projects if default_plat == "jimeng" else libtv_projects
+    state["projects"] = active_projects
+    state["projectsByPlatform"] = {
+        "libtv": libtv_projects,
+        "jimeng": jimeng_projects,
+    }
+    state["projectsError"] = jimeng_err if default_plat == "jimeng" else libtv_err
+    state["projectsAuthRequired"] = jimeng_auth_req if default_plat == "jimeng" else libtv_auth_req
+    state["libtvStatus"] = libtv_status
+    state["jimengStatus"] = jimeng_status
+    state["agentStatus"] = agent_presence.snapshot(state)
+    return JSONResponse(state, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/projects")
+def get_projects(platform: str = Query(default=""), refresh: bool = Query(default=True)) -> dict[str, Any]:
+    plat = normalize_platform(platform or store.get_state().get("defaultPlatform"))
+    projects, err, auth_required = _get_projects_cached(plat, force=refresh)
+    if auth_required:
+        return {"platform": plat, "projects": [], "error": err, "authRequired": True}
+    if err and not projects:
+        raise HTTPException(status_code=502, detail=f"获取 {get_platform_label(plat)} 画布列表失败: {err}")
+    return {"platform": plat, "projects": projects, "error": err, "authRequired": False}
+
+
+@app.post("/api/projects")
+def create_project(req: ProjectCreateReq) -> dict[str, Any]:
+    plat = normalize_platform(req.platform or store.get_state().get("defaultPlatform"))
+    try:
+        if plat == "jimeng":
+            proj = jimeng_bridge.create_project(req.name, description=req.description)
+        else:
+            proj = libtv_bridge.create_project(
+                req.name,
+                workspace_id=req.workspaceId,
+                create_workspace=req.createWorkspace,
+                description=req.description,
+            )
+            proj = {**proj, "platform": "libtv"}
+    except (jimeng_bridge.JimengAuthRequiredError, libtv_bridge.LibtvAuthRequiredError) as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"新建 {get_platform_label(plat)} 画布失败: {exc}") from exc
+
+    cache = _PROJECT_CACHES[plat]
+    existing = [p for p in cache.get("projects", []) if p.get("uuid") != proj.get("uuid")]
+    cache["projects"] = [proj, *existing]
+    cache["fetchedAt"] = time.monotonic()
+
+    if req.setAsDefault:
+        store.set_default_project(
+            proj["uuid"],
+            proj["name"],
+            workspace_id=proj.get("workspaceId") if proj.get("workspaceId") is not None else "",
+            platform=plat,
+            canvas_url=proj.get("url") or "",
+        )
+    return {"ok": True, "platform": plat, "project": proj}
+
+
+@app.post("/api/config/platform")
+def set_default_platform(req: PlatformSwitchReq) -> dict[str, Any]:
+    try:
+        updated = store.set_default_platform(req.platform)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    plat = normalize_platform(updated.get("defaultPlatform"))
+    libtv_status = libtv_bridge.get_auth_status(force=False)
+    jimeng_status = jimeng_bridge.get_auth_status(force=False)
+    auth_required = False
+    proj_err: str | None = None
+    if plat == "jimeng":
+        if jimeng_status.get("authenticated"):
+            projects, proj_err, auth_required = _get_projects_cached(
+                "jimeng", force=not bool(_PROJECT_CACHES["jimeng"]["projects"])
+            )
+        else:
+            projects = list(_PROJECT_CACHES["jimeng"]["projects"])
+            auth_required = True
+            proj_err = str(jimeng_status.get("detail") or "即梦官网尚未登录授权")
+    else:
+        if libtv_status.get("authenticated"):
+            projects, proj_err, auth_required = _get_projects_cached(
+                "libtv", force=not bool(_PROJECT_CACHES["libtv"]["projects"])
+            )
+        else:
+            projects = list(_PROJECT_CACHES["libtv"]["projects"])
+            auth_required = True
+            proj_err = str(libtv_status.get("detail") or "LibTV 尚未登录")
+
+    return {
+        "ok": True,
+        "defaultPlatform": plat,
+        "defaultProjectUuid": updated.get("defaultProjectUuid", ""),
+        "defaultProjectName": updated.get("defaultProjectName", ""),
+        "defaultWorkspaceId": updated.get("defaultWorkspaceId", ""),
+        "platformDefaults": updated.get("platformDefaults", {}),
+        "projects": projects,
+        "projectsError": proj_err,
+        "projectsAuthRequired": auth_required,
+        "libtvStatus": libtv_status,
+        "jimengStatus": jimeng_status,
+    }
+
+
+@app.get("/api/libtv/auth/status")
+def get_libtv_auth_status() -> dict[str, Any]:
+    st = libtv_bridge.get_auth_status(force=True)
+    projects: list[dict[str, Any]] = []
+    if st.get("authenticated"):
+        projects, _, _ = _get_projects_cached("libtv", force=not bool(_PROJECT_CACHES["libtv"]["projects"]))
+    return {"ok": True, "libtvStatus": st, "projects": projects}
+
+
+@app.post("/api/libtv/auth/login")
+def start_libtv_auth_login() -> dict[str, Any]:
+    try:
+        res = libtv_bridge.start_auth_login()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"启动 LibTV 登录失败: {exc}") from exc
+
+    projects: list[dict[str, Any]] = []
+    if res.get("authenticated"):
+        projects, _, _ = _get_projects_cached("libtv", force=True)
+    st = libtv_bridge.get_auth_status(force=True)
+    return {"ok": True, **res, "libtvStatus": st, "projects": projects}
+
+
+@app.get("/api/jimeng/auth/status")
+def get_jimeng_auth_status() -> dict[str, Any]:
+    st = jimeng_bridge.get_auth_status(force=True)
+    projects: list[dict[str, Any]] = []
+    if st.get("authenticated"):
+        projects, _, _ = _get_projects_cached("jimeng", force=not bool(_PROJECT_CACHES["jimeng"]["projects"]))
+    return {"ok": True, "jimengStatus": st, "projects": projects}
+
+
+@app.post("/api/jimeng/auth/login")
+def start_jimeng_auth_login() -> dict[str, Any]:
+    try:
+        res = jimeng_bridge.start_auth_login()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"启动即梦登录失败: {exc}") from exc
+
+    projects: list[dict[str, Any]] = []
+    if res.get("authenticated"):
+        projects, _, _ = _get_projects_cached("jimeng", force=True)
+    st = jimeng_bridge.get_auth_status(force=True)
+    return {"ok": True, **res, "jimengStatus": st, "projects": projects}
+
+
+@app.post("/api/config/default-project")
+def set_default_project(req: DefaultProjectReq) -> dict[str, Any]:
+    try:
+        updated = store.set_default_project(
+            req.projectUuid,
+            req.projectName,
+            workspace_id=req.workspaceId,
+            platform=req.platform or None,
+            canvas_url=req.canvasUrl,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "defaultPlatform": updated.get("defaultPlatform", "libtv"),
+        "defaultProjectUuid": updated["defaultProjectUuid"],
+        "defaultProjectName": updated["defaultProjectName"],
+        "defaultWorkspaceId": updated.get("defaultWorkspaceId", ""),
+        "platformDefaults": updated.get("platformDefaults", {}),
+    }
+
+
+@app.get("/api/presets")
+def get_presets() -> dict[str, Any]:
+    return {"presets": store.list_presets()}
+
+
+@app.post("/api/presets")
+async def create_preset(
+    name: str = Form(...),
+    scene: str = Form(default="通用"),
+    role_hint: str = Form(default=""),
+    libtv_node_key: str = Form(default=""),
+    project_uuid: str = Form(default=""),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    state = store.get_state()
+    p_uuid = project_uuid.strip() or state["defaultProjectUuid"]
+    preset = store.add_preset(
+        name=name,
+        role_hint=role_hint,
+        filename=file.filename or f"{name}.jpg",
+        raw_bytes=raw,
+        scene=scene,
+        libtv_node_key=libtv_node_key,
+        project_uuid=p_uuid,
+    )
+    return {"ok": True, "preset": preset}
+
+
+@app.patch("/api/presets/{preset_id}")
+def patch_preset(preset_id: str, req: PresetPatchReq) -> dict[str, Any]:
+    try:
+        preset = store.update_preset(preset_id, req.model_dump(exclude_none=True))
+        return {"ok": True, "preset": preset}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/presets/{preset_id}")
+def remove_preset(preset_id: str) -> dict[str, Any]:
+    try:
+        store.delete_preset(preset_id)
+        return {"ok": True}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/preflight")
+async def preflight_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Quick temporary preflight using the shared skill preflight_check.py."""
+    import tempfile
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件为空")
+    suffix = Path(file.filename or "asset").suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+        tmp.write(raw)
+        tmp.flush()
+        result = run_preflight(Path(tmp.name))
+        result["filename"] = file.filename
+        return result
+
+
+@app.post("/api/shots")
+async def create_shot(
+    shot_id: str = Form(...),
+    scene: str = Form(default=""),
+    platform: str = Form(default=""),
+    project_uuid: str = Form(default=""),
+    project_name: str = Form(default=""),
+    canvas_url: str = Form(default=""),
+    notes: str = Form(default=""),
+    user_prompt: str = Form(default=""),
+    char_specs_json: str = Form(default="[]"),
+    ordered_image_specs_json: str = Form(default=""),
+    whiteout_parts_json: str = Form(default="[]"),
+    whiteout_target: str = Form(default=""),
+    auto_confirm: str = Form(default="true"),
+    overwrite: str = Form(default="false"),
+    source_video: UploadFile | None = File(default=None),
+    comp_image: UploadFile | None = File(default=None),
+    char_images: list[UploadFile] = File(default=[]),
+) -> dict[str, Any]:
+    try:
+        char_specs = json.loads(char_specs_json or "[]")
+        if not isinstance(char_specs, list):
+            raise ValueError("char_specs_json 必须是数组")
+        ordered_image_specs = json.loads(ordered_image_specs_json) if ordered_image_specs_json.strip() else None
+        if ordered_image_specs is not None and not isinstance(ordered_image_specs, list):
+            raise ValueError("ordered_image_specs_json 必须是数组")
+        whiteout_parts = json.loads(whiteout_parts_json or "[]")
+        if not isinstance(whiteout_parts, list):
+            raise ValueError("whiteout_parts_json 必须是数组")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"素材列表格式错误: {exc}") from exc
+
+    src_bytes = await source_video.read() if source_video is not None else b""
+    comp_bytes = await comp_image.read() if comp_image is not None else b""
+
+    uploads: list[tuple[str, bytes]] = []
+    for up in char_images:
+        data = await up.read()
+        uploads.append((up.filename or "asset.jpg", data))
+
+    try:
+        shot = store.create_or_replace_shot(
+            shot_id=shot_id,
+            scene=scene,
+            platform=platform.strip(),
+            project_uuid=project_uuid.strip(),
+            project_name=project_name.strip(),
+            canvas_url=canvas_url.strip(),
+            notes=notes,
+            user_prompt=user_prompt,
+            source_filename=sanitize_filename(source_video.filename or "source.mp4") if source_video else "",
+            source_bytes=src_bytes,
+            comp_filename=sanitize_filename(comp_image.filename or "comp.jpg") if comp_image else "",
+            comp_bytes=comp_bytes,
+            char_specs=char_specs,
+            char_uploads=uploads,
+            ordered_image_specs=ordered_image_specs,
+            whiteout_parts=[str(x).strip() for x in whiteout_parts if str(x).strip()],
+            whiteout_target=whiteout_target.strip(),
+            auto_confirm=(auto_confirm.lower() != "false"),
+            overwrite=(overwrite.lower() == "true"),
+        )
+        return {"ok": True, "shot": shot}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/confirm")
+def confirm_shot(shot_id: str) -> dict[str, Any]:
+    try:
+        shot = store.confirm_shot(shot_id)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/feedback")
+async def submit_feedback(
+    shot_id: str,
+    comment: str = Form(default=""),
+    tags_json: str = Form(default="[]"),
+    target_slot: str = Form(default=""),
+    edited_prompt: str = Form(default=""),
+    attachments: list[UploadFile] = File(default=[]),
+) -> dict[str, Any]:
+    try:
+        tags = json.loads(tags_json or "[]")
+    except Exception:
+        tags = []
+
+    saved_attachments: list[tuple[str, bytes]] = []
+    for up in attachments:
+        data = await up.read()
+        if data:
+            saved_attachments.append((up.filename or "attachment.png", data))
+
+    if not comment.strip() and not tags and not saved_attachments and not edited_prompt.strip():
+        raise HTTPException(status_code=400, detail="请至少修改提示词、填写修改意见、勾选标签或附带图片")
+
+    try:
+        shot = store.submit_feedback(shot_id, comment, tags, target_slot, saved_attachments, edited_prompt)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/mask-image")
+async def save_manual_mask(
+    shot_id: str,
+    slot_tag: str = Form(default=""),
+    slot_id: str = Form(default=""),
+    sync_to_canvas: str = Form(default="false"),
+    is_reset: str = Form(default="false"),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="涂白图像文件为空")
+    try:
+        shot = store.apply_manual_mask(
+            shot_id,
+            slot_tag=slot_tag,
+            slot_id=slot_id,
+            filename=sanitize_filename(file.filename or "mask.png", "mask.png"),
+            raw_bytes=raw,
+            sync_to_canvas=(sync_to_canvas.lower() == "true"),
+            is_reset=(is_reset.lower() == "true"),
+        )
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/resolve-confirmation")
+async def resolve_confirmation(
+    shot_id: str,
+    decision: str = Form(default="approve"),
+    comment: str = Form(default=""),
+    corrected_mask: UploadFile | None = File(default=None),
+) -> dict[str, Any]:
+    corrected: tuple[str, bytes] | None = None
+    if corrected_mask is not None:
+        raw = await corrected_mask.read()
+        if raw:
+            corrected = (corrected_mask.filename or "corrected_mask.png", raw)
+    try:
+        shot = store.resolve_confirmation(shot_id, decision, comment, corrected)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/run")
+def run_shot(shot_id: str, req: RunShotReq | None = None) -> dict[str, Any]:
+    body = req or RunShotReq()
+    try:
+        shot = store.request_run(shot_id, edited_prompt=body.edited_prompt)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/approve-final")
+def approve_final(shot_id: str) -> dict[str, Any]:
+    try:
+        shot = store.request_final(shot_id)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/reprocess")
+def reprocess_shot(shot_id: str, req: ReprocessReq | None = None) -> dict[str, Any]:
+    body = req or ReprocessReq()
+    try:
+        shot = store.reprocess_shot(
+            shot_id,
+            reason=body.reason,
+            edited_prompt=body.edited_prompt,
+        )
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/recover-error")
+def recover_shot_error(shot_id: str, req: ErrorRecoverReq | None = None) -> dict[str, Any]:
+    body = req or ErrorRecoverReq()
+    try:
+        shot = store.recover_from_error(shot_id, mode=body.mode)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/shots/{shot_id}")
+def get_shot_detail(shot_id: str) -> dict[str, Any]:
+    try:
+        return {"ok": True, "shot": store.get_shot(shot_id)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/update-prompt")
+def update_shot_prompt(shot_id: str, req: PromptUpdateReq) -> dict[str, Any]:
+    try:
+        shot = store.request_prompt_update(shot_id, req.promptText, req.note)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/rollback")
+def rollback_shot(shot_id: str, req: RollbackReq) -> dict[str, Any]:
+    try:
+        shot = store.rollback_shot(shot_id, req.versionId, sync_to_canvas=req.syncToCanvas)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/shots/{shot_id}/project")
+def update_shot_project(shot_id: str, req: ShotProjectReq) -> dict[str, Any]:
+    try:
+        shot = store.update_shot_project(
+            shot_id,
+            req.projectUuid,
+            project_name=req.projectName,
+            canvas_url=req.canvasUrl,
+            workspace_id=req.workspaceId,
+            platform=req.platform,
+        )
+        eff_plat = normalize_platform(shot.get("platform"))
+        if req.setAsDefault and shot.get("projectUuid"):
+            store.set_default_project(
+                shot["projectUuid"],
+                shot.get("projectName") or "",
+                workspace_id=req.workspaceId if req.workspaceId is not None else "",
+                platform=eff_plat,
+                canvas_url=shot.get("canvasUrl") or "",
+            )
+            store.set_default_platform(eff_plat)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/shots/{shot_id}/scene")
+def update_shot_scene(shot_id: str, req: ShotSceneReq) -> dict[str, Any]:
+    try:
+        shot = store.update_shot_scene(shot_id, req.scene)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/scenes")
+def create_scene(req: SceneCreateReq) -> dict[str, Any]:
+    try:
+        result = store.create_scene(req.name)
+        return {"ok": True, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/scenes/rename")
+def rename_scene(req: SceneRenameReq) -> dict[str, Any]:
+    try:
+        result = store.rename_scene(req.oldName, req.newName)
+        return {"ok": True, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/scenes")
+def delete_scene(name: str = Query(...)) -> dict[str, Any]:
+    try:
+        result = store.delete_scene(name)
+        return {"ok": True, **result}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/sync-canvas")
+@app.post("/api/shots/{shot_id}/sync-libtv")
+def sync_libtv(shot_id: str) -> dict[str, Any]:
+    try:
+        shot = store.get_shot(shot_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    plat = normalize_platform(shot.get("platform"))
+    plat_label = get_platform_label(plat)
+    shot_dir = SHOTS_DIR / shot["id"]
+    try:
+        if plat == "jimeng":
+            info = jimeng_bridge.sync_shot_node(shot, shot_dir)
+        else:
+            info = libtv_bridge.sync_shot_node(shot, shot_dir)
+    except (jimeng_bridge.JimengAuthRequiredError, libtv_bridge.LibtvAuthRequiredError) as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"查询或下载 {plat_label} 节点失败: {exc}") from exc
+
+    updated = store.update_shot_from_libtv_sync(
+        shot["id"],
+        prompt_text=info.get("promptText") or None,
+        mixed_order=info.get("mixedOrder"),
+        draft_path=info.get("draftPath"),
+        remote_draft_url=info.get("remoteUrl") or "",
+        watermark=info.get("watermark"),
+        node_key=info.get("nodeKey"),
+        resource_id=str(info.get("resourceId") or ""),
+    )
+    return {
+        "ok": True,
+        "platform": plat,
+        "shot": updated,
+        "libtv": {
+            "nodeKey": info.get("nodeKey"),
+            "loading": info.get("loading"),
+            "taskStatus": info.get("taskStatus"),
+            "hasRemoteDraft": bool(info.get("remoteUrl") or info.get("draftPath")),
+        },
+    }
+
+
+@app.post("/api/shots/{shot_id}/agent-update")
+def agent_update(shot_id: str, req: AgentUpdateReq) -> dict[str, Any]:
+    try:
+        shot = store.agent_update_shot(shot_id, req.model_dump(exclude_unset=True))
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClaimConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shots/{shot_id}/claim")
+def claim_shot(shot_id: str, req: ClaimShotReq | None = None) -> dict[str, Any]:
+    body = req or ClaimShotReq()
+    try:
+        shot = store.claim_shot(shot_id, worker_id=body.workerId)
+        return {"ok": True, "shot": shot}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClaimConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/shots/{shot_id}")
+def delete_shot(shot_id: str) -> dict[str, Any]:
+    try:
+        store.delete_shot(shot_id)
+        return {"ok": True}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/files/read-text")
+def read_workspace_text(path: str = Query(...)) -> dict[str, Any]:
+    target = Path(path).resolve()
+    allowed_roots = [(WORKSPACE_ROOT / "outputs").resolve(), DATA_ROOT.resolve()]
+    if not any(r in target.parents for r in allowed_roots) or not target.is_file():
+        raise HTTPException(status_code=404, detail="仅支持读取 outputs 或 wash_queue_data 下的文本文件")
+    return {"path": str(target), "content": target.read_text(encoding="utf-8")}
+
+
+@app.get("/api/agent/pending")
+def get_agent_pending() -> dict[str, Any]:
+    return store.get_pending_for_agent()
+
+
+@app.get("/api/agent/status")
+def get_agent_status() -> dict[str, Any]:
+    return agent_presence.snapshot(store.get_state())
+
+
+@app.post("/api/agent/heartbeat")
+def post_agent_heartbeat(req: HeartbeatReq) -> dict[str, Any]:
+    snap = agent_presence.record_heartbeat(
+        req.watcherId,
+        req.mode,
+        busy=req.busy,
+        active_shot_ids=req.activeShotIds,
+        pid=req.pid,
+        ttl_sec=req.ttlSec,
+        last_conversation_id=req.lastConversationId,
+        last_run_at=req.lastRunAt,
+        last_error=req.lastError,
+    )
+    return {"ok": True, "agentStatus": snap}
+
+
+@app.post("/api/agent/bridge/start")
+def start_agent_bridge() -> dict[str, Any]:
+    res = ensure_bridge_running(clear_paused=True)
+    snap = agent_presence.snapshot(store.get_state())
+    return {**res, "agentStatus": snap}
+
+
+@app.post("/api/agent/bridge/stop")
+def stop_agent_bridge() -> dict[str, Any]:
+    res = stop_bridge_process()
+    snap = agent_presence.snapshot(store.get_state())
+    return {**res, "agentStatus": snap}
+
+
+@app.post("/api/agent/bridge/restart")
+def restart_agent_bridge() -> dict[str, Any]:
+    res = restart_bridge_process()
+    snap = agent_presence.snapshot(store.get_state())
+    return {**res, "agentStatus": snap}
+
+
+@app.post("/api/agent/claim")
+def claim_agent_pending(req: ClaimReq | None = None) -> dict[str, Any]:
+    body = req or ClaimReq()
+    if (body.workerId or "").strip() != "agy_bridge":
+        agent_presence.hold_interactive(45.0)
+    res = store.claim_pending(worker_id=body.workerId, limit=body.limit, shot_ids=body.shotIds)
+    return {"ok": True, **res}
+
+
+@app.get("/api/agent/locks")
+def list_agent_locks() -> dict[str, Any]:
+    return {"locks": resource_locks.list_active()}
+
+
+@app.post("/api/agent/locks/{lock_name}/acquire")
+def acquire_agent_lock(lock_name: str, req: LockAcquireReq | None = None) -> Response:
+    body = req or LockAcquireReq()
+    try:
+        res = resource_locks.acquire(lock_name, owner=body.owner, ttl_sec=body.ttlSec, wait_sec=body.waitSec)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not res.get("acquired"):
+        return JSONResponse(status_code=423, content=res)
+    return JSONResponse(status_code=200, content=res)
+
+
+@app.post("/api/agent/locks/{lock_name}/release")
+def release_agent_lock(lock_name: str, req: LockReleaseReq | None = None) -> Response:
+    body = req or LockReleaseReq()
+    try:
+        res = resource_locks.release(lock_name, token=body.token)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if res.get("conflict"):
+        return JSONResponse(status_code=409, content=res)
+    return JSONResponse(status_code=200, content=res)
+
+
+@app.get("/api/events/wait")
+def wait_events(
+    since: int = Query(default=0),
+    timeout: float = Query(default=20.0),
+    actionable: bool = Query(default=False),
+    watcher: str = Query(default=""),
+    mode: str = Query(default=""),
+) -> dict[str, Any]:
+    if watcher.strip() and mode.strip() in {"interactive", "bridge"}:
+        agent_presence.record_heartbeat(
+            watcher.strip(),
+            mode.strip(),
+            ttl_sec=max(float(timeout or 20.0) + 15.0, 35.0),
+        )
+    return store.wait_for_events(since_seq=since, timeout=timeout, only_actionable=actionable)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("WASH_APP_PORT", "8787"))
+    uvicorn.run("server:app", host="127.0.0.1", port=port, reload=False)

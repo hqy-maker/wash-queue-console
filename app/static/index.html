@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>洗片控制台 · Seedance 2.5</title>
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0d1017" media="(prefers-color-scheme: dark)" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="洗片控制台" />
+    <link rel="manifest" href="/static/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/static/icon-192.png" />
+    <link rel="icon" type="image/png" href="/static/icon-192.png" />
+    <link rel="stylesheet" href="/static/styles.css?v=25" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-top">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true"></div>
+            <div>
+              <div class="brand-title">洗片控制台</div>
+              <div class="brand-sub">Seedance 2.5</div>
+            </div>
+          </div>
+          <button id="newShotNavBtn" class="btn btn-primary btn-sm" type="button">+ 新建镜头</button>
+        </div>
+
+        <div class="sidebar-section-head">
+          <span class="sidebar-section-label">镜头列表</span>
+          <button id="newSceneBtn" class="btn btn-secondary btn-xs" type="button" title="新建一个场次文件夹">+ 新建场</button>
+        </div>
+        <div id="shotList" class="shot-list"></div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-left">
+            <span id="topbarTitle" class="topbar-title">新建排片</span>
+            <button id="topbarScenePill" class="pill pill-muted topbar-scene-btn hidden" type="button" title="点击修改所属场号"></button>
+            <span id="topbarStatusPill" class="pill pill-muted hidden"></span>
+          </div>
+
+          <div class="topbar-right">
+            <div id="aiStatusWrap" class="ai-status-wrap">
+              <button
+                id="aiStatusBtn"
+                class="ai-status-pill is-offline"
+                type="button"
+                aria-expanded="false"
+                title="查看 Antigravity 自动连接与后台桥接状态"
+              >
+                <span class="ai-dot" aria-hidden="true"></span>
+                <span id="aiStatusLabel" class="ai-status-label">AI 检查中…</span>
+              </button>
+              <div id="aiStatusPopover" class="ai-popover hidden" role="dialog" aria-label="Antigravity 连接状态"></div>
+            </div>
+            <div id="platformSwitch" class="platform-switch" role="group" aria-label="切换目标平台">
+              <button type="button" class="platform-switch-btn active" data-platform-btn="libtv" title="使用 LibTV 画布工作流">LibTV</button>
+              <button type="button" class="platform-switch-btn" data-platform-btn="jimeng" title="使用即梦官网（dreamina-canvas CLI）">即梦官网</button>
+            </div>
+            <div id="canvasPickerWrap" class="canvas-picker-wrap">
+              <button id="canvasPickerBtn" class="canvas-pill is-interactive" type="button" aria-expanded="false" title="点击切换或新建当前平台画布">
+                <span class="canvas-pill-label">画布</span>
+                <span id="projectNameBadge" class="canvas-pill-name">选择画布</span>
+                <span class="canvas-pill-caret" aria-hidden="true">▾</span>
+              </button>
+              <div id="canvasPopover" class="canvas-popover hidden" role="dialog" aria-label="切换或新建画布"></div>
+            </div>
+            <div id="updateWrap" class="update-wrap">
+              <button
+                id="updatePillBtn"
+                class="update-pill"
+                type="button"
+                aria-expanded="false"
+                title="查看版本与 GitHub 热更新"
+              >
+                <span id="updateDot" class="update-dot hidden" aria-hidden="true"></span>
+                <span id="updatePillLabel" class="update-pill-label">检查版本</span>
+              </button>
+              <div id="updatePopover" class="update-popover hidden" role="dialog" aria-label="GitHub 热更新"></div>
+            </div>
+            <div id="shotMoreWrap" class="more-menu-wrap hidden">
+              <button id="shotMoreBtn" class="icon-btn more-menu-trigger" type="button" aria-expanded="false" title="更多镜头操作">⋯</button>
+              <div id="shotMoreMenu" class="more-popover hidden" role="menu">
+                <button id="topbarReprocessBtn" class="more-menu-item" type="button" role="menuitem" title="中断恢复 · 核查画布连线与 Seedance 提示词自检">
+                  ↻ 重新处理·自检
+                </button>
+                <button id="topbarDeleteShotBtn" class="more-menu-item is-danger" type="button" role="menuitem">
+                  删除镜头
+                </button>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <main id="mainPane" class="main-pane"></main>
+      </div>
+    </div>
+
+    <!-- 角色库新增/编辑弹窗 -->
+    <div id="presetModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h3 id="presetModalTitle">新增角色</h3>
+          <button id="closePresetModalBtn" class="icon-btn" type="button" aria-label="关闭">✕</button>
+        </div>
+        <form id="presetForm" class="modal-body">
+          <input type="hidden" id="presetEditId" value="" />
+          <div class="form-row-2">
+            <label class="field">
+              <span>角色名称 *</span>
+              <input id="presetNameInput" type="text" placeholder="如：主角 A" required />
+            </label>
+            <label class="field">
+              <span>所属场号 *</span>
+              <input
+                id="presetSceneInput"
+                type="text"
+                list="sceneDatalist"
+                placeholder="如：通用 / 第75场"
+                required
+              />
+            </label>
+          </div>
+          <label class="field">
+            <span>外貌特征（可选）</span>
+            <input
+              id="presetHintInput"
+              type="text"
+              placeholder="如：女，20-30岁，扎低马尾，浅米色棉服"
+            />
+          </label>
+          <label id="presetFileField" class="field">
+            <span id="presetFileLabel">角色参考图 *</span>
+            <input id="presetFileInput" type="file" accept="image/*" required />
+          </label>
+          <div class="modal-actions">
+            <button id="deletePresetBtn" class="btn btn-danger-ghost hidden" type="button">
+              删除角色
+            </button>
+            <div class="modal-actions-spacer"></div>
+            <button id="cancelPresetBtn" class="btn btn-secondary" type="button">取消</button>
+            <button id="savePresetBtn" class="btn btn-primary" type="submit">保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- 独立历史版本与回滚弹窗 -->
+    <div id="historyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle">
+      <div class="modal-card history-modal-card">
+        <div class="modal-head">
+          <div class="history-modal-title-wrap">
+            <h3 id="historyModalTitle">历史版本与对话回滚</h3>
+            <span id="historyModalSub" class="history-modal-sub"></span>
+          </div>
+          <button id="closeHistoryModalBtn" class="icon-btn" type="button" aria-label="关闭历史版本窗口">✕</button>
+        </div>
+        <div class="history-shell">
+          <div id="historyVersionList" class="history-timeline-pane"></div>
+          <div id="historyDetailPane" class="history-preview-pane"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 通用二次确认弹窗（含无修改误触重新生成拦截） -->
+    <div id="confirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h3 id="confirmModalTitle">请确认操作</h3>
+          <button id="closeConfirmModalBtn" class="icon-btn" type="button" aria-label="关闭确认弹窗">✕</button>
+        </div>
+        <div class="modal-body">
+          <p id="confirmModalMessage" class="confirm-modal-msg"></p>
+          <div id="confirmModalMeta" class="confirm-meta-box hidden"></div>
+          <div class="modal-actions">
+            <div class="modal-actions-spacer"></div>
+            <button id="confirmCancelBtn" class="btn btn-secondary" type="button">取消</button>
+            <button id="confirmOkBtn" class="btn btn-primary" type="button">确认执行</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 图片预览 / 手涂涂白画板 Lightbox -->
+    <div id="lightboxModal" class="lightbox-backdrop hidden" role="dialog" aria-modal="true">
+      <div class="lightbox-inner" id="lightboxInner">
+        <div id="paintToolbar" class="paint-toolbar hidden">
+          <div class="paint-toolbar-left">
+            <span id="paintCaption" class="paint-caption"></span>
+            <span id="paintDims" class="paint-dims"></span>
+          </div>
+          <div class="paint-toolbar-center">
+            <div class="paint-seg">
+              <button type="button" class="paint-tool-btn active" data-paint-tool="white">✎ 画笔涂白</button>
+              <button type="button" class="paint-tool-btn" data-paint-tool="erase">橡皮还原</button>
+              <button type="button" class="paint-tool-btn" data-paint-tool="pan">✋ 拖动</button>
+            </div>
+            <label class="paint-size-wrap" title="调整画笔粗细">
+              <span>笔触</span>
+              <input id="paintSizeRange" type="range" min="6" max="180" value="44" />
+              <span id="paintSizeVal" class="paint-size-val">44</span>
+            </label>
+            <div class="paint-seg">
+              <button type="button" class="paint-zoom-btn active" data-paint-zoom="fit">适应</button>
+              <button type="button" class="paint-zoom-btn" data-paint-zoom="1">100%</button>
+              <button type="button" class="paint-zoom-btn" data-paint-zoom="2">200%</button>
+            </div>
+            <button id="paintUndoBtn" type="button" class="paint-action-btn" title="撤销上一笔 (⌘Z)">撤销</button>
+            <button id="paintCompareBtn" type="button" class="paint-action-btn" title="按住对比原图">对比原图</button>
+            <button id="paintResetBtn" type="button" class="paint-action-btn" title="清空当前涂抹回到原图">还原原图</button>
+          </div>
+          <div class="paint-toolbar-right">
+            <button id="paintSaveLocalBtn" type="button" class="btn btn-secondary btn-sm hidden">仅保存</button>
+            <button id="paintSavePrimaryBtn" type="button" class="btn btn-primary btn-sm">应用涂白</button>
+            <button id="closePaintBtn" type="button" class="paint-close-btn" aria-label="关闭">✕</button>
+          </div>
+        </div>
+
+        <button id="closeLightboxBtn" class="lightbox-close" type="button" aria-label="关闭预览">✕</button>
+        <img id="lightboxImg" src="" alt="" hidden />
+        <video id="lightboxVideo" src="" controls playsinline preload="metadata" hidden></video>
+
+        <div id="paintViewport" class="paint-viewport hidden">
+          <div id="paintStage" class="paint-stage">
+            <canvas id="paintDisplayCanvas"></canvas>
+            <div id="paintCursorRing" class="paint-cursor-ring hidden"></div>
+          </div>
+        </div>
+
+        <div id="lightboxCaption" class="lightbox-caption"></div>
+      </div>
+    </div>
+
+    <datalist id="sceneDatalist"></datalist>
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/static/app.js?v=25" type="module"></script>
+  </body>
+</html>
