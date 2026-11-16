@@ -288,17 +288,28 @@ def _build_worker_prompt(
     task_type = str(shot.get("processingTaskType") or shot.get("status") or "queued")
     platform = str(shot.get("platform") or "libtv").strip().lower()
     is_jimeng = platform == "jimeng"
+    work_mode = str(shot.get("workMode") or "video_wash").strip().lower()
+    is_creation = work_mode == "video_creation"
     jm = shot.get("jimengMeta") or {}
     if task_type == "queued" and is_jimeng and isinstance(jm, dict) and jm.get("pendingAction") == "promote_1080p":
         task_type = "final_requested"
 
     wash_skill_md = _resolve_skill_path("wash-queue-console")
     dreamina_skill_md = _resolve_skill_path("dreamina-canvas-cli")
-    section_hint = (
-        JIMENG_TASK_SECTION_HINTS.get(task_type)
-        if is_jimeng
-        else TASK_SECTION_HINTS.get(task_type)
-    ) or "请按 wash-queue-console 协议完整处理当前任务。"
+    if is_creation and task_type in {"queued", "recheck_requested"}:
+        section_hint = (
+            "【正常生成模式 · 跳过洗片与深度捕捉】"
+            "仅按 `seedance-video-prompts` 规范（结合用户输入与可选构图/角色参考图；无图时纯文生）撰写 Seedance 2.5 提示词，并在即梦画布创建 480P 样片节点（纯文生 `--mode t2v`，带参考图 `--mode m2v`；只读报价、不代点生成），回写状态为 ready_on_canvas。"
+            if is_jimeng
+            else "【正常生成模式 · 跳过洗片与深度捕捉】"
+            "仅按 `seedance-video-prompts` 与 `libtv-cli` 规范撰写提示词并搭建 LibTV Seedance 2.5 视频生成节点（无需深度动作捕捉），回写状态为 ready_on_canvas。"
+        )
+    else:
+        section_hint = (
+            JIMENG_TASK_SECTION_HINTS.get(task_type)
+            if is_jimeng
+            else TASK_SECTION_HINTS.get(task_type)
+        ) or "请按 wash-queue-console 协议完整处理当前任务。"
 
     all_fbs = shot.get("feedbacks") or []
     pending_fbs = [f for f in all_fbs if isinstance(f, dict) and f.get("status") == "pending"]
@@ -309,6 +320,7 @@ def _build_worker_prompt(
         "id": shot.get("id"),
         "scene": shot.get("scene"),
         "platform": platform,
+        "workMode": work_mode,
         "processingTaskType": task_type,
         "claimToken": shot.get("claimToken"),
         "projectUuid": shot.get("projectUuid"),
@@ -341,10 +353,15 @@ def _build_worker_prompt(
         "depthCdpScriptPath": str(Path(__file__).resolve().parent / "scripts" / "dreamina_depth_cdp.py"),
     }
 
-    chrome_lock_rule = (
-        f"只要需要操作浏览器点击「深度动作捕捉」，务必先调用 `POST {base_url}/api/agent/locks/chrome_ui/acquire`"
-        f"（`{{\"owner\": \"{shot.get('id')}\", \"ttlSec\": 60, \"waitSec\": 45}}`），点完触发后立刻 `POST {base_url}/api/agent/locks/chrome_ui/release` 释放锁，切勿与其他并行镜头争抢 Chrome 焦点。\n"
-    )
+    if is_creation:
+        chrome_lock_rule = (
+            "本镜为「正常生成（`video_creation`）」模式：**禁止**打开或操作 Chrome 浏览器，**禁止**触发任何深度动作捕捉（`dreamina_depth_cdp.py`）。\n"
+        )
+    else:
+        chrome_lock_rule = (
+            f"只要需要操作浏览器点击「深度动作捕捉」，务必先调用 `POST {base_url}/api/agent/locks/chrome_ui/acquire`"
+            f"（`{{\"owner\": \"{shot.get('id')}\", \"ttlSec\": 60, \"waitSec\": 45}}`），点完触发后立刻 `POST {base_url}/api/agent/locks/chrome_ui/release` 释放锁，切勿与其他并行镜头争抢 Chrome 焦点。\n"
+        )
     callback_rule = (
         f"关键节点务必用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（请求体必须带 `claimToken: \"{shot.get('claimToken')}\"`）汇报进度与最终结果；"
         "若对构图图或角色图执行了局部涂白/遮罩（例如生成了 `comp_masked.png`），**必须同步传入** `whiteoutUpdates: [{\"slotTag\": \"图片1\", \"filePath\": \"<绝对路径>\", \"parts\": [...]}]`（并在即梦平台写入 `jimengMeta.maskedCompPath`）；"
@@ -353,17 +370,26 @@ def _build_worker_prompt(
         "若收到 HTTP 409 Conflict 说明任务已被用户新操作取代，立刻停止。\n"
     )
 
-    lightweight_rule = (
-        "6. **严禁空转与消耗本机算力（极重要）**：\n"
-        "   - 听音辨别对白或 SFX 时，优先直接用 `read_file` 读取极轻量的 `prepped.sourceAudioPath`（16kHz 单声道短 WAV，走云端多模态听音，零本机算力）；**严禁在本机调用 `faster-whisper` / `Whisper` / `PyTorch` / `Silero VAD` 或任何离线语音模型**！\n"
-        "   - 看画面直接读取 `prepped.sourceKeyframesPath` 关键帧拼图（如需微查再读 `sourceVideo`），**禁止手写 Python/ffmpeg/PyAV 脚本重新大批量抽原片帧**；\n"
-        "   - **禁止**翻读 `server.py`、`store.py`、`jimeng_bridge.py` 等控制台底层源码，所有可用字段已完整在下方 JSON 与 `wash-queue-console` / `dreamina-canvas --format json schema` 中给出。\n\n"
-    )
+    if is_creation:
+        lightweight_rule = (
+            "6. **极速直写原则（严禁加载洗视频相关 Skill 或空转）**：\n"
+            "   - **严禁**读取 `seedance-video-recreation`、`zdepth-video`、`libtv-seedance-batch`、`wash-queue-console`、`dreamina-canvas-cli` 文档，**禁止**执行 `dreamina-canvas schema` / `auth status` 或抽原片帧/语音分析；\n"
+            "   - 仅按 `seedance-video-prompts` 规范结合用户输入撰写提示词（纯文生 `--mode t2v` 无需读任何图；带参考图时只读相应构图/角色图，**禁止**翻读 `server.py`、`store.py`、`jimeng_bridge.py` 等控制台底层源码）。\n\n"
+        )
+    else:
+        lightweight_rule = (
+            "6. **严禁空转与消耗本机算力（极重要）**：\n"
+            "   - 听音辨别对白或 SFX 时，优先直接用 `read_file` 读取极轻量的 `prepped.sourceAudioPath`（16kHz 单声道短 WAV，走云端多模态听音，零本机算力）；**严禁在本机调用 `faster-whisper` / `Whisper` / `PyTorch` / `Silero VAD` 或任何离线语音模型**！\n"
+            "   - 看画面直接读取 `prepped.sourceKeyframesPath` 关键帧拼图（如需微查再读 `sourceVideo`），**禁止手写 Python/ffmpeg/PyAV 脚本重新大批量抽原片帧**；\n"
+            "   - **禁止**翻读 `server.py`、`store.py`、`jimeng_bridge.py` 等控制台底层源码，所有可用字段已完整在下方 JSON 与 `wash-queue-console` / `dreamina-canvas --format json schema` 中给出。\n\n"
+        )
 
     prepped_dict = prepped or {}
     credit_ceiling = int(brief.get("jimengCreditCeiling") or 0)
     if is_jimeng:
-        if task_type == "queued" and prepped_dict.get("prebuildReady"):
+        if is_creation:
+            skill_list = "（`seedance-video-prompts`）"
+        elif task_type == "queued" and prepped_dict.get("prebuildReady"):
             skill_list = "（`dreamina-canvas-cli`、`seedance-video-recreation`、`seedance-video-prompts`）"
         else:
             skill_list = "（`dreamina-canvas-cli`、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`）"
@@ -375,8 +401,13 @@ def _build_worker_prompt(
             credit_rule = (
                 "3. 若需积分确认请严格遵循 `credits-and-hitl.md`，并将 `nodeId` / `submitId` / `selectedResourceId`（严禁保存 token 或凭据）写入 `jimengMeta`；向用户交付样片时须明确提醒最长存储 7 天。\n"
             )
+        platform_rule_1 = (
+            "1. 目标平台为 **即梦官网（`dreamina-canvas` CLI）**：请直接使用下方内联 `dreamina-canvas --non-interactive --format json` 命令模板并显式传入 `--project-id <projectUuid>`（不得调用未公开接口或查 `schema`）。\n"
+            if is_creation
+            else f"1. 目标平台为 **即梦官网（`dreamina-canvas` CLI）**：请遵循 `{dreamina_skill_md}`（命令入参以 `dreamina-canvas --format json schema` 实测为准，显式传入 `--project-id <projectUuid>`，不得调用未公开接口）。\n"
+        )
         exec_rules = (
-            f"1. 目标平台为 **即梦官网（`dreamina-canvas` CLI）**：请遵循 `{dreamina_skill_md}`（命令入参以 `dreamina-canvas --format json schema` 实测为准，显式传入 `--project-id <projectUuid>`，不得调用未公开接口）。\n"
+            f"{platform_rule_1}"
             f"2. {chrome_lock_rule}"
             f"{credit_rule}"
             f"4. {callback_rule}"
@@ -384,7 +415,11 @@ def _build_worker_prompt(
             f"{lightweight_rule}"
         )
     else:
-        skill_list = "（`libtv-seedance-batch`、`seedance-video-recreation`、`seedance-video-prompts`、`libtv-cli`）"
+        skill_list = (
+            "（`seedance-video-prompts`、`libtv-cli`）"
+            if is_creation
+            else "（`libtv-seedance-batch`、`seedance-video-recreation`、`seedance-video-prompts`、`libtv-cli`）"
+        )
         exec_rules = (
             "1. 多路并行时严禁调用 `libtv group use`，所有 `libtv` 命令显式传 `-p <projectUuid>`（与 `-g <groupKey>`）。\n"
             f"2. {chrome_lock_rule}"
@@ -404,7 +439,7 @@ def _build_worker_prompt(
             f"- 你只需执行 **1 次** `read_file` 查看 `{dl_path}`，确认主体/运镜/画质/音频无硬伤，然后立刻调用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（带 `claimToken`、`status: \"{target_st}\"`、`resolveFeedbacks: true` 及简明 `agentSummary`）即可结束！\n\n"
         )
     elif is_jimeng and task_type == "queued" and prepped_dict:
-        has_src_video = bool(brief.get("sourceVideo") or prepped_dict.get("preuploadedSourceNodeId"))
+        has_src_video = (not is_creation) and bool(brief.get("sourceVideo") or prepped_dict.get("preuploadedSourceNodeId"))
         depth_id = str(prepped_dict.get("pretriggeredDepthNodeId") or "").strip()
         depth_status = str(prepped_dict.get("depthTriggerStatus") or "").strip()
         depth_reason = str(prepped_dict.get("depthTriggerReason") or "").strip()
@@ -417,44 +452,76 @@ def _build_worker_prompt(
                 ordered_refs.append(f"--ref node:{ch['nodeId']}")
         if has_src_video and depth_id:
             ordered_refs.append(f"--ref node:{depth_id}")
-        refs_cli_hint = " ".join(ordered_refs) if ordered_refs else "--ref node:<comp> ..."
+        refs_cli_hint = " ".join(ordered_refs) if ordered_refs else ""
         pid = str(shot.get("projectUuid") or "")
 
-        if not has_src_video:
-            depth_hint = "本镜未上传原片视频（纯图生视频/多图参考模式）：**无需触发或等待深度动作捕捉**，直接引用构图图与角色节点即可。"
-        elif depth_id:
-            depth_hint = (
-                f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，只需查状态 `dreamina-canvas --non-interactive --format json node show --project-id {pid} --node-id {depth_id}` 等其 `status == success`！"
+        if is_creation:
+            creation_kind = str(prepped_dict.get("creationKind") or ("m2v" if ordered_refs else "t2v")).strip().lower()
+            video_mode_flag = "t2v" if creation_kind == "t2v" or not ordered_refs else "m2v"
+            gen_x = 800 if video_mode_flag == "t2v" else 3620
+            refs_suffix = f" {refs_cli_hint}" if (video_mode_flag != "t2v" and refs_cli_hint) else ""
+            prompt_bind_tip = (
+                "<纯文生 Seedance 2.5 提示词，严禁出现 {{node:...}} 或 @图片 引用>"
+                if video_mode_flag == "t2v"
+                else "<写好的提示词，含 {{node:...}} 绑定>"
+            )
+            whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
+            if video_mode_flag == "t2v":
+                whiteout_hint = "无构图图（纯文生视频 `--mode t2v`），无需涂白与参考节点绑定。"
+            elif whiteout_req:
+                whiteout_hint = f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
+            else:
+                whiteout_hint = "用 `read_file` 目视 `compImage`：仅出现真人清晰正面五官且未遮罩时才跑 `scripts/whiteout_mask.py`；否则直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）。"
+            prebuild_section = (
+                "## Fast-Path 正常生成清单（`video_creation` · 极速直出）\n"
+                f"- `prepped.prebuildReady`: `{bool(prepped_dict.get('prebuildReady'))}`，`creationKind = {video_mode_flag}`，`suggestedRowY = {row_y}`\n"
+                "- 已就绪画布节点（**严禁重跑 `node find` 全表、重传素材或 `dreamina-canvas schema` / `auth status`**）：\n"
+                f"  - 构图节点：`{comp_nid or '无（纯文生）'}`{f' (`(800, {row_y})`)' if comp_nid else ''}\n"
+                f"  - 角色参考：`{json.dumps(char_nodes, ensure_ascii=False)}`\n"
+                "- 深度捕捉：**正常生成模式已跳过**（严禁上传原片或触发 Chrome 深度捕捉）。\n"
+                f"- 涂白判断：{whiteout_hint}\n"
+                "- 建样片与只读报价内联命令模板：\n"
+                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode {video_mode_flag} --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x {gen_x} --y {row_y} --prompt \"{prompt_bind_tip}\"{refs_suffix}`（**严禁传 `--run`**）\n"
+                f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
+                f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
             )
         else:
-            depth_hint = (
-                f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {pid} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅脚本失败时才持 `chrome_ui` 锁走 Chrome MCP 手点。"
+            if not has_src_video:
+                depth_hint = "本镜未上传原片视频（纯图生视频/多图参考模式）：**无需触发或等待深度动作捕捉**，直接引用构图图与角色节点即可。"
+            elif depth_id:
+                depth_hint = (
+                    f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，只需查状态 `dreamina-canvas --non-interactive --format json node show --project-id {pid} --node-id {depth_id}` 等其 `status == success`！"
+                )
+            else:
+                depth_hint = (
+                    f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {pid} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅脚本失败时才持 `chrome_ui` 锁走 Chrome MCP 手点。"
+                )
+            whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
+            whiteout_hint = (
+                f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
+                if whiteout_req
+                else "用 `read_file` 目视 `compImage`：仅出现真人清晰正面五官且未遮罩时才跑 `scripts/whiteout_mask.py`；否则直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）。"
             )
-        whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
-        whiteout_hint = (
-            f"用户勾选了涂白 `{whiteout_req}`，须用 `scripts/whiteout_mask.py` 对 `compImage` 涂白上传 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
-            if whiteout_req
-            else "用 `read_file` 目视 `compImage`：仅出现真人清晰正面五官且未遮罩时才跑 `scripts/whiteout_mask.py`；否则直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）。"
-        )
-        src_line = (
-            f"  - 原片节点：`{prepped_dict.get('preuploadedSourceNodeId') or '未建'}` (`(1760, {row_y})`)\n"
-            if has_src_video
-            else "  - 原片节点：无（图+角色多模态直生视频）\n"
-        )
-        prebuild_section = (
-            "## Fast-Path 画布预建与省流清单（务必遵守以极速完成）\n"
-            f"- `prepped.prebuildReady`: `{bool(prepped_dict.get('prebuildReady'))}`，`suggestedRowY = {row_y}`\n"
-            "- 已就绪画布节点（**严禁重跑 `node find` 全表、重传素材或 `dreamina-canvas schema` / `auth status`**）：\n"
-            f"  - 构图节点：`{comp_nid or '未建'}` (`(800, {row_y})`)\n"
-            f"  - 角色参考：`{json.dumps(char_nodes, ensure_ascii=False)}`\n"
-            f"{src_line}"
-            f"- 深度捕捉：{depth_hint}\n"
-            f"- 涂白判断：{whiteout_hint}\n"
-            "- 建样片与只读报价内联命令模板（若更换涂白图请替换第一个 `--ref node:`）：\n"
-            f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode m2v --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x 3620 --y {row_y} --prompt \"<写好的提示词，含 {{node:...}} 绑定>\" {refs_cli_hint}`（**严禁传 `--run`**）\n"
-            f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
-            f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
-        )
+            src_line = (
+                f"  - 原片节点：`{prepped_dict.get('preuploadedSourceNodeId') or '未建'}` (`(1760, {row_y})`)\n"
+                if has_src_video
+                else "  - 原片节点：无（图+角色多模态直生视频）\n"
+            )
+            refs_hint_nonempty = refs_cli_hint or "--ref node:<comp> ..."
+            prebuild_section = (
+                "## Fast-Path 画布预建与省流清单（务必遵守以极速完成）\n"
+                f"- `prepped.prebuildReady`: `{bool(prepped_dict.get('prebuildReady'))}`，`suggestedRowY = {row_y}`\n"
+                "- 已就绪画布节点（**严禁重跑 `node find` 全表、重传素材或 `dreamina-canvas schema` / `auth status`**）：\n"
+                f"  - 构图节点：`{comp_nid or '未建'}` (`(800, {row_y})`)\n"
+                f"  - 角色参考：`{json.dumps(char_nodes, ensure_ascii=False)}`\n"
+                f"{src_line}"
+                f"- 深度捕捉：{depth_hint}\n"
+                f"- 涂白判断：{whiteout_hint}\n"
+                "- 建样片与只读报价内联命令模板（若更换涂白图请替换第一个 `--ref node:`）：\n"
+                f"  1) `dreamina-canvas --non-interactive --format json node create video --project-id {pid} --title \"{shot.get('id')}-样片\" --model seedance_2.5_draft --mode m2v --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x 3620 --y {row_y} --prompt \"<写好的提示词，含 {{node:...}} 绑定>\" {refs_hint_nonempty}`（**严禁传 `--run`**）\n"
+                f"  2) `dreamina-canvas --non-interactive --format json node quote --project-id {pid} --node-id <sampleNodeId>`\n"
+                f"  3) `POST {base_url}/api/shots/{shot.get('id')}/agent-update` 回写 `status: \"ready_on_canvas\"`、`promptText`、`promptFilePath`、`revisionDirection` 与 `jimengMeta`。\n\n"
+            )
 
     recreation_skill = _resolve_skill_path("seedance-video-recreation")
     prompts_skill = _resolve_skill_path("seedance-video-prompts")
@@ -463,14 +530,26 @@ def _build_worker_prompt(
             f"镜头 **{shot.get('id')}** 已由后台 Python 快速通道完成即梦生成与下载，你只需极速核查一次成片并回写结果（**无需阅读任何 Skill 文档，无需调用 Dreamina CLI**）：\n\n"
         )
     elif is_jimeng and task_type == "queued" and prepped_dict.get("prebuildReady") and not is_resume:
-        intro = (
-            "你是由洗片控制台唤醒的 Fast-Path Worker Agent（素材预上传、节点布局与 720P 深度捕捉已前置完成）。\n"
-            f"为极大提速：**跳过阅读 `wash-queue-console`、`dreamina-canvas-cli`、`zdepth-video` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；直接按 `{recreation_skill}` 与 `{prompts_skill}` 规范，看关键帧拼图/构图图/按需听轻量化音频写好提示词并落盘，随后按下方内联命令建样片节点、只读报价并回写完成：\n\n"
-        )
+        if is_creation:
+            intro = (
+                "你是由洗片控制台唤醒的 Fast-Path 正常生成 Worker Agent（已跳过原片抽帧、音频扫描与 720P 深度捕捉）。\n"
+                f"为达到极致速度：**只读 `{prompts_skill}`**，**严禁阅读 `seedance-video-recreation`、`zdepth-video`、`wash-queue-console`、`dreamina-canvas-cli` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；写好提示词并落盘后，直接按下方内联命令建样片节点、只读报价并回写完成：\n\n"
+            )
+        else:
+            intro = (
+                "你是由洗片控制台唤醒的 Fast-Path Worker Agent（素材预上传、节点布局与 720P 深度捕捉已前置完成）。\n"
+                f"为极大提速：**跳过阅读 `wash-queue-console`、`dreamina-canvas-cli`、`zdepth-video` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；直接按 `{recreation_skill}` 与 `{prompts_skill}` 规范，看关键帧拼图/构图图/按需听轻量化音频写好提示词并落盘，随后按下方内联命令建样片节点、只读报价并回写完成：\n\n"
+            )
     elif is_resume:
         intro = (
             f"你正在续接镜头 **{shot.get('id')}** 的专属独立对话（`--conversation` 已保留前序素材、剧情与画布认知，无需从头重学无关镜头）。\n"
             f"请直接处理本次新下发的 **{task_type}** 增量任务：\n\n"
+        )
+    elif is_creation:
+        extra_cli_doc = "" if is_jimeng else f" 与 `{_resolve_skill_path('libtv-cli')}`"
+        intro = (
+            "你是由洗片控制台本地后台桥接器（`agent_bridge.py`）唤醒的 **正常生成（`video_creation`）** Worker Agent。\n"
+            f"请只阅读 `{prompts_skill}`{extra_cli_doc}（**跳过** `seedance-video-recreation` / `zdepth-video` / `libtv-seedance-batch`），然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
         )
     else:
         intro = (
@@ -483,6 +562,7 @@ def _build_worker_prompt(
         f"- 工作区目录：`{WORKSPACE_ROOT}`\n"
         f"- 控制台地址：`{base_url}`\n"
         f"- 目标平台：`{'即梦官网 (jimeng)' if is_jimeng else 'LibTV (libtv)'}`\n"
+        f"- 工作模式：`{'正常生成 (video_creation)' if is_creation else '洗视频 (video_wash)'}`\n"
         f"- 镜头 ID：`{shot.get('id')}`\n"
         f"- 任务类型：`{task_type}`\n"
         f"- `claimToken`：`{shot.get('claimToken')}`\n"
@@ -1145,11 +1225,28 @@ class BridgeRuntime:
 
             if not prepped and SETTINGS["prePrepEnabled"] and task_type in {"queued", "recheck_requested"}:
                 is_jimeng_queued = str(shot.get("platform") or "").lower() == "jimeng" and task_type == "queued"
+                is_creation_mode = str(shot.get("workMode") or "video_wash").strip().lower() == "video_creation"
+                if is_jimeng_queued and is_creation_mode:
+                    prep_phase = "预建画布"
+                    prep_note = "正常生成模式：跳过原片抽帧与深度捕，并发预建参考图与画布布局…"
+                    prep_step = "正常生成模式：并发预建即梦画布布局"
+                elif is_jimeng_queued:
+                    prep_phase = "预建画布与深度捕"
+                    prep_note = "并发上传素材、摆放画布并自动触发 Chrome 720P 深度捕…"
+                    prep_step = "并发预建即梦画布节点并 CDP 触发 720P 深度动作捕捉"
+                elif is_creation_mode:
+                    prep_phase = "扫描画布"
+                    prep_note = "正常生成模式：跳过原片抽帧与音频分析，扫描画布上下文…"
+                    prep_step = "正常生成模式：扫描画布上下文"
+                else:
+                    prep_phase = "预处理素材"
+                    prep_note = "生成关键帧拼图与扫描音频声波…"
+                    prep_step = "预处理关键帧拼图与音频/画布信息"
                 self._update_worker(
                     shot_id,
-                    phase="预建画布与深度捕" if is_jimeng_queued else "预处理素材",
-                    lastNote="并发上传素材、摆放画布并自动触发 Chrome 720P 深度捕…" if is_jimeng_queued else "生成关键帧拼图与扫描音频声波…",
-                    step_note="并发预建即梦画布节点并 CDP 触发 720P 深度动作捕捉" if is_jimeng_queued else "预处理关键帧拼图与音频/画布信息",
+                    phase=prep_phase,
+                    lastNote=prep_note,
+                    step_note=prep_step,
                 )
                 prepped = shot_fastpath.prepare_shot_artifacts(
                     shot,

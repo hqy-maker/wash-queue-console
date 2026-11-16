@@ -169,6 +169,10 @@ const state = {
   updateActionPending: false,
   updateApplying: false,
   builder: {
+    workMode:
+      localStorage.getItem("wash_builder_work_mode") === "video_creation"
+        ? "video_creation"
+        : "video_wash",
     shotId: "",
     shotIdTouched: false,
     title: "",
@@ -272,6 +276,7 @@ function shotMediaSubtitle(s) {
     return mediaDisplayName(s.sourceVideo, "原片视频");
   }
   if (s.compImage) return "仅图参考";
+  if (s.workMode === "video_creation") return "纯文生视频";
   return "";
 }
 
@@ -388,7 +393,7 @@ function buildOrderedBuilderAssets() {
       editableIndex: i,
     });
   });
-  if (state.builder.videoItem) {
+  if (state.builder.workMode !== "video_creation" && state.builder.videoItem) {
     const idx = state.builder.imageItems.length + 1;
     const slotTag = `视频${idx}`;
     const v = state.builder.videoItem;
@@ -3589,6 +3594,7 @@ function renderSidebar() {
                     <div class="shot-item-id-group">
                       <span class="shot-item-id">${escapeHtml(s.id)}</span>
                       ${normalizePlatform(s.platform) === "jimeng" ? `<span class="shot-platform-tag">即梦</span>` : ""}
+                      ${s.workMode === "video_creation" ? `<span class="shot-mode-tag">生成</span>` : ""}
                     </div>
                     <span class="pill ${sm.cls}"${s.status === "error" ? ` title="${escapeHtml(s.errorReason || getShotErrorTag(s))}"` : ""}>${escapeHtml(sm.label)}</span>
                   </div>
@@ -3750,6 +3756,8 @@ function renderBuilderView() {
   const main = document.getElementById("mainPane");
   const d = state.data;
   const b = state.builder;
+  const workMode = b.workMode === "video_creation" ? "video_creation" : "video_wash";
+  const isCreationMode = workMode === "video_creation";
   if (!b.shotIdTouched) {
     b.shotId = suggestNextShotId(d?.shots || []);
   }
@@ -3761,6 +3769,32 @@ function renderBuilderView() {
   b.userPromptTokens = syncedPrompt.tokens;
   b.userPrompt = syncedPrompt.plainText;
   const uploadedImgCount = b.imageItems.filter((it) => !getBuilderItemPresetId(it)).length;
+
+  const modeSliderHtml = `
+    <div class="mode-slider-bar">
+      <div class="mode-slider" role="tablist" aria-label="生成模式切换">
+        <span class="mode-slider-thumb ${isCreationMode ? "is-right" : ""}" aria-hidden="true"></span>
+        <button
+          type="button"
+          role="tab"
+          aria-selected="${isCreationMode ? "false" : "true"}"
+          class="mode-slider-btn ${isCreationMode ? "" : "is-active"}"
+          data-work-mode="video_wash"
+        >🎞️ 洗视频</button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected="${isCreationMode ? "true" : "false"}"
+          class="mode-slider-btn ${isCreationMode ? "is-active" : ""}"
+          data-work-mode="video_creation"
+        >🎬 正常生成</button>
+      </div>
+      <span class="mode-slider-hint">${
+        isCreationMode
+          ? "无需原片 · 仅调 Seedance 写词规范 · 跳过抽帧与 720P 深度捕捉（参考图全空即纯文生 t2v）"
+          : "原片动作复刻 · 调用洗片与提示词双 Skill · 自动抽帧与 720P 深度动作捕捉"
+      }</span>
+    </div>`;
 
   const videoSlotHtml = b.videoItem
     ? `
@@ -3795,9 +3829,58 @@ function renderBuilderView() {
         <div class="dropzone-sub">MP4 / MOV</div>
       </div>`;
 
+  const uploadGridHtml = isCreationMode
+    ? `
+      <div class="upload-split-grid is-single builder-top-divider">
+        <div class="upload-pane">
+          <div class="upload-pane-head">
+            <span class="upload-pane-title">构图 / 参考图（可选 · 全部留空即纯文生 t2v）</span>
+            ${
+              uploadedImgCount > 0
+                ? `<span class="pill pill-blue">${uploadedImgCount} 张</span>`
+                : `<span class="pill pill-muted">可留空或选多张</span>`
+            }
+          </div>
+          <div id="imageDropzone" class="split-dropzone" tabindex="0">
+            <input id="imageFilesInput" type="file" multiple accept="image/*" hidden />
+            <div class="dropzone-icon">+</div>
+            <div class="dropzone-title">拖入首帧构图、场景或道具图（可选）</div>
+            <div class="dropzone-sub">支持多张 · 不传图则自动走纯文生视频（t2v）</div>
+          </div>
+        </div>
+      </div>`
+    : `
+      <div class="upload-split-grid builder-top-divider">
+        <div class="upload-pane">
+          <div class="upload-pane-head">
+            <span class="upload-pane-title">要洗的视频</span>
+            <span class="pill pill-purple">视频</span>
+          </div>
+          ${videoSlotHtml}
+        </div>
+
+        <div class="upload-pane">
+          <div class="upload-pane-head">
+            <span class="upload-pane-title">构图 / 参考图</span>
+            ${
+              uploadedImgCount > 0
+                ? `<span class="pill pill-blue">${uploadedImgCount} 张</span>`
+                : `<span class="pill pill-muted">可选多张</span>`
+            }
+          </div>
+          <div id="imageDropzone" class="split-dropzone" tabindex="0">
+            <input id="imageFilesInput" type="file" multiple accept="image/*" hidden />
+            <div class="dropzone-icon">+</div>
+            <div class="dropzone-title">拖入构图、场景或道具图</div>
+            <div class="dropzone-sub">支持多张同时拖入</div>
+          </div>
+        </div>
+      </div>`;
+
   main.innerHTML = `
     <div class="stack-lg is-builder">
       <section class="card">
+        ${modeSliderHtml}
         <div class="form-row-3">
           <label class="field">
             <span>镜头编号 *</span>
@@ -3813,32 +3896,7 @@ function renderBuilderView() {
           </label>
         </div>
 
-        <div class="upload-split-grid builder-top-divider">
-          <div class="upload-pane">
-            <div class="upload-pane-head">
-              <span class="upload-pane-title">要洗的视频</span>
-              <span class="pill pill-purple">视频</span>
-            </div>
-            ${videoSlotHtml}
-          </div>
-
-          <div class="upload-pane">
-            <div class="upload-pane-head">
-              <span class="upload-pane-title">构图 / 参考图</span>
-              ${
-                uploadedImgCount > 0
-                  ? `<span class="pill pill-blue">${uploadedImgCount} 张</span>`
-                  : `<span class="pill pill-muted">可选多张</span>`
-              }
-            </div>
-            <div id="imageDropzone" class="split-dropzone" tabindex="0">
-              <input id="imageFilesInput" type="file" multiple accept="image/*" hidden />
-              <div class="dropzone-icon">+</div>
-              <div class="dropzone-title">拖入构图、场景或道具图</div>
-              <div class="dropzone-sub">支持多张同时拖入</div>
-            </div>
-          </div>
-        </div>
+        ${uploadGridHtml}
       </section>
 
       <section class="card">
@@ -3870,7 +3928,7 @@ function renderBuilderView() {
         })}
 
         <div class="prompt-editor-shell">
-          <div id="builderPrompt" class="prompt-rich-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="输入提示词，输入 @ 可引用已添加素材"></div>
+          <div id="builderPrompt" class="prompt-rich-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="${isCreationMode ? "输入画面与动作要求，按 Seedance 2.5 规范直接写词（可纯文生，也可 @ 引用参考图）" : "输入提示词，输入 @ 可引用已添加素材"}"></div>
         </div>
 
         <div class="builder-submit-bar">
@@ -3953,6 +4011,18 @@ function bindBuilderEvents() {
   const videoInputEl = document.getElementById("videoFileInput");
   const imageDropEl = document.getElementById("imageDropzone");
   const imageInputEl = document.getElementById("imageFilesInput");
+
+  document.querySelectorAll("[data-work-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const nextMode = btn.dataset.workMode === "video_creation" ? "video_creation" : "video_wash";
+      if (state.builder.workMode === nextMode) return;
+      state.builder.workMode = nextMode;
+      try {
+        localStorage.setItem("wash_builder_work_mode", nextMode);
+      } catch {}
+      renderBuilderView();
+    });
+  });
 
   shotIdEl.addEventListener("input", () => {
     const raw = shotIdEl.value;
@@ -4199,7 +4269,13 @@ function clearBuilderDraft() {
     state.selectedSceneFolder && state.selectedSceneFolder !== "未分场"
       ? state.selectedSceneFolder
       : "";
+  const keepWorkMode =
+    state.builder?.workMode === "video_creation" ||
+    localStorage.getItem("wash_builder_work_mode") === "video_creation"
+      ? "video_creation"
+      : "video_wash";
   state.builder = {
+    workMode: keepWorkMode,
     shotId: suggestNextShotId(state.data?.shots || []),
     shotIdTouched: false,
     title: "",
@@ -4217,12 +4293,18 @@ function clearBuilderDraft() {
 async function submitBuilderShot(forceOverwrite = false) {
   state.builderPromptEditor?.syncAssets(buildOrderedBuilderAssets());
   const b = state.builder;
+  const workMode = b.workMode === "video_creation" ? "video_creation" : "video_wash";
   const shotId = (b.shotId || "").trim();
   if (!shotId) {
     showToast("请填写镜头编号，例如 S02");
     return;
   }
-  if (!b.videoItem && !b.imageItems.length) {
+  if (workMode === "video_creation") {
+    if (!(b.userPrompt || "").trim() && !b.imageItems.length) {
+      showToast("正常生成模式下，请至少填写提示词描述或添加参考图片");
+      return;
+    }
+  } else if (!b.videoItem && !b.imageItems.length) {
     showToast("请至少拖入原片视频或选择/上传参考图片");
     return;
   }
@@ -4253,6 +4335,7 @@ async function submitBuilderShot(forceOverwrite = false) {
     fd.append("title", (b.title || "").trim());
     fd.append("scene", (b.scene || "").trim());
     fd.append("platform", activeCtx.platform);
+    fd.append("work_mode", workMode);
     fd.append("project_uuid", activeCtx.uuid || "");
     fd.append("project_name", activeCtx.name || "");
     fd.append("canvas_url", activeCtx.url || "");
@@ -4265,7 +4348,7 @@ async function submitBuilderShot(forceOverwrite = false) {
       fd.append("overwrite", "true");
     }
 
-    if (b.videoItem) {
+    if (workMode !== "video_creation" && b.videoItem) {
       fd.append("source_video", b.videoItem.file);
     }
 
@@ -4693,6 +4776,7 @@ function renderShotActionBarHtml(shot) {
   return `
     <section class="shot-action-bar" aria-label="整镜全局操作栏">
       <div class="shot-action-meta">
+        ${shot.workMode === "video_creation" ? `<span class="shot-mode-tag is-detail" title="正常生成模式：仅使用 seedance-video-prompts，已跳过原片洗片与深度捕捉">🎬 正常生成</span>` : ""}
         ${passedMetaHtml}
         <span id="shotChangeBadge" class="change-badge ${info.badgeCls}" title="${escapeHtml(info.badgeTitle || "")}">${escapeHtml(passed && !info.hasChanges ? "✓ 与定版正片一致" : info.badgeText)}</span>
       </div>

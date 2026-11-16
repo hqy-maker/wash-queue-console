@@ -113,6 +113,13 @@ def normalize_platform(raw: str | None) -> str:
     return "libtv"
 
 
+def normalize_work_mode(raw: str | None) -> str:
+    clean = (raw or "").strip().lower()
+    if clean in {"video_creation", "creation", "normal", "create", "正常生成"}:
+        return "video_creation"
+    return "video_wash"
+
+
 def get_platform_label(platform: str | None) -> str:
     return "即梦官网" if normalize_platform(platform) == "jimeng" else "LibTV"
 
@@ -576,6 +583,7 @@ def _decorate_shot_payload(
 ) -> dict[str, Any]:
     out = copy.deepcopy(shot)
     out["title"] = str(out.get("title") or "").strip()
+    out["workMode"] = normalize_work_mode(out.get("workMode"))
     plat = normalize_platform(out.get("platform"))
     out["platform"] = plat
     out["platformLabel"] = get_platform_label(plat)
@@ -1702,6 +1710,7 @@ class QueueStore:
         scene: str = "",
         title: str = "",
         platform: str = "",
+        work_mode: str = "video_wash",
         canvas_url: str = "",
         source_filename: str = "",
         source_bytes: bytes = b"",
@@ -1770,12 +1779,17 @@ class QueueStore:
                     shot_dir, project_uuid, list(char_specs or []), uploads_list, presets
                 )
 
-            if not source_video_obj and not comp_obj and not char_refs:
-                raise ValueError("请至少拖入原片视频或参考图片")
+            clean_work_mode = normalize_work_mode(work_mode)
+            if clean_work_mode == "video_creation":
+                if not source_video_obj and not comp_obj and not char_refs and not user_prompt.strip():
+                    raise ValueError("正常生成模式请至少填写生成提示词或添加参考图片")
+            elif not source_video_obj and not comp_obj and not char_refs:
+                raise ValueError("洗视频模式请至少拖入原片视频或参考图片")
 
             clean_whiteout_parts = [str(p).strip() for p in (whiteout_parts or []) if str(p).strip()]
             clean_whiteout_target = whiteout_target.strip()
-            rev_note = f"创建镜头 {sid}" + (" 并确认提交队列" if auto_confirm else "（草稿）")
+            mode_tag = "正常生成" if clean_work_mode == "video_creation" else "洗视频"
+            rev_note = f"创建镜头 {sid}（{mode_tag}）" + (" 并确认提交队列" if auto_confirm else "（草稿）")
             if clean_whiteout_parts:
                 target_label = clean_whiteout_target or "自动识别构图图"
                 rev_note += f" · 涂白选项：{'、'.join(clean_whiteout_parts)}（{target_label}）"
@@ -1795,6 +1809,7 @@ class QueueStore:
             shot = {
                 "id": sid,
                 "title": (title or "").strip(),
+                "workMode": clean_work_mode,
                 "scene": scene.strip(),
                 "status": status,
                 "platform": eff_platform,

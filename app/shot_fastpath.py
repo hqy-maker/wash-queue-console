@@ -504,11 +504,14 @@ def inspect_dreamina_canvas_context(
     *,
     base_url: str = "",
     preupload_source: bool = True,
+    trigger_depth: bool = True,
 ) -> dict[str, Any]:
-    """Scan Dreamina canvas, pre-upload/place shot assets in parallel, and trigger 720P depth capture via CDP."""
+    """Scan Dreamina canvas, pre-upload/place shot assets in parallel, and optionally trigger 720P depth capture via CDP."""
     result: dict[str, Any] = {}
     project_uuid = str(shot.get("projectUuid") or "").strip()
     shot_id = str(shot.get("id") or "").strip()
+    work_mode = str(shot.get("workMode") or "video_wash").strip().lower()
+    is_creation = work_mode == "video_creation"
     if not project_uuid or str(shot.get("platform") or "").lower() != "jimeng":
         return result
     if not jimeng_bridge.get_auth_status().get("authenticated"):
@@ -671,7 +674,7 @@ def inspect_dreamina_canvas_context(
                     cp = Path(spec["filePath"])
                     if cp.is_file():
                         upload_jobs.append((f"char:{cidx}", cp, spec["title"]))
-            if not snap["sourceNodeId"] and src_path.is_file():
+            if not snap["sourceNodeId"] and trigger_depth and not is_creation and src_path.is_file():
                 upload_jobs.append(("source", src_path, f"{shot_id}-原片"))
 
             if upload_jobs:
@@ -779,7 +782,7 @@ def inspect_dreamina_canvas_context(
     # Release layout lock FIRST before attempting Chrome CDP `chrome_ui` lock (prevents lock ordering deadlock)
     source_node_id = str(result.get("preuploadedSourceNodeId") or jm.get("sourceNodeId") or "").strip()
     ddc = _load_dreamina_depth_cdp()
-    if source_node_id and ddc is not None:
+    if trigger_depth and not is_creation and source_node_id and ddc is not None:
         try:
             existing_depth = ddc.find_existing_depth_node(project_uuid, shot_id, source_node_id, items=nodes_summary or None)
             if existing_depth and existing_depth.get("nodeId"):
@@ -804,9 +807,19 @@ def inspect_dreamina_canvas_context(
             result["depthTriggerStatus"] = "fallback_needed"
             result["depthTriggerReason"] = str(dexc)
 
-    has_source = bool(str((shot.get("sourceVideo") or {}).get("filePath") or "").strip())
+    has_source = bool(str((shot.get("sourceVideo") or {}).get("filePath") or "").strip()) and not is_creation
+    has_comp = comp_path.is_file()
+    result["workMode"] = work_mode
     result["hasSourceVideo"] = has_source
-    result["prebuildReady"] = bool(result.get("preuploadedCompNodeId") and (not has_source or result.get("preuploadedSourceNodeId")))
+    result["creationKind"] = "t2v" if (is_creation and not has_comp and not char_specs) else "m2v"
+    if is_creation:
+        result["depthTriggerStatus"] = "skipped_creation_mode"
+        result["prebuildReady"] = bool(
+            ("nodeCount" in result)
+            and (not has_comp or result.get("preuploadedCompNodeId"))
+        )
+    else:
+        result["prebuildReady"] = bool(result.get("preuploadedCompNodeId") and (not has_source or result.get("preuploadedSourceNodeId")))
     if warnings_list:
         result["canvasPrepWarning"] = "; ".join(warnings_list)
     return result
@@ -820,12 +833,13 @@ def prepare_shot_artifacts(
 ) -> dict[str, Any]:
     """Generate local inspection artifacts + canvas coordinate/node context before invoking `agy -p`."""
     sid = str(shot.get("id") or "").strip()
+    work_mode = str(shot.get("workMode") or "video_wash").strip().lower()
     shot_dir = SHOTS_DIR / sid
     shot_dir.mkdir(parents=True, exist_ok=True)
-    out: dict[str, Any] = {}
+    out: dict[str, Any] = {"workMode": work_mode}
 
     src_fp = str((shot.get("sourceVideo") or {}).get("filePath") or "").strip()
-    if src_fp:
+    if src_fp and work_mode != "video_creation":
         src_path = Path(src_fp)
         kf_path = render_source_keyframes(src_path, shot_dir / "source_keyframes.jpg")
         if kf_path is not None:
@@ -846,6 +860,7 @@ def prepare_shot_artifacts(
                 shot,
                 base_url=base_url,
                 preupload_source=preupload_source and (task_type == "queued"),
+                trigger_depth=(work_mode != "video_creation"),
             )
         )
     return out
