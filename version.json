@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.11",
+  "version": "2026.11.16.12",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T22:34:30+08:00",
-  "changelog": "新增即梦单镜积分自动确认上限配置；修复并发冷启动 Keyring 超时反复弹出 Antigravity 登录框并交错启动防并发锁死",
+  "publishedAt": "2026-11-16T22:47:34+08:00",
+  "changelog": "修复 Dreamina node show 单批 25 节点超限问题（改为 20 节点并发批查），实测 114 节点画布秒级精准算出行高",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

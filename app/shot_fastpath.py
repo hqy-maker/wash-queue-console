@@ -398,7 +398,7 @@ def _compute_canvas_layouts(
     nodes_summary: list[dict[str, Any]],
 ) -> tuple[float, dict[str, dict[str, Any]]]:
     all_ids = [str(n.get("nodeId") or "").strip() for n in nodes_summary if n.get("nodeId")]
-    batches = [all_ids[i : i + 25] for i in range(0, len(all_ids), 25)]
+    batches = [all_ids[i : i + 20] for i in range(0, len(all_ids), 20)]
     nodes_by_id: dict[str, dict[str, Any]] = {}
     max_bottom = 0.0
 
