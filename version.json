@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.8",
+  "version": "2026.11.16.9",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T21:21:22+08:00",
-  "changelog": "新增非阻塞无动作卡死看门狗与安全分级自动干预（释放锁/孤儿解救/防误扣费）、全UI报错分类标签（参数冲突/卡住中断/进程中断/运行超时等）、并将5K关键帧拼图与轻量音频抽轨提速至秒级（彻底禁用本地Whisper重算力）。",
+  "publishedAt": "2026-11-16T21:23:51+08:00",
+  "changelog": "修正登录失效诊断规则优先级（authentication failed or timed out 优先归类为登录失效并引导检查浏览器授权页面），同步配套报错标签与自动看门狗。",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

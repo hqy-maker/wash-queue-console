@@ -155,6 +155,12 @@ ERROR_DIAGNOSIS_RULES: tuple[tuple[str, tuple[str, ...], str, str], ...] = (
         "① 若是转 1080P 或生图环节，先点击「↓ 同步成片」或查看本地目录确认是否其实已下载；② 再点「↻ 重试刚才操作」或「🛠 重新自检修复」。",
     ),
     (
+        "auth_expired",
+        ("authentication failed", "401", "403", "not logged in", "unauthorized", "login", "auth", "oauth", "cookie", "token expired", "未登录", "登录", "过期"),
+        "{platform} 登录凭证或 CLI / Google 账号授权已失效、过期或等待浏览器登录超时，导致命令行无法继续读写。",
+        "① 若浏览器弹出 Google 登录/授权页（如 Antigravity Authentication），请先点完成授权；若属 {platform} 未登录请点顶部画布菜单重登；② 完成后点击「↻ 重试刚才操作」。",
+    ),
+    (
         "timeout",
         ("print timeout", "15m0s", "执行超时", "timeout"),
         "本轮后台处理耗时超过单次等待上限（云端生成任务可能仍在排队或其实已出片）。",
@@ -171,12 +177,6 @@ ERROR_DIAGNOSIS_RULES: tuple[tuple[str, tuple[str, ...], str, str], ...] = (
         ("network issue", "connection", "connect", "econnreset", "timed out", "502", "503", "504", "internal (code 500)", "internal error"),
         "与后台 AI 服务或目标平台（{platform}）的网络连接临时中断（未造成额外扣分，提示词、涂白与已出样片均保留完好）。",
         "① 直接点击下方「↻ 重试刚才操作」重新入队执行；② 若连续两次报相同网络错误，请检查网络/代理连接状态或重启桌面端后再试。",
-    ),
-    (
-        "auth_expired",
-        ("401", "403", "not logged in", "unauthorized", "login", "auth", "cookie", "token expired", "未登录", "登录", "过期"),
-        "{platform} 登录凭证已失效或未完成扫码授权，导致命令行无法读取或写入画布。",
-        "① 请点击顶部平台/画布菜单确认并重新登录 {platform}；② 登录成功后点击下方「↻ 重试刚才操作」继续执行。",
     ),
     (
         "credits_insufficient",
@@ -596,13 +596,10 @@ def _decorate_shot_payload(
         raw_detail = str(out.get("errorDetail") or out.get("agentSummary") or "").strip()
         diag = diagnose_error(raw_detail, failed_task=failed_task, platform=plat)
         saved_code = str(out.get("errorCode") or "").strip()
-        resolved_code = (
-            diag["errorCode"]
-            if (not saved_code or (saved_code == "unknown_error" and diag["errorCode"] != "unknown_error"))
-            else saved_code
-        )
+        upgradable = saved_code in {"", "unknown_error", "network_error"} and diag["errorCode"] not in {"unknown_error", saved_code}
+        resolved_code = diag["errorCode"] if upgradable else (saved_code or diag["errorCode"])
         out["errorCode"] = resolved_code
-        if saved_code == "unknown_error" and resolved_code != "unknown_error":
+        if upgradable:
             out["errorTag"] = ERROR_TAG_LABELS.get(resolved_code, diag["errorTag"])
             out["errorReason"] = diag["errorReason"]
             out["errorSolution"] = diag["errorSolution"]
