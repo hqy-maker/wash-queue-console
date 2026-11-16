@@ -120,8 +120,9 @@ description: >-
    - **真并发执行**：`read_file` 多模态读取原片/参考图、生成 `whiteout_mask.py` 涂白图、撰写 Seedance 提示词与 `outputs/{shot_id}_提示词.md`、上传素材到 LibTV、建文本/Seedance 节点、连线、校验与下载，所有 Worker 全程互不阻塞并行执行。
    - **布局短锁（~1 秒）**：在同一张画布新建分组前，先申请画布级布局锁，查清最大右边界并创建不重叠新分组后**立即释放**：
      `POST /api/agent/locks/canvas_layout_<projectUuid>/acquire`（`{"owner": "<shotId>", "ttlSec": 45, "waitSec": 30}`）-> 建组占位 -> `release`。
-   - **Chrome UI 短锁（~3–5 秒）**：无论是 LibTV 还是即梦官网模式，只要操作浏览器执行「选中视频节点 -> 点击 `深度动作捕捉` -> 点击 `确认提取`」这一瞬间，必须先申请全局 `chrome_ui` 锁：
-     `POST /api/agent/locks/chrome_ui/acquire`（`{"owner": "<shotId>", "ttlSec": 60, "waitSec": 45}`）。**点完触发见到云端任务开始跑即可立即 `release` 释放锁**（不必占用锁等云端转码完成），下一路 Worker 立刻接力点提取，云端 3–4 路深度视频生成同时并发推进！
+   - **Chrome UI 短锁（~3–5 秒，优先确定性 CDP 脚本）**：无论是 LibTV 还是即梦官网模式，只要操作浏览器执行「选中视频节点 -> 点击 `深度动作捕捉` -> 点击 `720P` -> 点击 `生成`」这一瞬间，必须先申请全局 `chrome_ui` 锁：
+     `POST /api/agent/locks/chrome_ui/acquire`（`{"owner": "<shotId>", "ttlSec": 60, "waitSec": 45}`）。**即梦官网模式**已由 `shot_fastpath.py` 在唤醒 Worker 前并发预上传构图/角色/原片节点并自动调用 `scripts/dreamina_depth_cdp.py` 通过 Chrome `DevToolsActivePort` 确定性点完 720P 深度动作捕捉（写入 `prepped.pretriggeredDepthNodeId`）；**当 `pretriggeredDepthNodeId` 已存在时，Worker 严禁再打开/操作 Chrome 点击深度捕捉**，直接 `node show` 等该节点就绪即可；仅当 `pretriggeredDepthNodeId` 为空时才先跑 `scripts/dreamina_depth_cdp.py` 补触发，仍失败再降级持 `chrome_ui` 锁用 Chrome MCP 点击。点完触发见到云端任务开始跑即可立即 `release` 释放锁（不必占用锁等云端转码完成），下一路 Worker 立刻接力点提取，云端 3–4 路深度视频生成同时并发推进！
+   - **即梦官网 Fast-Path `queued` 极速路径**：当简报中 `prepped.prebuildReady == true` 时，严禁再用 `node find` 全表扫描画布或重复 `resource upload`，直接使用 `prepped.preuploadedCompNodeId`、`prepped.preuploadedCharRefNodes`、`prepped.preuploadedSourceNodeId`、`prepped.suggestedRowY` 与 `prepped.pretriggeredDepthNodeId`；视觉校验 `compImage` 仅在勾选 `whiteoutOptions.parts` 或画面含未遮罩真人正面人脸时才运行 `scripts/whiteout_mask.py` 上传 `{shot_id}-构图遮罩图`，否则直接复用预建构图节点，写出提示词后直接创建 `{shot_id}-样片`（`--x 3620 --y <suggestedRowY>`，禁止 `--run`）并只读 `node quote` 报价回写 `ready_on_canvas`。
    - 若收到多次连续修改意见（队列简报中包含 `pendingFeedbacks[]`），必须合并核对并逐条落实全部未解决反馈后再传 `resolveFeedbacks: true`。
 4. **乐观锁回写（`claimToken` 防冲突）**
    - 每个 Worker 在执行过程中可用自己的 `claimToken` 频繁回写 `status: "processing"` 实时刷新控制台中的 `agentSummary` 进度条；

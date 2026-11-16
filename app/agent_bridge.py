@@ -256,7 +256,7 @@ TASK_SECTION_HINTS = {
 
 
 JIMENG_TASK_SECTION_HINTS = {
-    "queued": "请严格按 `wash-queue-console` + `dreamina-canvas-cli` 执行：优先利用 `prepped` 中已生成好的 `sourceKeyframesPath`、`sourceAudioSummary`、`suggestedRowY`、`existingPublicRoleNodes` 及 `preuploadedSourceNodeId`（无需重复上传或重扫全画布）；按需涂白构图图并上传、`chrome_ui` 加锁点 Chrome 720P 深度动作捕捉、写提示词落盘 `outputs/{shot_id}_提示词.md`，创建 Seedance `--mode m2v` 节点并完成只读 `node quote` 报价（严禁直接 `node run` 扣费），完成后回写 `ready_on_canvas`、`jimengMeta` 与 `revisionDirection`。",
+    "queued": "请严格按 Fast-Path 预建流执行：优先直接复用 `prepped` 中已预上传并定位好的 `preuploadedCompNodeId`、`preuploadedCharRefNodes`（含 `公共-<角色>`）、`preuploadedSourceNodeId` 及 `pretriggeredDepthNodeId`（无需重扫全画布、重复上传或重开浏览器点深度）；用 `read_file` 看 `prepped.sourceKeyframesPath`（有明显声波才听 `prepped.sourceAudioPath`）并目视 `compImage` 决定是否跑 `whiteout_mask.py` 涂白替换；写出高水准提示词并落盘 `outputs/{shot_id}_提示词.md`，确认景深视频生成就绪后创建 `{shot_id}-样片`（`--mode m2v --model seedance_2.5_draft --ratio 21:9 --resolution 480p --duration <整数秒> --count 1 --x 3620 --y <suggestedRowY>`，严禁传 `--run`）并完成只读 `node quote` 报价，最后回写 `ready_on_canvas`、`jimengMeta` 与 `revisionDirection`。",
     "feedback_queued": "请严格按 `wash-queue-console` + `dreamina-canvas-cli` 处理即梦官网画布修改意见：**必须逐条核对并落实 `pendingFeedbacks[]` 中的全部未处理意见**（例如既有手涂涂白替换，又紧接着补充了细节修改意见），遵循增量修改原则，上传新素材并替换连线与 `dreamina-canvas node edit`（显式 `--project-id`）同步至即梦节点与 `outputs/{shot_id}_提示词.md`，保留既有已归档正片元字段，回写 `ready_on_canvas`、`resolveFeedbacks: true` 与 `revisionDirection`。",
     "recheck_requested": "请用 `dreamina-canvas node show` 与 `schema` 核对即梦官网画布节点/连线/参考顺序/提示词规范并补全同步，恢复合适状态并在 `revisionDirection` / `agentSummary` 汇报结果。",
     "final_requested": "请用 `dreamina-canvas node promote`（若超过 7 天有效期提醒用户）或超清工作流为即梦官网样片转 1080P 正片、下载归档并完成画面与音频全量质检后，回写 `final_ready`。",
@@ -332,6 +332,7 @@ def _build_worker_prompt(
         "pendingFeedbacks": pending_fbs,
         "latestFeedback": shot.get("latestFeedback"),
         "prepped": prepped or {},
+        "depthCdpScriptPath": str(Path(__file__).resolve().parent / "scripts" / "dreamina_depth_cdp.py"),
     }
 
     chrome_lock_rule = (
@@ -353,8 +354,12 @@ def _build_worker_prompt(
         "   - **禁止**翻读 `server.py`、`store.py`、`jimeng_bridge.py` 等控制台底层源码，所有可用字段已完整在下方 JSON 与 `wash-queue-console` / `dreamina-canvas --format json schema` 中给出。\n\n"
     )
 
+    prepped_dict = prepped or {}
     if is_jimeng:
-        skill_list = "（`dreamina-canvas-cli`、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`）"
+        if task_type == "queued" and prepped_dict.get("prebuildReady"):
+            skill_list = "（`dreamina-canvas-cli`、`seedance-video-recreation`、`seedance-video-prompts`）"
+        else:
+            skill_list = "（`dreamina-canvas-cli`、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`）"
         exec_rules = (
             f"1. 目标平台为 **即梦官网（`dreamina-canvas` CLI）**：请遵循 `{dreamina_skill_md}`（命令入参以 `dreamina-canvas --format json schema` 实测为准，显式传入 `--project-id <projectUuid>`，不得调用未公开接口）。\n"
             f"2. {chrome_lock_rule}"
@@ -371,6 +376,34 @@ def _build_worker_prompt(
             f"3. {callback_rule}"
             "4. **禁止**在本 Worker 内启动桥接池或队列常驻监听。\n"
             f"{lightweight_rule}"
+        )
+
+    prebuild_section = ""
+    if is_jimeng and task_type == "queued" and prepped_dict:
+        depth_id = str(prepped_dict.get("pretriggeredDepthNodeId") or "").strip()
+        depth_status = str(prepped_dict.get("depthTriggerStatus") or "").strip()
+        depth_reason = str(prepped_dict.get("depthTriggerReason") or "").strip()
+        depth_hint = (
+            f"已自动通过 Chrome CDP 触发 720P 深度动作捕捉，节点为 **`{depth_id}`**（状态 `{depth_status}`）：**禁止再打开/操作 Chrome 点击深度捕捉**，直接 `dreamina-canvas node show --project-id {shot.get('projectUuid')} --node-id {depth_id}` 确认其进入 `success`（若仍在运行可用 `operation wait` 或短轮询等待）！"
+            if depth_id
+            else f"720P 深度捕捉尚未触发成功（`{depth_reason or 'pending'}`）：请先执行 `.venv/bin/python {brief['depthCdpScriptPath']} --project-id {shot.get('projectUuid')} --shot-id {shot.get('id')} --source-node-id {prepped_dict.get('preuploadedSourceNodeId', '')} --base-url {base_url}`（约 4s 完成）；仅当脚本仍返回失败时再持 `chrome_ui` 锁走 Chrome MCP 手点。"
+        )
+        whiteout_req = prepped_dict.get("whiteoutPartsRequested") or []
+        whiteout_hint = (
+            f"用户明确勾选了涂白部位 `{whiteout_req}`，必须对 `compImage` 运行 `scripts/whiteout_mask.py` 生成 `{shot.get('id')}-构图遮罩图` 并传 `whiteoutUpdates` + `jimengMeta.maskedCompPath`。"
+            if whiteout_req
+            else "请直接用 `read_file` 目视 `compImage`：仅当画面出现真实真人正面五官/清晰人脸且尚未遮罩时，才调用 `scripts/whiteout_mask.py` 涂白并上传 `{shot.get('id')}-构图遮罩图`；若无明确人脸（大景/背影/局部/已遮罩/机械动物），**直接复用 `prepped.preuploadedCompNodeId`（跳过涂白与重传）**。"
+        )
+        prebuild_section = (
+            "## Fast-Path 画布预建与省流清单（务必遵守以极速完成）\n"
+            f"- `prepped.prebuildReady`: `{bool(prepped_dict.get('prebuildReady'))}`，行坐标 `suggestedRowY = {prepped_dict.get('suggestedRowY')}`\n"
+            "- 已自动在画布放好（严禁重复 `node find` 全表或重复 `resource upload`）：\n"
+            f"  - 构图节点：`{prepped_dict.get('preuploadedCompNodeId') or '未建'}`（坐标 `(800, {prepped_dict.get('suggestedRowY')})`）\n"
+            f"  - 角色参考节点：`{json.dumps(prepped_dict.get('preuploadedCharRefNodes') or [], ensure_ascii=False)}`\n"
+            f"  - 原片节点：`{prepped_dict.get('preuploadedSourceNodeId') or '未建'}`（坐标 `(1760, {prepped_dict.get('suggestedRowY')})`）\n"
+            f"- 深度动作捕捉：{depth_hint}\n"
+            f"- 涂白判断：{whiteout_hint}\n"
+            f"- 样片创建位点：等 `{depth_id or 'depthNodeId'}` 状态 `success` 后，直接执行 `dreamina-canvas node create video` 创建 `{shot.get('id')}-样片` 置于 `--x 3620 --y {int(round(float(prepped_dict.get('suggestedRowY') or 0)))}`，严格按参考顺序传 `--reference-node`（先构图节点、再 charRefs、最后景深视频），然后只读 `node quote`，**严禁传 `--run`**，完成后立刻 `agent-update` 回写 `ready_on_canvas`。\n\n"
         )
 
     if is_resume:
@@ -395,6 +428,7 @@ def _build_worker_prompt(
         f"- 任务指引：{section_hint}\n\n"
         "## 执行硬性约束\n"
         f"{exec_rules}"
+        f"{prebuild_section}"
         "## 镜头完整元数据 JSON\n"
         f"```json\n{json.dumps(brief, ensure_ascii=False, indent=2)}\n```\n"
     )
@@ -969,14 +1003,24 @@ class BridgeRuntime:
 
             prepped: dict[str, Any] = {}
             if SETTINGS["prePrepEnabled"] and task_type in {"queued", "recheck_requested"}:
-                self._update_worker(shot_id, phase="预处理素材", lastNote="生成关键帧拼图与扫描音频声波…", step_note="预处理关键帧拼图与音频/画布信息")
+                is_jimeng_queued = str(shot.get("platform") or "").lower() == "jimeng" and task_type == "queued"
+                self._update_worker(
+                    shot_id,
+                    phase="预建画布与深度捕" if is_jimeng_queued else "预处理素材",
+                    lastNote="并发上传素材、摆放画布并自动触发 Chrome 720P 深度捕…" if is_jimeng_queued else "生成关键帧拼图与扫描音频声波…",
+                    step_note="并发预建即梦画布节点并 CDP 触发 720P 深度动作捕捉" if is_jimeng_queued else "预处理关键帧拼图与音频/画布信息",
+                )
                 prepped = shot_fastpath.prepare_shot_artifacts(
                     shot,
                     base_url=self.base_url,
                     preupload_source=(task_type == "queued"),
                 )
                 if prepped:
-                    _log(f"{shot_id} prepped keys={sorted(prepped.keys())}")
+                    _log(
+                        f"{shot_id} prepped keys={sorted(prepped.keys())} "
+                        f"prebuildReady={prepped.get('prebuildReady')} "
+                        f"depthStatus={prepped.get('depthTriggerStatus')}"
+                    )
 
             agy_bin = find_agy_bin()
             if not agy_bin:

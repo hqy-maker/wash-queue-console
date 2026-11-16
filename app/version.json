@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.9",
+  "version": "2026.11.16.10",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T21:23:51+08:00",
-  "changelog": "修正登录失效诊断规则优先级（authentication failed or timed out 优先归类为登录失效并引导检查浏览器授权页面），同步配套报错标签与自动看门狗。",
+  "publishedAt": "2026-11-16T21:49:08+08:00",
+  "changelog": "即梦 queued 极速预建通道（并发上传+确定性Chrome CDP 720P深度捕捉+Worker减负指南）",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

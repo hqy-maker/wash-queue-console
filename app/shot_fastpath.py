@@ -11,6 +11,7 @@ Design goals:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -18,9 +19,11 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import warnings
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -328,13 +331,172 @@ def _release_layout_lock(base_url: str, project_uuid: str, token: str) -> None:
         pass
 
 
+_DEPTH_CDP_MOD: Any = None
+
+
+def _load_dreamina_depth_cdp() -> Any:
+    global _DEPTH_CDP_MOD
+    if _DEPTH_CDP_MOD is not None:
+        return _DEPTH_CDP_MOD
+    script_path = Path(__file__).resolve().parent / "scripts" / "dreamina_depth_cdp.py"
+    if not script_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("wash_dreamina_depth_cdp", script_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _DEPTH_CDP_MOD = mod
+        return mod
+    except Exception:
+        return None
+
+
+def _extract_find_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = data.get("items")
+    if not isinstance(raw, list):
+        raw = data.get("nodes")
+    if not isinstance(raw, list):
+        return []
+    return [n for n in raw if isinstance(n, dict)]
+
+
+def _extract_created_node_id(create_res: dict[str, Any]) -> str:
+    data = create_res.get("data") if isinstance(create_res.get("data"), dict) else {}
+    node_obj = data.get("node") if isinstance(data.get("node"), dict) else {}
+    nid = str(node_obj.get("nodeId") or "").strip()
+    if nid:
+        return nid
+    nodes = data.get("nodes") if isinstance(data.get("nodes"), list) else []
+    if nodes and isinstance(nodes[0], dict):
+        nid = str(nodes[0].get("nodeId") or (nodes[0].get("node") or {}).get("nodeId") or "").strip()
+        if nid:
+            return nid
+    return str(data.get("nodeId") or "").strip()
+
+
+def _list_all_dreamina_items(project_uuid: str, max_pages: int = 12) -> list[dict[str, Any]]:
+    nodes_summary: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(max_pages):
+        find_res = _run_dreamina_json(
+            ["node", "find", "--project-id", project_uuid, "--limit", "50", "--offset", str(offset)],
+            timeout=20,
+        )
+        data = find_res.get("data") or {}
+        page_nodes = _extract_find_items(data)
+        nodes_summary.extend(page_nodes)
+        if not data.get("hasMore") or not page_nodes:
+            break
+        offset += len(page_nodes)
+    return nodes_summary
+
+
+def _compute_canvas_layouts(
+    project_uuid: str,
+    nodes_summary: list[dict[str, Any]],
+) -> tuple[float, dict[str, dict[str, Any]]]:
+    all_ids = [str(n.get("nodeId") or "").strip() for n in nodes_summary if n.get("nodeId")]
+    batches = [all_ids[i : i + 25] for i in range(0, len(all_ids), 25)]
+    nodes_by_id: dict[str, dict[str, Any]] = {}
+    max_bottom = 0.0
+
+    def _fetch_batch(chunk: list[str]) -> list[dict[str, Any]]:
+        cmd = ["node", "show", "--project-id", project_uuid]
+        for nid in chunk:
+            cmd.extend(["--node-id", nid])
+        show_res = _run_dreamina_json(cmd, timeout=25)
+        out_nodes: list[dict[str, Any]] = []
+        for wrap in (show_res.get("data") or {}).get("nodes") or []:
+            node = wrap.get("node") if isinstance(wrap, dict) else None
+            if isinstance(node, dict) and node.get("nodeId"):
+                out_nodes.append(node)
+        return out_nodes
+
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+            for batch_nodes in pool.map(_fetch_batch, batches):
+                for node in batch_nodes:
+                    nid = str(node.get("nodeId") or "")
+                    nodes_by_id[nid] = node
+                    lay = node.get("layout")
+                    if isinstance(lay, dict):
+                        y_val = float(lay.get("y") or 0.0)
+                        h_val = float(lay.get("height") or 320.0)
+                        max_bottom = max(max_bottom, y_val + h_val)
+    return max_bottom, nodes_by_id
+
+
+def _clean_char_node_title(shot_id: str, cref: dict[str, Any], idx: int, used_titles: set[str]) -> str:
+    raw = str(cref.get("roleHint") or cref.get("label") or "").strip()
+    is_hash = bool(re.fullmatch(r"[0-9a-fA-F]{16,64}", raw)) or bool(re.fullmatch(r"image\(\d+\)", raw, re.IGNORECASE))
+    base = "" if (not raw or is_hash) else re.sub(r"[\r\n/\\]+", "_", raw)[:24].strip()
+    cand = f"{shot_id}-{base}" if base else f"{shot_id}-参考图{idx + 1}"
+    if cand in used_titles:
+        cand = f"{cand}_{idx + 1}"
+    used_titles.add(cand)
+    return cand
+
+
+def _upload_media_resource(project_uuid: str, file_path: Path, name: str, timeout: int = 120) -> str:
+    up_res = _run_dreamina_json(
+        [
+            "resource",
+            "upload",
+            "--project-id",
+            project_uuid,
+            "--file",
+            str(file_path),
+            "--name",
+            name,
+            "--import-kind",
+            "local_upload",
+        ],
+        timeout=timeout,
+    )
+    return str((up_res.get("data") or {}).get("resourceId") or "").strip()
+
+
+def _create_canvas_media_node(
+    project_uuid: str,
+    media_kind: str,
+    title: str,
+    resource_id: str,
+    x: float,
+    y: float,
+    timeout: int = 35,
+) -> str:
+    create_res = _run_dreamina_json(
+        [
+            "node",
+            "create",
+            media_kind,
+            "--project-id",
+            project_uuid,
+            "--title",
+            title,
+            "--import-kind",
+            "local_upload",
+            "--resource-id",
+            resource_id,
+            "--x",
+            str(int(round(x))),
+            "--y",
+            str(int(round(y))),
+        ],
+        timeout=timeout,
+    )
+    return _extract_created_node_id(create_res)
+
+
 def inspect_dreamina_canvas_context(
     shot: dict[str, Any],
     *,
     base_url: str = "",
     preupload_source: bool = True,
 ) -> dict[str, Any]:
-    """Read canvas node catalog, reuse role preset nodes, find collision-free Y, and optionally pre-upload source video."""
+    """Scan Dreamina canvas, pre-upload/place shot assets in parallel, and trigger 720P depth capture via CDP."""
     result: dict[str, Any] = {}
     project_uuid = str(shot.get("projectUuid") or "").strip()
     shot_id = str(shot.get("id") or "").strip()
@@ -343,119 +505,299 @@ def inspect_dreamina_canvas_context(
     if not jimeng_bridge.get_auth_status().get("authenticated"):
         return result
 
-    lock_tok = _acquire_layout_lock(base_url, project_uuid, f"{shot_id}_preprep") if preupload_source else ""
-    try:
-        nodes_summary: list[dict[str, Any]] = []
-        offset = 0
-        for _ in range(4):
-            find_res = _run_dreamina_json(
-                ["node", "find", "--project-id", project_uuid, "--limit", "50", "--offset", str(offset)],
-                timeout=20,
-            )
-            data = find_res.get("data") or {}
-            page_nodes = data.get("nodes") or []
-            nodes_summary.extend(n for n in page_nodes if isinstance(n, dict))
-            if not data.get("hasMore") or not page_nodes:
-                break
-            offset += len(page_nodes)
+    jm = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
+    comp_obj = shot.get("compImage") if isinstance(shot.get("compImage"), dict) else {}
+    comp_path = Path(str(jm.get("maskedCompPath") or comp_obj.get("filePath") or ""))
+    src_path = Path(str((shot.get("sourceVideo") or {}).get("filePath") or ""))
+    char_refs = [c for c in (shot.get("charRefs") or []) if isinstance(c, dict)]
+    whiteout_parts = [
+        str(p).strip()
+        for p in ((shot.get("whiteoutOptions") or {}).get("parts") or [])
+        if str(p).strip()
+    ]
+    result["whiteoutPartsRequested"] = whiteout_parts
 
-        existing_source_id = ""
-        public_presets: dict[str, str] = {}
-        char_labels = [str(c.get("label") or "").strip() for c in (shot.get("charRefs") or []) if isinstance(c, dict)]
-        for item in nodes_summary:
-            title = str(item.get("title") or "").strip()
-            nid = str(item.get("nodeId") or "").strip()
-            ntype = str(item.get("type") or "").strip()
+    def _scan_existing(items: list[dict[str, Any]]) -> dict[str, Any]:
+        by_id = {str(it.get("nodeId") or "").strip(): it for it in items if it.get("nodeId")}
+        img_by_title: dict[str, str] = {}
+        vid_by_title: dict[str, str] = {}
+        pub_presets: dict[str, str] = {}
+        char_role_names: set[str] = set()
+        for c in char_refs:
+            lbl = str(c.get("label") or "").strip()
+            rh = str(c.get("roleHint") or "").strip()
+            if lbl:
+                char_role_names.add(lbl)
+            if rh:
+                char_role_names.add(rh)
+
+        for it in items:
+            nid = str(it.get("nodeId") or "").strip()
+            title = str(it.get("title") or "").strip()
+            ntype = str(it.get("type") or "").strip()
             if not nid:
                 continue
-            if ntype == "video" and title in {f"{shot_id}-原片", f"{shot_id}_source"}:
-                existing_source_id = nid
-            if ntype == "image" and title.startswith("公共-"):
-                role_name = title[len("公共-") :].strip()
-                if role_name and role_name in char_labels and role_name not in public_presets:
-                    public_presets[role_name] = nid
+            if ntype == "image":
+                if title and title not in img_by_title:
+                    img_by_title[title] = nid
+                if title.startswith("公共-"):
+                    role_name = title[len("公共-") :].strip()
+                    if role_name and role_name in char_role_names and role_name not in pub_presets:
+                        pub_presets[role_name] = nid
+            elif ntype == "video":
+                if title and title not in vid_by_title:
+                    vid_by_title[title] = nid
 
-        # Compute bottom-most Y boundary across canvas nodes in batches of 25
-        max_bottom = 0.0
-        all_ids = [str(n.get("nodeId") or "").strip() for n in nodes_summary if n.get("nodeId")]
-        for i in range(0, len(all_ids), 25):
-            chunk = all_ids[i : i + 25]
-            cmd = ["node", "show", "--project-id", project_uuid]
-            for nid in chunk:
-                cmd.extend(["--node-id", nid])
-            try:
-                show_res = _run_dreamina_json(cmd, timeout=25)
-                for wrap in (show_res.get("data") or {}).get("nodes") or []:
-                    node = wrap.get("node") if isinstance(wrap, dict) else None
-                    lay = (node or {}).get("layout") if isinstance(node, dict) else None
-                    if isinstance(lay, dict):
-                        y_val = float(lay.get("y") or 0.0)
-                        h_val = float(lay.get("height") or 320.0)
-                        max_bottom = max(max_bottom, y_val + h_val)
-            except Exception:
+        comp_nid = ""
+        comp_masked = False
+        for cand_title, is_masked in (
+            (f"{shot_id}-构图遮罩图", True),
+            (f"{shot_id}-构图图", False),
+            (f"{shot_id}_comp", False),
+        ):
+            if cand_title in img_by_title:
+                comp_nid = img_by_title[cand_title]
+                comp_masked = is_masked
+                break
+        if not comp_nid:
+            jm_comp = str(jm.get("compNodeId") or "").strip()
+            if jm_comp and jm_comp in by_id:
+                comp_nid = jm_comp
+
+        src_nid = ""
+        jm_src = str(jm.get("sourceNodeId") or "").strip()
+        if jm_src and jm_src in by_id:
+            src_nid = jm_src
+        else:
+            for cand_title in (f"{shot_id}-原片", f"{shot_id}_source"):
+                if cand_title in vid_by_title:
+                    src_nid = vid_by_title[cand_title]
+                    break
+
+        sample_nid = ""
+        jm_sample = str(jm.get("sampleNodeId") or "").strip()
+        if jm_sample and jm_sample in by_id:
+            sample_nid = jm_sample
+        elif f"{shot_id}-样片" in vid_by_title:
+            sample_nid = vid_by_title[f"{shot_id}-样片"]
+
+        return {
+            "byId": by_id,
+            "imgByTitle": img_by_title,
+            "vidByTitle": vid_by_title,
+            "publicPresets": pub_presets,
+            "compNodeId": comp_nid,
+            "compMasked": comp_masked,
+            "sourceNodeId": src_nid,
+            "sampleNodeId": sample_nid,
+        }
+
+    warnings_list: list[str] = []
+    lock_tok = ""
+    nodes_summary: list[dict[str, Any]] = []
+    try:
+        nodes_summary = _list_all_dreamina_items(project_uuid)
+        snap = _scan_existing(nodes_summary)
+
+        used_titles: set[str] = set()
+        jm_char_map = jm.get("charRefNodeIds") if isinstance(jm.get("charRefNodeIds"), dict) else {}
+        char_specs: list[dict[str, Any]] = []
+        for idx, cref in enumerate(char_refs):
+            lbl = str(cref.get("label") or "").strip()
+            rh = str(cref.get("roleHint") or "").strip()
+            slot_id = str(cref.get("slotId") or f"char_{idx}").strip()
+            fpath = Path(str(cref.get("filePath") or ""))
+            matched_role = next((r for r in (rh, lbl) if r and r in snap["publicPresets"]), "")
+            if matched_role:
+                char_specs.append(
+                    {
+                        "slotId": slot_id,
+                        "label": lbl,
+                        "roleHint": rh,
+                        "title": f"公共-{matched_role}",
+                        "isPublicPreset": True,
+                        "nodeId": snap["publicPresets"][matched_role],
+                        "resourceId": "",
+                        "filePath": str(fpath) if str(fpath) else "",
+                    }
+                )
                 continue
 
-        suggested_y = float(int(math.ceil((max_bottom + 260.0) / 100.0) * 100)) if max_bottom > 0 else 0.0
+            title = _clean_char_node_title(shot_id, cref, idx, used_titles)
+            existing_cid = ""
+            for key_cand in (rh, lbl, slot_id):
+                if key_cand and str(jm_char_map.get(key_cand) or "") in snap["byId"]:
+                    existing_cid = str(jm_char_map[key_cand])
+                    break
+            if not existing_cid:
+                lk = str(cref.get("libtvNodeKey") or "").strip()
+                if lk and lk in snap["byId"]:
+                    existing_cid = lk
+            if not existing_cid:
+                for cand_t in (title, f"{shot_id}-参考图{idx + 1}"):
+                    if cand_t in snap["imgByTitle"]:
+                        existing_cid = snap["imgByTitle"][cand_t]
+                        break
+            char_specs.append(
+                {
+                    "slotId": slot_id,
+                    "label": lbl,
+                    "roleHint": rh,
+                    "title": title,
+                    "isPublicPreset": False,
+                    "nodeId": existing_cid,
+                    "resourceId": "",
+                    "filePath": str(fpath) if fpath.is_file() else "",
+                }
+            )
+
+        # Parallel media upload stage BEFORE taking the short canvas layout lock
+        uploaded_resources: dict[str, str] = {}
+        if preupload_source:
+            upload_jobs: list[tuple[str, Path, str]] = []
+            if not snap["compNodeId"] and comp_path.is_file():
+                upload_jobs.append(("comp", comp_path, f"{shot_id}-构图图"))
+            for cidx, spec in enumerate(char_specs):
+                if not spec["isPublicPreset"] and not spec["nodeId"] and spec["filePath"]:
+                    cp = Path(spec["filePath"])
+                    if cp.is_file():
+                        upload_jobs.append((f"char:{cidx}", cp, spec["title"]))
+            if not snap["sourceNodeId"] and src_path.is_file():
+                upload_jobs.append(("source", src_path, f"{shot_id}-原片"))
+
+            if upload_jobs:
+                def _run_upload(job: tuple[str, Path, str]) -> tuple[str, str, str]:
+                    key, fp, nm = job
+                    try:
+                        rid = _upload_media_resource(project_uuid, fp, nm, timeout=120)
+                        return key, rid, "" if rid else f"empty resourceId for {nm}"
+                    except Exception as uexc:
+                        return key, "", f"{nm}: {uexc}"
+
+                with ThreadPoolExecutor(max_workers=min(4, len(upload_jobs))) as pool:
+                    for key, rid, err in pool.map(_run_upload, upload_jobs):
+                        if rid:
+                            uploaded_resources[key] = rid
+                        if err:
+                            warnings_list.append(err)
+
+        # Short layout lock ONLY around max_bottom check + node creation
+        suggested_y = 0.0
+        has_pending_nodes = bool(uploaded_resources)
+        if preupload_source and has_pending_nodes:
+            lock_tok = _acquire_layout_lock(base_url, project_uuid, f"{shot_id}_preprep")
+            nodes_summary = _list_all_dreamina_items(project_uuid)
+            snap = _scan_existing(nodes_summary)
+
+        max_bottom, nodes_by_id = _compute_canvas_layouts(project_uuid, nodes_summary)
+        # Anchor rowY to an already-placed shot node if one exists, else pick collision-free bottom Y
+        anchor_id = snap["sourceNodeId"] or snap["compNodeId"]
+        if anchor_id and isinstance((nodes_by_id.get(anchor_id) or {}).get("layout"), dict):
+            suggested_y = float(nodes_by_id[anchor_id]["layout"].get("y") or 0.0)
+        if suggested_y <= 0.0:
+            suggested_y = float(int(math.ceil((max_bottom + 260.0) / 100.0) * 100)) if max_bottom > 0 else 0.0
+
+        comp_node_id = snap["compNodeId"]
+        comp_res_id = str(jm.get("compResourceId") or "").strip()
+        if preupload_source and not comp_node_id and uploaded_resources.get("comp"):
+            comp_res_id = uploaded_resources["comp"]
+            try:
+                comp_node_id = _create_canvas_media_node(
+                    project_uuid, "image", f"{shot_id}-构图图", comp_res_id, 800, suggested_y
+                )
+            except Exception as exc:
+                warnings_list.append(f"create comp node failed: {exc}")
+
+        non_preset_idx = 0
+        for cidx, spec in enumerate(char_specs):
+            if spec["isPublicPreset"]:
+                continue
+            if not spec["nodeId"]:
+                # Re-check post-lock imgByTitle
+                for cand_t in (spec["title"], f"{shot_id}-参考图{cidx + 1}"):
+                    if cand_t in snap["imgByTitle"]:
+                        spec["nodeId"] = snap["imgByTitle"][cand_t]
+                        break
+            if preupload_source and not spec["nodeId"] and uploaded_resources.get(f"char:{cidx}"):
+                crid = uploaded_resources[f"char:{cidx}"]
+                spec["resourceId"] = crid
+                cy = suggested_y + 380.0 * (non_preset_idx + 1)
+                try:
+                    spec["nodeId"] = _create_canvas_media_node(
+                        project_uuid, "image", spec["title"], crid, 800, cy
+                    )
+                    spec["x"] = 800
+                    spec["y"] = cy
+                except Exception as exc:
+                    warnings_list.append(f"create char node {spec['title']} failed: {exc}")
+            non_preset_idx += 1
+
+        source_node_id = snap["sourceNodeId"]
+        source_res_id = str(jm.get("sourceResourceId") or "").strip()
+        if preupload_source and not source_node_id and uploaded_resources.get("source"):
+            source_res_id = uploaded_resources["source"]
+            try:
+                source_node_id = _create_canvas_media_node(
+                    project_uuid, "video", f"{shot_id}-原片", source_res_id, 1760, suggested_y
+                )
+            except Exception as exc:
+                warnings_list.append(f"create source node failed: {exc}")
+
         result["nodeCount"] = len(nodes_summary)
         result["suggestedRowY"] = suggested_y
-        if public_presets:
-            result["existingPublicRoleNodes"] = public_presets
-
-        jm = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
-        src_path = Path(str((shot.get("sourceVideo") or {}).get("filePath") or ""))
-        if existing_source_id:
-            result["preuploadedSourceNodeId"] = existing_source_id
-        elif preupload_source and not jm.get("sourceNodeId") and src_path.is_file():
-            up_res = _run_dreamina_json(
-                [
-                    "resource",
-                    "upload",
-                    "--project-id",
-                    project_uuid,
-                    "--file",
-                    str(src_path),
-                    "--name",
-                    f"{shot_id}-原片",
-                    "--import-kind",
-                    "local_upload",
-                ],
-                timeout=120,
-            )
-            res_id = str((up_res.get("data") or {}).get("resourceId") or "").strip()
-            if res_id:
-                create_res = _run_dreamina_json(
-                    [
-                        "node",
-                        "create",
-                        "video",
-                        "--project-id",
-                        project_uuid,
-                        "--title",
-                        f"{shot_id}-原片",
-                        "--import-kind",
-                        "local_upload",
-                        "--resource-id",
-                        res_id,
-                        "--x",
-                        "1760",
-                        "--y",
-                        str(suggested_y),
-                    ],
-                    timeout=35,
-                )
-                created_nodes = (create_res.get("data") or {}).get("nodes") or []
-                created_id = ""
-                if created_nodes and isinstance(created_nodes[0], dict):
-                    created_id = str(created_nodes[0].get("nodeId") or (created_nodes[0].get("node") or {}).get("nodeId") or "").strip()
-                if not created_id:
-                    created_id = str((create_res.get("data") or {}).get("nodeId") or "").strip()
-                if created_id:
-                    result["preuploadedSourceNodeId"] = created_id
-                    result["preuploadedSourceResourceId"] = res_id
+        if snap["publicPresets"]:
+            result["existingPublicRoleNodes"] = snap["publicPresets"]
+        if comp_node_id:
+            result["preuploadedCompNodeId"] = comp_node_id
+            result["preuploadedCompMasked"] = snap["compMasked"] or bool(jm.get("maskedCompPath"))
+        if comp_res_id:
+            result["preuploadedCompResourceId"] = comp_res_id
+        if char_specs:
+            result["preuploadedCharRefNodes"] = char_specs
+        if source_node_id:
+            result["preuploadedSourceNodeId"] = source_node_id
+        if source_res_id:
+            result["preuploadedSourceResourceId"] = source_res_id
+        if snap["sampleNodeId"]:
+            result["existingSampleNodeId"] = snap["sampleNodeId"]
     except Exception as exc:
-        result["canvasPrepWarning"] = str(exc)
+        warnings_list.append(str(exc))
     finally:
-        _release_layout_lock(base_url, project_uuid, lock_tok)
+        if lock_tok:
+            _release_layout_lock(base_url, project_uuid, lock_tok)
+            lock_tok = ""
+
+    # Release layout lock FIRST before attempting Chrome CDP `chrome_ui` lock (prevents lock ordering deadlock)
+    source_node_id = str(result.get("preuploadedSourceNodeId") or jm.get("sourceNodeId") or "").strip()
+    ddc = _load_dreamina_depth_cdp()
+    if source_node_id and ddc is not None:
+        try:
+            existing_depth = ddc.find_existing_depth_node(project_uuid, shot_id, source_node_id, items=nodes_summary or None)
+            if existing_depth and existing_depth.get("nodeId"):
+                result["pretriggeredDepthNodeId"] = str(existing_depth["nodeId"])
+                result["depthTriggerStatus"] = "already_existed"
+            elif preupload_source:
+                cdp_res = ddc.trigger_dreamina_depth_capture(
+                    project_uuid,
+                    shot_id,
+                    source_node_id,
+                    canvas_url=str(shot.get("canvasUrl") or jm.get("canvasUrl") or ""),
+                    base_url=base_url,
+                    existing_items=nodes_summary or None,
+                )
+                if cdp_res.get("ok") and cdp_res.get("depthNodeId"):
+                    result["pretriggeredDepthNodeId"] = str(cdp_res["depthNodeId"])
+                    result["depthTriggerStatus"] = "already_existed" if cdp_res.get("alreadyExisted") else "triggered_cdp"
+                else:
+                    result["depthTriggerStatus"] = "fallback_needed"
+                    result["depthTriggerReason"] = str(cdp_res.get("reason") or "unknown")
+        except Exception as dexc:
+            result["depthTriggerStatus"] = "fallback_needed"
+            result["depthTriggerReason"] = str(dexc)
+
+    result["prebuildReady"] = bool(result.get("preuploadedSourceNodeId") and result.get("preuploadedCompNodeId"))
+    if warnings_list:
+        result["canvasPrepWarning"] = "; ".join(warnings_list)
     return result
 
 
