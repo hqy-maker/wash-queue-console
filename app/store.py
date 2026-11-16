@@ -253,6 +253,13 @@ def infer_shot_stage_flags(
     }
 
 
+def safe_prompt_update_prev_status(shot: dict[str, Any], cur_status: str) -> str:
+    """Resolve safe restore status after a manual prompt edit/rollback without regressing reopened finals."""
+    if cur_status in {"final_ready", "final_done"} or shot.get("finalModifiedReopened"):
+        return "draft_ready" if (shot.get("draftVideo") or {}).get("mediaUrl") else "ready_on_canvas"
+    return cur_status
+
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
@@ -1390,6 +1397,7 @@ class QueueStore:
                 "confirmationRequest": None,
                 "confirmationHistory": [],
                 "feedbacks": [],
+                "shotConversationId": "",
                 "claimToken": "",
                 "claimedBy": "",
                 "claimedAt": "",
@@ -2015,9 +2023,7 @@ class QueueStore:
 
     @staticmethod
     def _safe_prompt_update_prev_status(shot: dict[str, Any], cur_status: str) -> str:
-        if cur_status in {"final_ready", "final_done"} or shot.get("finalModifiedReopened"):
-            return "draft_ready" if (shot.get("draftVideo") or {}).get("mediaUrl") else "ready_on_canvas"
-        return cur_status
+        return safe_prompt_update_prev_status(shot, cur_status)
 
     def recover_from_error(self, shot_id: str, mode: str = "retry") -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
@@ -2295,6 +2301,8 @@ class QueueStore:
                 conv_id = str(payload.get("conversationId") or "").strip()
                 if rev_dir:
                     shot["latestRevisionDirection"] = rev_dir
+                if conv_id:
+                    shot["shotConversationId"] = conv_id
 
                 updated_result_video = None
                 for vid_field in ("draftVideo", "finalVideo"):

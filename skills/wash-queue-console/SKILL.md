@@ -133,8 +133,9 @@ description: >-
    - **真并发执行**：`read_file` 多模态读取原片/参考图、生成 `whiteout_mask.py` 涂白图、撰写 Seedance 提示词与 `outputs/{shot_id}_提示词.md`、上传素材到 LibTV、建文本/Seedance 节点、连线、校验与下载，所有 Worker 全程互不阻塞并行执行。
    - **布局短锁（~1 秒）**：在同一张画布新建分组前，先申请画布级布局锁，查清最大右边界并创建不重叠新分组后**立即释放**：
      `POST /api/agent/locks/canvas_layout_<projectUuid>/acquire`（`{"owner": "<shotId>", "ttlSec": 45, "waitSec": 30}`）-> 建组占位 -> `release`。
-   - **Chrome UI 短锁（~3–5 秒）**：只有需要操作浏览器中 LibTV 页面执行「选中视频节点 -> 点击 `深度动作捕捉` -> 点击 `确认提取`」这一瞬间时，才申请全局 `chrome_ui` 锁：
-     `POST /api/agent/locks/chrome_ui/acquire`（`{"owner": "<shotId>", "ttlSec": 60, "waitSec": 45}`）。**点完 `确认提取` 见到云端任务开始跑即可立即 `release` 释放锁**（不必占用锁等云端转码完成），下一路 Worker 立刻接力点提取，云端 3 路深度视频生成同时并发推进！
+   - **Chrome UI 短锁（~3–5 秒）**：无论是 LibTV 还是即梦官网模式，只要操作浏览器执行「选中视频节点 -> 点击 `深度动作捕捉` -> 点击 `确认提取`」这一瞬间，必须先申请全局 `chrome_ui` 锁：
+     `POST /api/agent/locks/chrome_ui/acquire`（`{"owner": "<shotId>", "ttlSec": 60, "waitSec": 45}`）。**点完触发见到云端任务开始跑即可立即 `release` 释放锁**（不必占用锁等云端转码完成），下一路 Worker 立刻接力点提取，云端 3–4 路深度视频生成同时并发推进！
+   - 若收到多次连续修改意见（队列简报中包含 `pendingFeedbacks[]`），必须合并核对并逐条落实全部未解决反馈后再传 `resolveFeedbacks: true`。
 4. **乐观锁回写（`claimToken` 防冲突）**
    - 每个 Worker 在执行过程中可用自己的 `claimToken` 频繁回写 `status: "processing"` 实时刷新控制台中的 `agentSummary` 进度条；
    - 最终回写 `ready_on_canvas` / `needs_confirmation` / `draft_ready` / `final_ready` 时**必须携带 `claimToken`**；若服务返回 HTTP `409 Conflict`（说明用户在你处理期间提交了新反馈或点击了“重新处理·自检”，清除了旧令牌），立即停止旧流程，绝不覆盖用户新指令。

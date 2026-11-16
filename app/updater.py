@@ -34,6 +34,7 @@ APP_MANAGED_FILES = [
     "server.py",
     "store.py",
     "updater.py",
+    "shot_fastpath.py",
     "libtv_bridge.py",
     "jimeng_bridge.py",
     "agent_bridge.py",

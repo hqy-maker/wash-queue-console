@@ -63,6 +63,7 @@ def summarize_pending(payload: dict) -> dict:
                     for c in s.get("charRefs", [])
                 ],
                 "latestFeedback": latest_fb,
+                "pendingFeedbacks": fbs,
                 "latestConfirmation": last_conf,
             }
         )

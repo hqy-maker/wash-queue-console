@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.16.2",
+  "version": "2026.11.16.3",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-16T17:50:13+08:00",
-  "changelog": "新增已定版（1080P 已过条）镜头全入口二次确认保护：误点拦截，确认解锁后支持继续生成新版 480P 样片与重转 1080P 正片",
+  "publishedAt": "2026-11-16T18:05:06+08:00",
+  "changelog": "并发提速与稳定性升级：独立桥接 4 路并发池按镜续接会话、PyAV 原片拼图/音轨扫描预处理、改词同步免调大模型快速通道、多条反馈完整下发及即梦 Chrome UI 互斥锁",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

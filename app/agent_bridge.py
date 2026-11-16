@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""Standalone headless Antigravity (`agy`) queue bridge for SHZ Wash Queue Console.
+"""Standalone headless Antigravity (`agy`) queue bridge for Wash Queue Console.
 
-Runs alongside the desktop console (`server.py` on port 8787) so that even when no
-interactive Antigravity conversation is attached, any queued shot, run request,
-prompt sync, feedback, recheck, or 1080P final approval automatically wakes an
-`agy -p` worker (up to 3 in parallel) using the workspace skills.
+Runs alongside `server.py` so queued shots, feedback, prompt sync, recheck, run,
+and 1080P promote tasks are dispatched concurrently across isolated `agy -p`
+workers (default 4 workers, configurable 1..6 via `WASH_BRIDGE_WORKERS` or
+`~/.wash_console/bridge.json`).
 
-When an interactive Antigravity conversation is actively listening (`interactiveOnline`),
-this bridge stays in warm standby so it never steals tasks from the live conversation.
+Performance & safety features:
+1. Per-shot conversation continuity (`--conversation <id>`) on follow-up tasks
+   with automatic clean retry if a resumed conversation is missing/expired.
+2. Deterministic Python fast-path for pure prompt syncs (`prompt_update_requested`)
+   plus pre-computed PyAV keyframe contact sheet, audio RMS scan, and canvas node/Y
+   pre-prep before waking `agy -p`.
+3. Tiered `--effort` (low/medium/high) and safe optional lightweight `--model` routing
+   for maintenance tasks vs creative prompt tasks.
+4. Full `pendingFeedbacks[]` delivery and shared `chrome_ui` mutex locking for both
+   LibTV and Dreamina Chrome depth-capture interactions.
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -28,11 +37,14 @@ from typing import Any
 
 import httpx
 
+import shot_fastpath
 from store import DATA_ROOT, WORKSPACE_ROOT, diagnose_error
 
 HOME_DIR = Path.home()
 LOCK_PATH = DATA_ROOT / "bridge.lock"
 PID_PATH = DATA_ROOT / "bridge.pid"
+SHOT_CONVS_PATH = DATA_ROOT / "shot_conversations.json"
+BRIDGE_CONF_PATH = HOME_DIR / ".wash_console" / "bridge.json"
 
 
 def find_agy_bin() -> str | None:
@@ -42,7 +54,7 @@ def find_agy_bin() -> str | None:
         str(HOME_DIR / ".local" / "bin" / "agy"),
         str(HOME_DIR / ".gemini" / "antigravity" / "bin" / "agy"),
         "/Applications/Antigravity.app/Contents/Resources/app/bin/agy",
-        str(HOME_DIR / "Applications" / "Antigravity.app" / "Contents/Resources/app/bin/agy"),
+        str(HOME_DIR / "Applications" / "Antigravity.app/Contents/Resources/app/bin/agy"),
     ]
     for cand in candidates:
         if cand and os.path.isfile(cand):
@@ -50,17 +62,110 @@ def find_agy_bin() -> str | None:
     return None
 
 
+def _load_bridge_settings() -> dict[str, Any]:
+    raw: dict[str, Any] = {}
+    if BRIDGE_CONF_PATH.is_file():
+        try:
+            loaded = json.loads(BRIDGE_CONF_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                raw = loaded
+        except Exception:
+            raw = {}
+
+    def _int_opt(conf_key: str, env_key: str, default: int, lo: int, hi: int) -> int:
+        val = os.environ.get(env_key, "").strip() or str(raw.get(conf_key) or "").strip()
+        try:
+            num = int(val) if val else default
+        except ValueError:
+            num = default
+        return max(lo, min(num, hi))
+
+    def _bool_opt(conf_key: str, env_key: str, default: bool) -> bool:
+        ev = os.environ.get(env_key, "").strip().lower()
+        if ev in {"1", "true", "yes", "on"}:
+            return True
+        if ev in {"0", "false", "no", "off"}:
+            return False
+        if conf_key in raw:
+            return bool(raw[conf_key])
+        return default
+
+    def _str_opt(conf_key: str, env_key: str, default: str = "") -> str:
+        return (os.environ.get(env_key, "").strip() or str(raw.get(conf_key) or "").strip() or default)
+
+    return {
+        "workers": _int_opt("workers", "WASH_BRIDGE_WORKERS", 4, 1, 6),
+        "timeoutSec": _int_opt("timeoutSec", "WASH_BRIDGE_AGY_TIMEOUT", 900, 120, 3600),
+        "resumeByShot": _bool_opt("resumeByShot", "WASH_BRIDGE_RESUME_SHOT", True),
+        "fastPathEnabled": _bool_opt("fastPathEnabled", "WASH_BRIDGE_FASTPATH", True),
+        "prePrepEnabled": _bool_opt("prePrepEnabled", "WASH_BRIDGE_PREPREP", True),
+        "heavyModel": _str_opt("heavyModel", "WASH_BRIDGE_HEAVY_MODEL", ""),
+        "fastModel": _str_opt("fastModel", "WASH_BRIDGE_FAST_MODEL", ""),
+        "heavyEffort": _str_opt("heavyEffort", "WASH_BRIDGE_HEAVY_EFFORT", "high"),
+        "midEffort": _str_opt("midEffort", "WASH_BRIDGE_MID_EFFORT", "medium"),
+        "fastEffort": _str_opt("fastEffort", "WASH_BRIDGE_FAST_EFFORT", "low"),
+    }
+
+
+SETTINGS = _load_bridge_settings()
 AGY_BIN = find_agy_bin() or str(HOME_DIR / ".local" / "bin" / "agy")
-MAX_WORKERS = max(1, min(int(os.environ.get("WASH_BRIDGE_WORKERS", "3")), 5))
-AGY_TIMEOUT_SEC = max(120, int(os.environ.get("WASH_BRIDGE_AGY_TIMEOUT", "900")))
+MAX_WORKERS = SETTINGS["workers"]
+AGY_TIMEOUT_SEC = SETTINGS["timeoutSec"]
 
 _STOP_EVENT = threading.Event()
 _LOCK_FH: Any = None
+_MODELS_LOCK = threading.Lock()
+_CACHED_AGY_MODELS: set[str] | None = None
 
 
 def _log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     print(f"[{ts}] [bridge] {msg}", flush=True)
+
+
+def _discover_agy_models(agy_bin: str) -> set[str]:
+    global _CACHED_AGY_MODELS
+    with _MODELS_LOCK:
+        if _CACHED_AGY_MODELS is not None:
+            return set(_CACHED_AGY_MODELS)
+        found: set[str] = set()
+        try:
+            proc = subprocess.run(
+                [agy_bin, "models"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+            for line in (proc.stdout or "").splitlines():
+                clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line).strip()
+                if not clean or clean.startswith("Fetching"):
+                    continue
+                first = clean.split()[0]
+                if re.match(r"^[a-zA-Z0-9._-]+$", first):
+                    found.add(first)
+        except Exception:
+            found = set()
+        _CACHED_AGY_MODELS = found
+        return set(found)
+
+
+def _select_execution_profile(task_type: str, available_models: set[str], cfg: dict[str, Any]) -> tuple[str, str]:
+    """Return `(model, effort)` tailored to task complexity."""
+    if task_type in {"prompt_update_requested", "recheck_requested"}:
+        effort = cfg["fastEffort"] or "low"
+        model = cfg["fastModel"]
+        if not model:
+            for cand in ("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-4-argon-low"):
+                if cand in available_models:
+                    model = cand
+                    break
+        return model, effort
+
+    if task_type in {"run_requested", "final_requested"}:
+        return cfg["heavyModel"], cfg["midEffort"] or "medium"
+
+    return cfg["heavyModel"], cfg["heavyEffort"] or "high"
 
 
 def _acquire_singleton_lock(wait_sec: float = 3.5) -> bool:
@@ -97,22 +202,22 @@ def _cleanup_pid_and_lock() -> None:
 
 
 TASK_SECTION_HINTS = {
-    "queued": "请严格按 `wash-queue-console` §3.A（queued 新建排片）执行：多模态直读原片/参考图、按需涂白、写提示词并落盘 `outputs/{shot_id}_提示词.md`、上传/深度动作捕捉/连线 LibTV（不自动点击生成），完成后回写 `ready_on_canvas` 并提供清晰的 `revisionDirection`（概括首版核心思路与保留锚点）。",
-    "feedback_queued": "请严格按 `wash-queue-console` §3.B（feedback_queued 修改意见 / 涂白 / @新图 / 改词）处理，遵循 `seedance-video-prompts` 增量修改铁律（仅修改用户提及处），同步至 LibTV 节点与 `outputs/{shot_id}_提示词.md`，完成后回写 `ready_on_canvas`、置 `resolveFeedbacks: true`，并**必填** `revisionDirection`（向用户简明说明你理解的修改方向、改了哪几处、保留了哪些未动部分）。",
+    "queued": "请严格按 `wash-queue-console` §3.A（queued 新建排片）执行：先查看 `prepped` 里已生成好的 `sourceKeyframesPath` 与 `sourceAudioSummary`（含明显语音时再用 `read_file` 听 `sourceVideo`），按需涂白、写提示词并落盘 `outputs/{shot_id}_提示词.md`、上传/深度动作捕捉/连线 LibTV（不自动点击生成），完成后回写 `ready_on_canvas` 并提供清晰的 `revisionDirection`（概括首版核心思路与保留锚点）。",
+    "feedback_queued": "请严格按 `wash-queue-console` §3.B（feedback_queued 修改意见 / 涂白 / @新图 / 改词）处理，务必逐条落实 `pendingFeedbacks[]` 中的**全部待处理意见**（不止最后一条），遵循 `seedance-video-prompts` 增量修改铁律（仅修改用户提及处），同步至 LibTV 节点与 `outputs/{shot_id}_提示词.md`，完成后回写 `ready_on_canvas`、置 `resolveFeedbacks: true`，并**必填** `revisionDirection`。",
     "recheck_requested": "请严格按 `wash-queue-console` §3.C（recheck_requested 中断恢复与全链路自检）核对画布节点/连线/涂白/提示词/序号对齐并修复，完成后恢复合适状态并在 `revisionDirection` / `agentSummary` 汇报核查修改方向与结果。",
-    "final_requested": "请严格按 `wash-queue-console` §3.D（final_requested 转 1080P 正片并下载归档）运行 `libtv video final` 并下载至 `shots/{shot_id}/final_1080p.mp4`，完成后回写 `final_ready`。",
+    "final_requested": "请严格按 `wash-queue-console` §3.D（final_requested 转 1080P 正片并下载归档）运行 `libtv video final` 并下载至 `shots/{shot_id}/final_1080p.mp4`，完成多模态视听核验后回写 `final_ready`。",
     "run_requested": "请严格按 `wash-queue-console` §3.E（run_requested 执行 Seedance 生成并下载看片）同步待更新提示词（若有）→ 执行 `libtv node ... --run` 等待终态 → 拉回无水印 480P 样片到本地 `draft_480p.mp4` → 多模态直读拉片自检，完成后回写 `draft_ready` 与看片反馈 `revisionDirection`。",
-    "prompt_update_requested": "请严格按 `wash-queue-console` §3.F（prompt_update_requested 同步手动改词/回滚词到画布，不要触发 --run）读取新旧提示词对照并更新 LibTV 画布节点与 `outputs/{shot_id}_提示词.md`，完成后恢复为原状态（`promptUpdatePrevStatus` 或合理状态）、清除 `pendingPromptEdit`，并用 `revisionDirection` 归纳本次手动调词的核心改动方向。",
+    "prompt_update_requested": "请严格按 `wash-queue-console` §3.F（prompt_update_requested 同步手动改词/回滚词到画布，不要触发 --run）读取新旧提示词对照并更新 LibTV 画布节点与 `outputs/{shot_id}_提示词.md`，完成后恢复为 `promptUpdatePrevStatus`（若已解锁定版重改不得恢复为 `final_ready`）、清除 `pendingPromptEdit`，并用 `revisionDirection` 归纳本次手动调词的核心改动方向。",
 }
 
 
 JIMENG_TASK_SECTION_HINTS = {
-    "queued": "请严格按 `wash-queue-console` + `dreamina-canvas-cli` 执行：多模态直读原片/参考图、按需涂白或用 `zdepth-video` 提取景深动作参考视频、写提示词并落盘 `outputs/{shot_id}_提示词.md`；用 `dreamina-canvas resource upload`（显式 `--project-id`）上传素材为 `node`，创建 Seedance `--mode m2v` 生成节点并通过 `{{node:<node-id>}}` 与 `--ref node:<node-id>` 连线（不自动调用 `node run` 扣费），完成后回写 `ready_on_canvas`、节点 ID、`jimengMeta` 与 `revisionDirection`。",
-    "feedback_queued": "请严格按 `wash-queue-console` + `dreamina-canvas-cli` 处理即梦官网画布修改意见：遵循增量修改原则，上传新素材并通过 `dreamina-canvas node edit`（显式 `--project-id`）同步提示词与引用至即梦节点与 `outputs/{shot_id}_提示词.md`，回写 `ready_on_canvas`、`resolveFeedbacks: true` 与 `revisionDirection`。",
+    "queued": "请严格按 `wash-queue-console` + `dreamina-canvas-cli` 执行：优先利用 `prepped` 中已生成好的 `sourceKeyframesPath`、`sourceAudioSummary`、`suggestedRowY`、`existingPublicRoleNodes` 及 `preuploadedSourceNodeId`（无需重复上传或重扫全画布）；按需涂白构图图并上传、`chrome_ui` 加锁点 Chrome 720P 深度动作捕捉、写提示词落盘 `outputs/{shot_id}_提示词.md`，创建 Seedance `--mode m2v` 节点并完成只读 `node quote` 报价（严禁直接 `node run` 扣费），完成后回写 `ready_on_canvas`、`jimengMeta` 与 `revisionDirection`。",
+    "feedback_queued": "请严格按 `wash-queue-console` + `dreamina-canvas-cli` 处理即梦官网画布修改意见：**必须逐条核对并落实 `pendingFeedbacks[]` 中的全部未处理意见**（例如既有手涂涂白替换，又紧接着补充了细节修改意见），遵循增量修改原则，上传新素材并替换连线与 `dreamina-canvas node edit`（显式 `--project-id`）同步至即梦节点与 `outputs/{shot_id}_提示词.md`，保留既有已归档正片元字段，回写 `ready_on_canvas`、`resolveFeedbacks: true` 与 `revisionDirection`。",
     "recheck_requested": "请用 `dreamina-canvas node show` 与 `schema` 核对即梦官网画布节点/连线/参考顺序/提示词规范并补全同步，恢复合适状态并在 `revisionDirection` / `agentSummary` 汇报结果。",
-    "final_requested": "请用 `dreamina-canvas node promote`（若超过 7 天有效期提醒用户）或超清工作流为即梦官网样片转 1080P 正片并下载归档，回写 `final_ready`。",
-    "run_requested": "请严格遵循 `dreamina-canvas-cli` 报价与积分确认规则：先核对待更新提示词并用 `dreamina-canvas node quote` 查看即梦积分报价；若需确认或无用户明确 ceiling 授权请遵循 `credits-and-hitl.md` 停下询问并保存 `jimengMeta` 中的 `submitId`；取得批准后执行 `node confirm`/`node run`、检查产物终态并交付结果（样片交付时务必提醒最长存储 7 天）。",
-    "prompt_update_requested": "请对照 `promptText` 与 `previousPromptText`，通过 `dreamina-canvas node edit`（显式 `--project-id`，不自动触发 `node run`）将改词同步回即梦官网画布节点与 `outputs/{shot_id}_提示词.md`，完成后恢复为 `promptUpdatePrevStatus` 并清除 `pendingPromptEdit`。",
+    "final_requested": "请用 `dreamina-canvas node promote`（若超过 7 天有效期提醒用户）或超清工作流为即梦官网样片转 1080P 正片、下载归档并完成画面与音频全量质检后，回写 `final_ready`。",
+    "run_requested": "请严格遵循 `dreamina-canvas-cli` 报价与积分确认规则：先核对待更新提示词并用 `dreamina-canvas node quote` 查看即梦积分报价；若需确认或无用户明确 ceiling 授权请遵循 `credits-and-hitl.md` 停下询问并保存 `jimengMeta` 中的 `submitId`；取得批准后执行 `node confirm`/`node run`、下载并多模态自检成片后再回写结果（样片交付时务必提醒最长存储 7 天）。",
+    "prompt_update_requested": "请对照 `promptText` 与 `previousPromptText`，通过 `dreamina-canvas node edit video`（显式 `--project-id` 与完整 generation/ref 参数，不触发 `node run`）将改词同步回即梦官网画布节点与 `outputs/{shot_id}_提示词.md`，完成后恢复为 `promptUpdatePrevStatus`（若已有 `finalModifiedReopened` 标记不得回写 `final_ready`）并清除 `pendingPromptEdit`。",
 }
 
 
@@ -128,13 +233,20 @@ def _resolve_skill_path(skill_name: str) -> str:
     return str(candidates[0])
 
 
-def _build_worker_prompt(shot: dict[str, Any], base_url: str) -> str:
+def _build_worker_prompt(
+    shot: dict[str, Any],
+    base_url: str,
+    *,
+    prepped: dict[str, Any] | None = None,
+    is_resume: bool = False,
+) -> str:
     task_type = str(shot.get("processingTaskType") or shot.get("status") or "queued")
     platform = str(shot.get("platform") or "libtv").strip().lower()
     is_jimeng = platform == "jimeng"
     jm = shot.get("jimengMeta") or {}
     if task_type == "queued" and is_jimeng and isinstance(jm, dict) and jm.get("pendingAction") == "promote_1080p":
         task_type = "final_requested"
+
     wash_skill_md = _resolve_skill_path("wash-queue-console")
     dreamina_skill_md = _resolve_skill_path("dreamina-canvas-cli")
     section_hint = (
@@ -142,6 +254,12 @@ def _build_worker_prompt(shot: dict[str, Any], base_url: str) -> str:
         if is_jimeng
         else TASK_SECTION_HINTS.get(task_type)
     ) or "请按 wash-queue-console 协议完整处理当前任务。"
+
+    all_fbs = shot.get("feedbacks") or []
+    pending_fbs = [f for f in all_fbs if isinstance(f, dict) and f.get("status") == "pending"]
+    if not pending_fbs and isinstance(shot.get("latestFeedback"), dict):
+        pending_fbs = [shot["latestFeedback"]]
+
     brief = {
         "id": shot.get("id"),
         "scene": shot.get("scene"),
@@ -167,35 +285,54 @@ def _build_worker_prompt(shot: dict[str, Any], base_url: str) -> str:
         "libtvMixedOrder": shot.get("libtvMixedOrder"),
         "jimengMeta": shot.get("jimengMeta"),
         "promptFilePath": shot.get("promptFilePath"),
+        "pendingFeedbacks": pending_fbs,
         "latestFeedback": shot.get("latestFeedback"),
+        "prepped": prepped or {},
     }
+
+    chrome_lock_rule = (
+        f"只要需要操作浏览器点击「深度动作捕捉」，务必先调用 `POST {base_url}/api/agent/locks/chrome_ui/acquire`"
+        f"（`{{\"owner\": \"{shot.get('id')}\", \"ttlSec\": 60, \"waitSec\": 45}}`），点完触发后立刻 `POST {base_url}/api/agent/locks/chrome_ui/release` 释放锁，切勿与其他并行镜头争抢 Chrome 焦点。\n"
+    )
+    callback_rule = (
+        f"关键节点务必用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（请求体必须带 `claimToken: \"{shot.get('claimToken')}\"`）汇报进度与最终结果；"
+        "若对构图图或角色图执行了局部涂白/遮罩（例如生成了 `comp_masked.png`），**必须同步传入** `whiteoutUpdates: [{\"slotTag\": \"图片1\", \"filePath\": \"<绝对路径>\", \"parts\": [...]}]`（并在即梦平台写入 `jimengMeta.maskedCompPath`）；"
+        "修改或撰写提示词后**必须同时传入 `revisionDirection`** 以及 `conversationId`（若可知）；"
+        "若收到 `pendingFeedbacks[]` 多条待办须**全部落实后**再置 `resolveFeedbacks: true`；"
+        "若收到 HTTP 409 Conflict 说明任务已被用户新操作取代，立刻停止。\n"
+    )
+
     if is_jimeng:
         skill_list = "（`dreamina-canvas-cli`、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`）"
         exec_rules = (
-            f"1. 本镜头目标平台为 **即梦官网（`dreamina-canvas` CLI）**，请先阅读 `{dreamina_skill_md}`，命令入参以 `dreamina-canvas --format json schema` 实测为准，显式传入 `--project-id <projectUuid>`，不得调用未公开接口。\n"
-            "2. 若需积分确认请严格遵循 `credits-and-hitl.md`，并将 `nodeId` / `submitId` / `selectedResourceId`（严禁保存 token 或凭据）写入 `jimengMeta`；向用户交付样片时须明确提醒最长存储 7 天。\n"
-            f"3. 关键节点务必用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（请求体必须带 `claimToken: \"{shot.get('claimToken')}\"`）汇报进度与最终结果；"
-            "若对构图图或角色图执行了局部涂白/遮罩（例如生成了 `comp_masked.png`），**必须同步传入** `whiteoutUpdates: [{\"slotTag\": \"图片1\", \"filePath\": \"<绝对路径>\", \"parts\": [...]}]`（并在即梦平台写入 `jimengMeta.maskedCompPath`），确保控制台缩略图立即更新为涂白图并保留原图对比；"
-            "修改或撰写提示词后**必须同时传入 `revisionDirection`**（1–2 句话精炼说明你理解的修改方向、改了哪几处、保留了哪些未动部分）以及 `conversationId`（若可知）；"
-            "若收到 HTTP 409 Conflict 说明任务已被用户新操作取代，立刻停止。\n"
-            "4. **禁止**在本 Worker 内启动 `watch_queue.py`（外层桥接进程会统一监听队列与调度并发）。\n\n"
+            f"1. 目标平台为 **即梦官网（`dreamina-canvas` CLI）**：请遵循 `{dreamina_skill_md}`（命令入参以 `dreamina-canvas --format json schema` 实测为准，显式传入 `--project-id <projectUuid>`，不得调用未公开接口）。\n"
+            f"2. {chrome_lock_rule}"
+            "3. 若需积分确认请严格遵循 `credits-and-hitl.md`，并将 `nodeId` / `submitId` / `selectedResourceId`（严禁保存 token 或凭据）写入 `jimengMeta`；向用户交付样片时须明确提醒最长存储 7 天。\n"
+            f"4. {callback_rule}"
+            "5. **禁止**在本 Worker 内启动 `watch_queue.py`。\n\n"
         )
     else:
         skill_list = "（`libtv-seedance-batch`、`seedance-video-recreation`、`seedance-video-prompts`、`libtv-cli`）"
         exec_rules = (
             "1. 多路并行时严禁调用 `libtv group use`，所有 `libtv` 命令显式传 `-p <projectUuid>`（与 `-g <groupKey>`）。\n"
-            "2. 只有需要点网页「深度动作捕捉」且 Chrome UI 未占锁时，才通过 `/api/agent/locks/chrome_ui/acquire` 申请短锁并在点完「确认提取」后立刻 release。\n"
-            f"3. 关键节点务必用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（请求体必须带 `claimToken: \"{shot.get('claimToken')}\"`）汇报进度与最终结果；"
-            "若对构图图或角色图执行了局部涂白/遮罩（例如生成了 `comp_masked.png`），**必须同步传入** `whiteoutUpdates: [{\"slotTag\": \"图片1\", \"filePath\": \"<绝对路径>\", \"parts\": [...]}]`（并在即梦平台写入 `jimengMeta.maskedCompPath`），确保控制台缩略图立即更新为涂白图并保留原图对比；"
-            "修改或撰写提示词后**必须同时传入 `revisionDirection`**（1–2 句话精炼说明你理解的修改方向、改了哪几处、保留了哪些未动部分）以及 `conversationId`（若可知）；"
-            "若收到 HTTP 409 Conflict 说明任务已被用户新操作取代，立刻停止。\n"
-            "4. **禁止**在本 Worker 内启动 `watch_queue.py`（外层桥接进程会统一监听队列与调度并发）。\n\n"
+            f"2. {chrome_lock_rule}"
+            f"3. {callback_rule}"
+            "4. **禁止**在本 Worker 内启动 `watch_queue.py`。\n\n"
         )
+
+    if is_resume:
+        intro = (
+            f"你正在续接镜头 **{shot.get('id')}** 的专属独立对话（`--conversation` 已保留前序素材、剧情与画布认知，无需从头重学无关镜头）。\n"
+            f"请直接处理本次新下发的 **{task_type}** 增量任务：\n\n"
+        )
+    else:
+        intro = (
+            "你是由洗片控制台本地后台桥接器（`agent_bridge.py`）自动唤醒的 Worker Agent。\n"
+            f"请先阅读 `{wash_skill_md}` 及本任务涉及的配套 Skill{skill_list}，然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
+        )
+
     return (
-        "你是由洗片控制台本地后台桥接器（`agent_bridge.py`）自动唤醒的 Worker Agent。\n"
-        f"请先阅读 `{wash_skill_md}` 及本任务涉及的配套 Skill"
-        f"{skill_list}，"
-        "然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
+        f"{intro}"
         f"- 工作区目录：`{WORKSPACE_ROOT}`\n"
         f"- 控制台地址：`{base_url}`\n"
         f"- 目标平台：`{'即梦官网 (jimeng)' if is_jimeng else 'LibTV (libtv)'}`\n"
@@ -211,11 +348,12 @@ def _build_worker_prompt(shot: dict[str, Any], base_url: str) -> str:
 
 
 class BridgeRuntime:
-    """Coordinates heartbeats, standby vs active claiming, and parallel `agy -p` execution."""
+    """Coordinates heartbeats, standby vs active claiming, per-shot sessions, fast-paths & parallel `agy -p`."""
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url
         self._lock = threading.Lock()
+        self._conv_lock = threading.Lock()
         self._active: dict[str, Future[None]] = {}
         self._last_conv_id = ""
         self._last_run_at = ""
@@ -224,6 +362,57 @@ class BridgeRuntime:
     def active_ids(self) -> list[str]:
         with self._lock:
             return sorted(self._active.keys())
+
+    def _load_shot_convs(self) -> dict[str, Any]:
+        if not SHOT_CONVS_PATH.is_file():
+            return {}
+        try:
+            data = json.loads(SHOT_CONVS_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_shot_convs(self, data: dict[str, Any]) -> None:
+        SHOT_CONVS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SHOT_CONVS_PATH.with_name(f".{SHOT_CONVS_PATH.name}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(SHOT_CONVS_PATH)
+
+    def _get_shot_conversation_id(self, shot: dict[str, Any]) -> str:
+        sid = str(shot.get("id") or "").strip()
+        platform = str(shot.get("platform") or "libtv").strip().lower()
+        proj_uuid = str(shot.get("projectUuid") or "").strip()
+        with self._conv_lock:
+            convs = self._load_shot_convs()
+            rec = convs.get(sid)
+            if isinstance(rec, dict):
+                cid = str(rec.get("conversationId") or "").strip()
+                if cid and rec.get("platform") == platform and rec.get("projectUuid", "") == proj_uuid:
+                    return cid
+        return str(shot.get("shotConversationId") or "").strip()
+
+    def _set_shot_conversation_id(self, shot: dict[str, Any], conv_id: str) -> None:
+        if not conv_id:
+            return
+        sid = str(shot.get("id") or "").strip()
+        platform = str(shot.get("platform") or "libtv").strip().lower()
+        proj_uuid = str(shot.get("projectUuid") or "").strip()
+        with self._conv_lock:
+            convs = self._load_shot_convs()
+            convs[sid] = {
+                "conversationId": conv_id,
+                "platform": platform,
+                "projectUuid": proj_uuid,
+                "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            }
+            self._save_shot_convs(convs)
+
+    def _clear_shot_conversation_id(self, shot_id: str) -> None:
+        with self._conv_lock:
+            convs = self._load_shot_convs()
+            if shot_id in convs:
+                convs.pop(shot_id, None)
+                self._save_shot_convs(convs)
 
     def _send_heartbeat(self, client: httpx.Client) -> dict[str, Any] | None:
         ids = self.active_ids()
@@ -253,6 +442,17 @@ class BridgeRuntime:
             return None
         return None
 
+    def _claim_still_ours(self, shot_id: str, claim_token: str) -> bool:
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=8.0) as client:
+                r = client.get(f"/api/shots/{shot_id}")
+                if r.status_code != 200:
+                    return False
+                shot = r.json().get("shot") or {}
+                return shot.get("status") == "processing" and shot.get("claimToken") == claim_token
+        except Exception:
+            return False
+
     def _ensure_not_stuck_processing(self, shot_id: str, claim_token: str, reason: str) -> None:
         try:
             with httpx.Client(base_url=self.base_url, timeout=10.0) as client:
@@ -281,27 +481,30 @@ class BridgeRuntime:
         except Exception as exc:
             _log(f"{shot_id} failed-state cleanup error: {exc}")
 
-    def _run_shot_worker(self, shot: dict[str, Any]) -> None:
+    def _invoke_agy_once(
+        self,
+        shot: dict[str, Any],
+        prompt: str,
+        *,
+        agy_bin: str,
+        model: str = "",
+        effort: str = "",
+        resume_conv_id: str = "",
+    ) -> tuple[str, str, str]:
         shot_id = str(shot["id"])
-        claim_token = str(shot.get("claimToken") or "")
-        task_type = str(shot.get("processingTaskType") or "")
-        _log(f"start worker shot={shot_id} task={task_type} token={claim_token}")
-
-        prompt = _build_worker_prompt(shot, self.base_url)
         env = os.environ.copy()
         extra_path = f"{HOME_DIR / '.local' / 'bin'}:{HOME_DIR / '.libtv'}:/opt/homebrew/bin:/usr/local/bin"
         env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
 
-        conv_id = ""
-        err_msg = ""
-        last_status = ""
-        proc: subprocess.Popen[str] | None = None
-        try:
-            agy_bin = find_agy_bin()
-            if not agy_bin:
-                raise FileNotFoundError("本机未检测到 Antigravity agy CLI（安装 Antigravity 后重试）")
-            cmd = [
-                agy_bin,
+        cmd = [agy_bin]
+        if resume_conv_id:
+            cmd.extend(["--conversation", resume_conv_id])
+        if model:
+            cmd.extend(["--model", model])
+        if effort in {"low", "medium", "high", "xhigh", "max"}:
+            cmd.extend(["--effort", effort])
+        cmd.extend(
+            [
                 "-p",
                 prompt,
                 "--dangerously-skip-permissions",
@@ -310,6 +513,13 @@ class BridgeRuntime:
                 "--print-timeout",
                 f"{AGY_TIMEOUT_SEC}s",
             ]
+        )
+
+        conv_id = ""
+        err_msg = ""
+        last_status = ""
+        proc: subprocess.Popen[str] | None = None
+        try:
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(WORKSPACE_ROOT),
@@ -337,7 +547,8 @@ class BridgeRuntime:
                             conv_id = str(evt["conversation_id"])
                             with self._lock:
                                 self._last_conv_id = conv_id
-                            _log(f"{shot_id} agy conversation_id={conv_id}")
+                            self._set_shot_conversation_id(shot, conv_id)
+                            _log(f"{shot_id} agy conversation_id={conv_id} (resumed={bool(resume_conv_id)})")
                         if evt.get("event") == "result":
                             res_obj = evt.get("result") or {}
                             last_status = str(res_obj.get("status") or "")
@@ -352,6 +563,74 @@ class BridgeRuntime:
             err_msg = str(exc)
             if proc and proc.poll() is None:
                 proc.kill()
+        return conv_id, err_msg, last_status
+
+    def _run_shot_worker(self, shot: dict[str, Any]) -> None:
+        shot_id = str(shot["id"])
+        claim_token = str(shot.get("claimToken") or "")
+        task_type = str(shot.get("processingTaskType") or "")
+        _log(f"start worker shot={shot_id} task={task_type} token={claim_token}")
+
+        conv_id = ""
+        err_msg = ""
+        last_status = ""
+        try:
+            if SETTINGS["fastPathEnabled"] and task_type == "prompt_update_requested":
+                fp_res = shot_fastpath.try_fastpath_prompt_update(
+                    shot, base_url=self.base_url, workspace_root=WORKSPACE_ROOT
+                )
+                if fp_res.get("handled"):
+                    _log(f"{shot_id} fast-path completed: {fp_res.get('summary')}")
+                    return
+                _log(f"{shot_id} fast-path skipped ({fp_res.get('reason')}); falling back to agy")
+
+            prepped: dict[str, Any] = {}
+            if SETTINGS["prePrepEnabled"] and task_type in {"queued", "recheck_requested"}:
+                prepped = shot_fastpath.prepare_shot_artifacts(
+                    shot,
+                    base_url=self.base_url,
+                    preupload_source=(task_type == "queued"),
+                )
+                if prepped:
+                    _log(f"{shot_id} prepped keys={sorted(prepped.keys())}")
+
+            agy_bin = find_agy_bin()
+            if not agy_bin:
+                raise FileNotFoundError("本机未检测到 Antigravity agy CLI（安装 Antigravity 后重试）")
+
+            avail_models = _discover_agy_models(agy_bin)
+            model, effort = _select_execution_profile(task_type, avail_models, SETTINGS)
+            resume_id = ""
+            if SETTINGS["resumeByShot"] and task_type != "queued":
+                resume_id = self._get_shot_conversation_id(shot)
+
+            _log(f"{shot_id} dispatch profile model={model or 'default'} effort={effort} resume={resume_id or 'new'}")
+            prompt = _build_worker_prompt(shot, self.base_url, prepped=prepped, is_resume=bool(resume_id))
+            conv_id, err_msg, last_status = self._invoke_agy_once(
+                shot,
+                prompt,
+                agy_bin=agy_bin,
+                model=model,
+                effort=effort,
+                resume_conv_id=resume_id,
+            )
+
+            # Fallback seamlessly to a fresh session if resuming an older conversation failed and claim still holds
+            if resume_id and (err_msg or (last_status and last_status != "SUCCESS")):
+                if self._claim_still_ours(shot_id, claim_token):
+                    _log(f"{shot_id} resume conv={resume_id} failed ({err_msg}); retrying fresh session")
+                    self._clear_shot_conversation_id(shot_id)
+                    fresh_prompt = _build_worker_prompt(shot, self.base_url, prepped=prepped, is_resume=False)
+                    conv_id, err_msg, last_status = self._invoke_agy_once(
+                        shot,
+                        fresh_prompt,
+                        agy_bin=agy_bin,
+                        model=model,
+                        effort=effort,
+                        resume_conv_id="",
+                    )
+        except Exception as exc:
+            err_msg = str(exc)
         finally:
             now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             with self._lock:
@@ -445,7 +724,7 @@ class BridgeRuntime:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Headless agy queue bridge for SHZ Wash Queue Console")
+    parser = argparse.ArgumentParser(description="Headless agy queue bridge for Wash Queue Console")
     parser.add_argument("--port", type=int, default=int(os.environ.get("WASH_APP_PORT", "8787")))
     args = parser.parse_args()
 
@@ -460,7 +739,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     base_url = f"http://127.0.0.1:{args.port}"
-    _log(f"started pid={os.getpid()} target={base_url} max_workers={MAX_WORKERS}")
+    _log(
+        f"started pid={os.getpid()} target={base_url} max_workers={MAX_WORKERS} "
+        f"resume={SETTINGS['resumeByShot']} fastpath={SETTINGS['fastPathEnabled']} preprep={SETTINGS['prePrepEnabled']}"
+    )
     try:
         runtime = BridgeRuntime(base_url)
         return runtime.run_forever()
