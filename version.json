@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.3",
+  "version": "2026.11.17.4",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T11:32:01+08:00",
-  "changelog": "新增视频历史版本归档与切换、修复生成新样片时已出样片标志误显示、支持全视频原生分辨率逐帧截图并一键加为参考图",
+  "publishedAt": "2026-11-17T11:46:22+08:00",
+  "changelog": "修改意见新增新图支持双击手涂涂白与对象选择；彻底移除已废弃的 zdepth-video Skill（含热更新与同事版同步清理）",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",
@@ -11,7 +11,6 @@
     "libtv-seedance-batch",
     "seedance-video-prompts",
     "seedance-video-recreation",
-    "zdepth-video",
     "prompt-markdown-delivery"
   ]
 }

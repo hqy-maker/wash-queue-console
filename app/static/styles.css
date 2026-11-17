@@ -2299,6 +2299,16 @@ button {
   overflow: hidden;
   background: var(--media-bg);
   cursor: zoom-in;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.fb-attach-chip.is-paintable {
+  cursor: pointer;
+}
+
+.fb-attach-chip.is-paintable:hover {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.14);
 }
 
 .fb-attach-chip img,

@@ -491,13 +491,16 @@ function buildFeedbackAttachAssets() {
     const slotTag = isVid ? `新视频${vidIdx}` : `新图${imgIdx}`;
     return {
       id: `fb_${att.id}`,
+      rawId: att.id,
       slotTag,
       mentionToken: slotTag,
       insertText: slotTag,
       mediaType: isVid ? "video" : "image",
       url: att.url,
+      originalUrl: att.originalUrl || att.url,
+      whiteoutApplied: Boolean(att.whiteoutApplied),
       label: att.name,
-      subtitle: "新上传参考",
+      subtitle: att.whiteoutApplied ? "已涂白新图" : "新上传参考",
       isFeedbackAttachment: true,
     };
   });
@@ -711,7 +714,9 @@ function updateMentionChipEl(chip, item, fallbackTag) {
     .join(" ");
 
   chip.title = item
-    ? `${tag}${item.label ? ` · ${item.label}` : ""}（双击可放大预览）`
+    ? item.isFeedbackAttachment && !isVid
+      ? `${tag}${item.label ? ` · ${item.label}` : ""}（双击可手涂涂白）`
+      : `${tag}${item.label ? ` · ${item.label}` : ""}（双击可放大预览）`
     : `${tag}（素材已移除）`;
 
   const desiredThumbUrl = isVid ? "" : item?.url || "";
@@ -1140,13 +1145,24 @@ function initRichMentionEditor({ editorEl, initialTokens = "", initialPlainText 
     const chip = e.target.closest('[data-mention-chip="1"]');
     if (!chip) return;
     const item = getItemsFn().find((it) => it.id === chip.dataset.assetId);
-    if (item?.url) {
-      openLightbox(
-        item.url,
-        item.mediaType === "video" ? "video" : "image",
-        `${item.slotTag}${item.label ? ` · ${item.label}` : ""}`
-      );
+    if (!item?.url) return;
+    if (item.isFeedbackAttachment && item.mediaType !== "video") {
+      openImagePaintModal({
+        url: item.url,
+        origUrl: item.originalUrl || item.url,
+        caption: `${item.slotTag}${item.label ? ` · ${item.label}` : ""}${item.whiteoutApplied ? "（已涂白）" : ""}`,
+        mode: "feedback_att",
+        slotTag: item.slotTag,
+        slotId: item.rawId || "",
+        shotId: state.selectedShotId || "",
+      });
+      return;
     }
+    openLightbox(
+      item.url,
+      item.mediaType === "video" ? "video" : "image",
+      `${item.slotTag}${item.label ? ` · ${item.label}` : ""}`
+    );
   }
 
   function onKeydown(e) {
@@ -1388,6 +1404,8 @@ async function openImagePaintModal({ url, origUrl, caption, mode, slotTag, slotI
   const imgEl = document.getElementById("lightboxImg");
   const vidEl = document.getElementById("lightboxVideo");
   const capEl = document.getElementById("lightboxCaption");
+  const vidTools = document.getElementById("lightboxVideoTools");
+  const vidCaptureBar = document.getElementById("lightboxCaptureBar");
   const closeImgBtn = document.getElementById("closeLightboxBtn");
   const saveLocalBtn = document.getElementById("paintSaveLocalBtn");
   const savePrimaryBtn = document.getElementById("paintSavePrimaryBtn");
@@ -1399,6 +1417,12 @@ async function openImagePaintModal({ url, origUrl, caption, mode, slotTag, slotI
   imgEl.hidden = true;
   closeImgBtn.classList.add("hidden");
   capEl.classList.add("hidden");
+  vidTools?.classList.add("hidden");
+  setCapturedSlot("lightboxCapture", null);
+  if (vidCaptureBar) {
+    vidCaptureBar.innerHTML = "";
+    vidCaptureBar.classList.add("hidden");
+  }
 
   inner.classList.add("is-paint");
   toolbar.classList.remove("hidden");
@@ -1492,6 +1516,33 @@ async function openImagePaintModal({ url, origUrl, caption, mode, slotTag, slotI
   }
 }
 
+function applyLocalMaskBlobToAsset(item, blob, { isReset = false, fallbackName = "image" } = {}) {
+  if (!item.originalUrl) item.originalUrl = item.url;
+  if (!item.originalFile && item.file) item.originalFile = item.file;
+  if (!item.originalName && (item.name || item.label)) item.originalName = item.name || item.label;
+  if (isReset) {
+    if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
+      URL.revokeObjectURL(item.url);
+    }
+    item.url = item.originalUrl;
+    if (item.originalFile) item.file = item.originalFile;
+    if (item.originalName && "name" in item && !("label" in item)) {
+      item.name = item.originalName;
+    }
+    item.whiteoutApplied = false;
+    return false;
+  }
+  const baseName = String(item.originalName || item.label || item.name || fallbackName).replace(/\.[^.]+$/, "");
+  const maskFile = new File([blob], `${baseName}_mask.png`, { type: "image/png" });
+  if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
+    URL.revokeObjectURL(item.url);
+  }
+  item.file = maskFile;
+  item.url = URL.createObjectURL(maskFile);
+  item.whiteoutApplied = true;
+  return true;
+}
+
 async function savePaintedMask(syncToCanvas) {
   if (!paintState.isPaint || !paintState.workCanvas) return;
   const isReset = paintState.wasResetToOriginal && paintState.strokes.length === 0;
@@ -1513,37 +1564,22 @@ async function savePaintedMask(syncToCanvas) {
       if (paintState.mode === "builder") {
         const item = state.builder.imageItems.find((x) => x.id === paintState.slotId);
         if (!item) throw new Error("找不到要更新的素材图片");
-        if (!item.originalUrl) item.originalUrl = item.url;
         const presetId = getBuilderItemPresetId(item);
         if (presetId && !item.originalPresetId) {
           item.originalPresetKind = "preset";
           item.originalPresetId = presetId;
         }
-        if (isReset) {
-          if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
-            URL.revokeObjectURL(item.url);
-          }
-          item.url = item.originalUrl;
-          if (item.originalFile) item.file = item.originalFile;
+        const masked = applyLocalMaskBlobToAsset(item, blob, { isReset, fallbackName: "image" });
+        if (!masked) {
           if (item.originalPresetKind === "preset" || item.originalPresetId) {
             item.kind = "preset";
             item.presetId = item.originalPresetId;
           }
-          item.whiteoutApplied = false;
           showToast("已还原为原图");
         } else {
-          if (!item.originalFile && item.file) item.originalFile = item.file;
-          const baseName = String(item.label || "image").replace(/\.[^.]+$/, "");
-          const maskFile = new File([blob], `${baseName}_mask.png`, { type: "image/png" });
-          if (item.url?.startsWith("blob:") && item.url !== item.originalUrl) {
-            URL.revokeObjectURL(item.url);
-          }
-          item.file = maskFile;
-          item.url = URL.createObjectURL(maskFile);
           item.kind = "upload";
           item.presetId = "";
-          item.whiteoutApplied = true;
-          preflightFileInBackground(maskFile, (meta) => {
+          preflightFileInBackground(item.file, (meta) => {
             item.meta = meta;
             renderBuilderAssetStripOnly();
           });
@@ -1551,6 +1587,16 @@ async function savePaintedMask(syncToCanvas) {
         }
         closeLightbox();
         renderBuilderView();
+        return;
+      }
+
+      if (paintState.mode === "feedback_att") {
+        const att = (state.detailDraft.attachments || []).find((x) => x.id === paintState.slotId);
+        if (!att) throw new Error("找不到要更新的新增参考图");
+        const masked = applyLocalMaskBlobToAsset(att, blob, { isReset, fallbackName: "ref" });
+        closeLightbox();
+        refreshDetailFeedbackAttachDom();
+        showToast(masked ? "已应用手涂涂白（提交修改时将自动附带）" : "已还原为原图");
         return;
       }
 
@@ -1839,6 +1885,35 @@ async function copyCapturedImageToClipboard(cap) {
   return false;
 }
 
+function revokeAttachmentBlobUrls(att) {
+  if (!att) return;
+  if (att.url?.startsWith("blob:")) URL.revokeObjectURL(att.url);
+  if (att.originalUrl?.startsWith("blob:") && att.originalUrl !== att.url) {
+    URL.revokeObjectURL(att.originalUrl);
+  }
+}
+
+function addDetailDraftAttachmentFiles(fileList) {
+  const valid = Array.from(fileList || []).filter((f) => isImageFile(f) || isVideoFile(f));
+  if (!valid.length) return 0;
+  for (const f of valid) {
+    const initUrl = URL.createObjectURL(f);
+    state.detailDraft.attachments.push({
+      id: uid(),
+      file: f,
+      originalFile: f,
+      url: initUrl,
+      originalUrl: initUrl,
+      kind: isVideoFile(f) ? "video" : "image",
+      name: f.name,
+      originalName: f.name,
+      whiteoutApplied: false,
+    });
+  }
+  refreshDetailFeedbackAttachDom();
+  return valid.length;
+}
+
 function refreshDetailFeedbackAttachDom() {
   const wrap = document.getElementById("fbAttachPreviewWrap");
   const shot = (state.data?.shots || []).find((s) => s.id === state.selectedShotId);
@@ -1849,12 +1924,26 @@ function refreshDetailFeedbackAttachDom() {
         e.stopPropagation();
         const idx = Number(btn.dataset.removeFbAtt);
         const removed = state.detailDraft.attachments.splice(idx, 1)[0];
-        if (removed?.url?.startsWith("blob:")) URL.revokeObjectURL(removed.url);
+        revokeAttachmentBlobUrls(removed);
         refreshDetailFeedbackAttachDom();
       });
     });
   }
   if (shot) {
+    const imgItems = [...buildOrderedShotAssets(shot), ...buildFeedbackAttachAssets()].filter(
+      (it) => it.mediaType === "image"
+    );
+    if (
+      state.detailDraft.whiteoutTarget &&
+      !imgItems.some((it) => it.slotTag === state.detailDraft.whiteoutTarget)
+    ) {
+      state.detailDraft.whiteoutTarget = "";
+    }
+    const woSel = document.getElementById("detailWhiteoutTarget");
+    if (woSel) {
+      woSel.disabled = imgItems.length === 0;
+      woSel.innerHTML = buildWhiteoutTargetOptionsHtml(imgItems, state.detailDraft.whiteoutTarget);
+    }
     const mentionItems = buildDetailMentionAssets(shot);
     state.detailPromptEditor?.syncAssets(mentionItems);
     state.fbCommentEditor?.syncAssets(mentionItems);
@@ -1865,18 +1954,9 @@ function appendFilesToActiveDraft(files) {
   const valid = Array.from(files || []).filter((f) => isImageFile(f) || isVideoFile(f));
   if (!valid.length) return false;
   if (state.view === "detail") {
-    for (const f of valid) {
-      state.detailDraft.attachments.push({
-        id: uid(),
-        file: f,
-        url: URL.createObjectURL(f),
-        kind: isVideoFile(f) ? "video" : "image",
-        name: f.name,
-      });
-    }
-    refreshDetailFeedbackAttachDom();
+    addDetailDraftAttachmentFiles(valid);
     document.getElementById("fbDropzone")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    showToast("已加入修改意见参考图（可用 @新图 引用）");
+    showToast("已加入修改意见参考图（可用 @新图 引用，双击可涂白）");
     return true;
   }
   if (state.view === "builder") {
@@ -4891,7 +4971,7 @@ async function submitBuilderShot(forceOverwrite = false) {
 /* Detail View */
 function clearDetailDraftAttachments() {
   for (const att of state.detailDraft.attachments || []) {
-    if (att.url?.startsWith("blob:")) URL.revokeObjectURL(att.url);
+    revokeAttachmentBlobUrls(att);
   }
   state.detailDraft.attachments = [];
 }
@@ -5022,17 +5102,29 @@ function renderFeedbackAttachmentsHtml() {
       ${list
         .map((att, idx) => {
           const slotTag = attachAssets[idx]?.slotTag || `新图${idx + 1}`;
+          const isImg = att.kind !== "video";
+          const caption = `${slotTag} · ${att.name}${isImg && att.whiteoutApplied ? "（已涂白）" : ""}`;
+          const paintAttrs = isImg
+            ? `data-paint-slot="${escapeHtml(slotTag)}" data-paint-id="${escapeHtml(att.id)}" data-paint-orig="${escapeHtml(att.originalUrl || att.url)}" data-paint-mode="feedback_att"`
+            : "";
+          const maskedBadge =
+            isImg && att.whiteoutApplied
+              ? `<span class="asset-masked-badge" title="已涂白 · 双击可继续补涂或还原原图">已涂白</span>`
+              : "";
           return `
-            <div class="fb-attach-chip"
+            <div class="fb-attach-chip ${isImg ? "is-paintable" : ""}"
               data-zoom-url="${escapeHtml(att.url)}"
               data-zoom-kind="${att.kind}"
-              data-zoom-caption="${escapeHtml(`${slotTag} · ${att.name}`)}">
+              data-zoom-caption="${escapeHtml(caption)}"
+              ${paintAttrs}
+              title="${isImg ? "单击放大预览 · 双击手涂涂白" : "点击放大播放"}">
               ${
                 att.kind === "video"
                   ? `<video src="${escapeHtml(att.url)}" muted playsinline preload="metadata"></video>`
                   : `<img src="${escapeHtml(att.url)}" alt="${escapeHtml(att.name)}" />`
               }
               <span class="asset-slot-badge is-new-att ${att.kind === "video" ? "is-video" : ""}">${escapeHtml(slotTag)}</span>
+              ${maskedBadge}
               <button type="button" class="fb-attach-remove" data-remove-fb-att="${idx}" title="移除">×</button>
             </div>`;
         })
@@ -5753,7 +5845,7 @@ function renderDetailView() {
                 prefix: "detail",
                 parts: state.detailDraft.whiteoutParts,
                 targetSlot: state.detailDraft.whiteoutTarget,
-                imageItems: orderedItems.filter((it) => it.mediaType === "image"),
+                imageItems: [...orderedItems, ...buildFeedbackAttachAssets()].filter((it) => it.mediaType === "image"),
               })}
 
               <div id="fbDropzone" class="fb-composer-shell">
@@ -5765,7 +5857,7 @@ function renderDetailView() {
                 <div class="fb-composer-footer">
                   <div class="fb-composer-tools">
                     <button id="fbUploadBtn" class="btn btn-secondary btn-sm" type="button">+ 参考图</button>
-                    <span class="fb-composer-hint">可拖拽 · 支持 @新图</span>
+                    <span class="fb-composer-hint">可拖拽 · 支持 @新图 · 双击新图涂白</span>
                   </div>
                   <button id="submitFeedbackBtn" class="btn btn-primary btn-sm" type="button">提交修改</button>
                 </div>
@@ -5872,18 +5964,7 @@ function bindDetailEvents(shot) {
   refreshDetailFeedbackAttachDom();
 
   const addFeedbackFiles = (fileList) => {
-    const files = Array.from(fileList || []).filter((f) => isImageFile(f) || isVideoFile(f));
-    if (!files.length) return;
-    for (const f of files) {
-      state.detailDraft.attachments.push({
-        id: uid(),
-        file: f,
-        url: URL.createObjectURL(f),
-        kind: isVideoFile(f) ? "video" : "image",
-        name: f.name,
-      });
-    }
-    refreshDetailFeedbackAttachDom();
+    addDetailDraftAttachmentFiles(fileList);
   };
 
   bindDropzoneEl(fbDropEl, fbFilesEl, addFeedbackFiles, { clickToOpen: false });
@@ -7286,8 +7367,22 @@ function bindGlobalEvents() {
     }
   });
 
-  // Delegated click for runtime status buttons, original comparison preview, Paint Canvas, or video Lightbox
-  document.getElementById("mainPane").addEventListener("click", (e) => {
+  // Delegated click & dblclick for runtime status buttons, original comparison preview, Paint Canvas, or Lightbox
+  const mainPaneEl = document.getElementById("mainPane");
+  let fbZoomClickTimer = null;
+  const openPaintModalFromMediaEl = (el) => {
+    const mode = el.dataset.paintMode || "detail";
+    openImagePaintModal({
+      url: el.dataset.zoomUrl,
+      origUrl: el.dataset.paintOrig || el.dataset.zoomUrl,
+      caption: el.dataset.zoomCaption,
+      mode,
+      slotTag: el.dataset.paintSlot,
+      slotId: el.dataset.paintId || "",
+      shotId: mode === "detail" || mode === "feedback_att" ? state.selectedShotId || "" : "",
+    });
+  };
+  mainPaneEl.addEventListener("click", (e) => {
     const rtDetailBtn = e.target.closest("#openShotRuntimeBtn, #runtimeBannerDetailBtn");
     if (rtDetailBtn) {
       e.stopPropagation();
@@ -7313,21 +7408,36 @@ function bindGlobalEvents() {
       openLightbox(origBtn.dataset.zoomOrigUrl, "image", origBtn.dataset.zoomCaption);
       return;
     }
+    if (e.target.closest("[data-remove-fb-att]")) return;
     const mediaEl = e.target.closest("[data-zoom-url]");
     if (!mediaEl) return;
     if (mediaEl.dataset.zoomKind === "image" && mediaEl.dataset.paintSlot) {
-      openImagePaintModal({
-        url: mediaEl.dataset.zoomUrl,
-        origUrl: mediaEl.dataset.paintOrig || mediaEl.dataset.zoomUrl,
-        caption: mediaEl.dataset.zoomCaption,
-        mode: mediaEl.dataset.paintMode || "detail",
-        slotTag: mediaEl.dataset.paintSlot,
-        slotId: mediaEl.dataset.paintId || "",
-        shotId: mediaEl.dataset.paintMode === "detail" ? state.selectedShotId || "" : "",
-      });
+      if (mediaEl.dataset.paintMode === "feedback_att") {
+        clearTimeout(fbZoomClickTimer);
+        fbZoomClickTimer = null;
+        if (e.detail >= 2) return;
+        const zoomUrl = mediaEl.dataset.zoomUrl;
+        const zoomCaption = mediaEl.dataset.zoomCaption;
+        fbZoomClickTimer = setTimeout(() => {
+          fbZoomClickTimer = null;
+          openLightbox(zoomUrl, "image", zoomCaption);
+        }, 230);
+        return;
+      }
+      openPaintModalFromMediaEl(mediaEl);
       return;
     }
     openLightbox(mediaEl.dataset.zoomUrl, mediaEl.dataset.zoomKind, mediaEl.dataset.zoomCaption);
+  });
+  mainPaneEl.addEventListener("dblclick", (e) => {
+    if (e.target.closest("[data-remove-fb-att]")) return;
+    const paintEl = e.target.closest('[data-paint-mode="feedback_att"][data-paint-slot]');
+    if (!paintEl || paintEl.dataset.zoomKind !== "image") return;
+    clearTimeout(fbZoomClickTimer);
+    fbZoomClickTimer = null;
+    e.preventDefault();
+    e.stopPropagation();
+    openPaintModalFromMediaEl(paintEl);
   });
 
   document.getElementById("topbarScenePill").addEventListener("click", async () => {

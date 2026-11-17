@@ -410,7 +410,7 @@ def _build_worker_prompt(
     if is_creation:
         lightweight_rule = (
             "6. **极速直写原则（严禁加载洗视频相关 Skill 或空转）**：\n"
-            "   - **严禁**读取 `seedance-video-recreation`、`zdepth-video`、`libtv-seedance-batch`、`wash-queue-console`、`dreamina-canvas-cli` 文档，**禁止**执行 `dreamina-canvas schema` / `auth status` 或抽原片帧/语音分析；\n"
+            "   - **严禁**读取 `seedance-video-recreation`、`libtv-seedance-batch`、`wash-queue-console`、`dreamina-canvas-cli` 文档，**禁止**执行 `dreamina-canvas schema` / `auth status` 或抽原片帧/语音分析；\n"
             "   - 仅按 `seedance-video-prompts` 规范结合用户输入撰写提示词（纯文生 `--mode t2v` 无需读任何图；带参考图时只读相应构图/角色图，**禁止**翻读 `server.py`、`store.py`、`jimeng_bridge.py` 等控制台底层源码）。\n\n"
         )
     else:
@@ -429,7 +429,7 @@ def _build_worker_prompt(
         elif task_type == "queued" and prepped_dict.get("prebuildReady"):
             skill_list = "（`dreamina-canvas-cli`、`seedance-video-recreation`、`seedance-video-prompts`）"
         else:
-            skill_list = "（`dreamina-canvas-cli`、`zdepth-video`、`seedance-video-recreation`、`seedance-video-prompts`）"
+            skill_list = "（`dreamina-canvas-cli`、`seedance-video-recreation`、`seedance-video-prompts`）"
         if credit_ceiling > 0:
             credit_rule = (
                 f"3. **已获用户明确全局积分上限授权（`{credit_ceiling}` 积分/镜）**：在 `run_requested` 或 `final_requested` 中执行扣费前，先核对报价（`node quote` 等）；只要明确报价 **`<= {credit_ceiling}`** 积分且余额充足，**严禁停在 `needs_confirmation` 打断用户**，直接调用 `dreamina-canvas node confirm --project-id <projectUuid> --node-id <nodeId> --credit-ceiling {credit_ceiling}` 获取 `--credit-token` 后紧接着 `node run`（1080P 转正传 `--credit-ceiling {credit_ceiling} --yes`）放行生成；只有超过 `{credit_ceiling}`、报 `occupancy_unknown` 或余额不足时才停回 `needs_confirmation`；`nodeId` / `submitId` / `selectedResourceId` 写入 `jimengMeta`（严禁保存 token 或凭据）；向用户交付样片时须明确提醒最长存储 7 天。\n"
@@ -584,12 +584,12 @@ def _build_worker_prompt(
         if is_creation:
             intro = (
                 "你是由洗片控制台唤醒的 Fast-Path 正常生成 Worker Agent（已跳过原片抽帧、音频扫描与 720P 深度捕捉）。\n"
-                f"为达到极致速度：**只读 `{prompts_skill}`**，**严禁阅读 `seedance-video-recreation`、`zdepth-video`、`wash-queue-console`、`dreamina-canvas-cli` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；写好提示词并落盘后，直接按下方内联命令建样片节点、只读报价并回写完成：\n\n"
+                f"为达到极致速度：**只读 `{prompts_skill}`**，**严禁阅读 `seedance-video-recreation`、`wash-queue-console`、`dreamina-canvas-cli` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；写好提示词并落盘后，直接按下方内联命令建样片节点、只读报价并回写完成：\n\n"
             )
         else:
             intro = (
                 "你是由洗片控制台唤醒的 Fast-Path Worker Agent（素材预上传、节点布局与 720P 深度捕捉已前置完成）。\n"
-                f"为极大提速：**跳过阅读 `wash-queue-console`、`dreamina-canvas-cli`、`zdepth-video` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；直接按 `{recreation_skill}` 与 `{prompts_skill}` 规范，看关键帧拼图/构图图/按需听轻量化音频写好提示词并落盘，随后按下方内联命令建样片节点、只读报价并回写完成：\n\n"
+                f"为极大提速：**跳过阅读 `wash-queue-console`、`dreamina-canvas-cli` 文档，禁止执行 `dreamina-canvas schema` 与 `auth status`**；直接按 `{recreation_skill}` 与 `{prompts_skill}` 规范，看关键帧拼图/构图图/按需听轻量化音频写好提示词并落盘，随后按下方内联命令建样片节点、只读报价并回写完成：\n\n"
             )
     elif is_resume:
         intro = (
@@ -600,7 +600,7 @@ def _build_worker_prompt(
         extra_cli_doc = "" if is_jimeng else f" 与 `{_resolve_skill_path('libtv-cli')}`"
         intro = (
             "你是由洗片控制台本地后台桥接器（`agent_bridge.py`）唤醒的 **正常生成（`video_creation`）** Worker Agent。\n"
-            f"请只阅读 `{prompts_skill}`{extra_cli_doc}（**跳过** `seedance-video-recreation` / `zdepth-video` / `libtv-seedance-batch`），然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
+            f"请只阅读 `{prompts_skill}`{extra_cli_doc}（**跳过** `seedance-video-recreation` / `libtv-seedance-batch`），然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
         )
     else:
         intro = (

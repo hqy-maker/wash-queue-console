@@ -43,6 +43,7 @@ APP_MANAGED_FILES = [
     "version.json",
 ]
 APP_MANAGED_DIRS = ["static", "scripts"]
+RETIRED_SKILLS = ("zdepth-video",)
 
 
 def _now_iso() -> str:
@@ -501,6 +502,11 @@ class HotUpdateManager:
                 self._create_backup(old_ver, skill_names, workspace_root)
                 self._copy_app_tree(staged_app)
                 synced_skills = self._sync_skills_dir(staged_skills, workspace_root)
+                for retired in RETIRED_SKILLS:
+                    for t_root in self._skill_target_roots(workspace_root):
+                        obsolete = t_root / retired
+                        if obsolete.exists():
+                            shutil.rmtree(obsolete, ignore_errors=True)
                 self._maybe_install_requirements(old_req_sha)
 
             self._cached_check = {
