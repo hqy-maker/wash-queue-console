@@ -404,6 +404,7 @@ def _build_worker_prompt(
     callback_rule = (
         f"关键节点务必用 `POST {base_url}/api/shots/{shot.get('id')}/agent-update`（请求体必须带 `claimToken: \"{shot.get('claimToken')}\"`）汇报进度与最终结果；"
         "若对构图图或角色图执行了局部涂白/遮罩（例如生成了 `comp_masked.png`），**必须同步传入** `whiteoutUpdates: [{\"slotTag\": \"图片1\", \"filePath\": \"<绝对路径>\", \"parts\": [...]}]`（并在即梦平台写入 `jimengMeta.maskedCompPath`）；"
+        "若根据修改意见替换现有素材槽位或补充了新的参考图（`@新图N`），**同步传入** `assetUpdates: [{\"action\": \"replace\"|\"append\", \"slotTag\": \"图片N\", \"filePath\": \"<绝对路径>\", \"label\": \"<显示名>\", \"libtvNodeKey\": \"<node_id>\"}]` 与最新 `libtvMixedOrder`，确保控制台「镜头素材」实时更新；"
         "修改或撰写提示词后**必须同时传入 `revisionDirection`** 以及 `conversationId`（若可知）；"
         "若收到 `pendingFeedbacks[]` 多条待办须**全部落实后**再置 `resolveFeedbacks: true`；"
         "若收到 HTTP 409 Conflict 说明任务已被用户新操作取代，立刻停止。\n"

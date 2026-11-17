@@ -1267,22 +1267,158 @@ class QueueStore:
             del history[:-80]
         return entry
 
+    @staticmethod
+    def _ordered_image_slots(shot: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        ordered: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(shot.get("compImage"), dict):
+            ordered.append(("图片1", shot["compImage"]))
+        start_idx = 2 if isinstance(shot.get("compImage"), dict) else 1
+        for idx, cref in enumerate(shot.get("charRefs") or [], start=start_idx):
+            if isinstance(cref, dict):
+                ordered.append((f"图片{idx}", cref))
+        return ordered
+
+    @classmethod
+    def _find_image_slot(
+        cls,
+        shot: dict[str, Any],
+        *,
+        slot_tag: str = "",
+        slot_id: str = "",
+    ) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+        for tag, obj in cls._ordered_image_slots(shot):
+            if (slot_tag and tag == slot_tag) or (slot_id and obj.get("slotId") == slot_id):
+                return tag, obj
+        return None, None
+
     def _resolve_image_slot(
         self,
         shot: dict[str, Any],
         slot_tag: str = "",
         slot_id: str = "",
     ) -> tuple[str, dict[str, Any]]:
-        ordered_slots: list[tuple[str, dict[str, Any]]] = []
-        if isinstance(shot.get("compImage"), dict):
-            ordered_slots.append(("图片1", shot["compImage"]))
-        start_idx = 2 if isinstance(shot.get("compImage"), dict) else 1
-        for idx, cref in enumerate(shot.get("charRefs", []), start=start_idx):
-            ordered_slots.append((f"图片{idx}", cref))
-        for tag, obj in ordered_slots:
-            if (slot_tag and tag == slot_tag) or (slot_id and obj.get("slotId") == slot_id):
-                return tag, obj
+        tag, obj = self._find_image_slot(shot, slot_tag=slot_tag, slot_id=slot_id)
+        if tag and obj is not None:
+            return tag, obj
         raise ValueError(f"找不到要更新涂白图的素材槽位: {slot_tag or slot_id}")
+
+    def _upsert_image_slot_locked(
+        self,
+        shot: dict[str, Any],
+        *,
+        action: str = "",
+        slot_tag: str = "",
+        slot_id: str = "",
+        file_path: str | Path,
+        label: str = "",
+        role_hint: str = "",
+        libtv_node_key: str | None = None,
+        mark_whiteout: bool = False,
+        parts: list[str] | None = None,
+    ) -> tuple[str, bool]:
+        resolved = resolve_media_path(str(file_path))
+        if not resolved.is_file() or DATA_ROOT.resolve() not in resolved.parents:
+            raise ValueError(f"素材文件路径无效或不在数据目录内: {file_path}")
+        try:
+            ver_token = str(resolved.stat().st_mtime_ns)
+        except OSError:
+            ver_token = str(int(time.time() * 1000))
+
+        clean_action = str(action or "").strip().lower()
+        clean_tag = str(slot_tag or "").strip()
+        clean_sid = str(slot_id or "").strip()
+        clean_label = str(label or "").strip()
+        clean_role = str(role_hint or "").strip()
+        clean_nk = str(libtv_node_key).strip() if libtv_node_key is not None else None
+        clean_parts = [str(x).strip() for x in (parts or []) if str(x).strip()]
+
+        matched_tag, target_obj = (None, None)
+        if clean_action != "append" and (clean_tag or clean_sid):
+            matched_tag, target_obj = self._find_image_slot(shot, slot_tag=clean_tag, slot_id=clean_sid)
+
+        if matched_tag and target_obj is not None:
+            cur_fp = str(target_obj.get("filePath") or "")
+            already_same = (
+                cur_fp == str(resolved)
+                and (not mark_whiteout or bool(target_obj.get("whiteoutApplied")))
+                and (clean_nk is None or str(target_obj.get("libtvNodeKey") or "") == clean_nk)
+                and (not clean_label or str(target_obj.get("label") or "") == clean_label)
+                and str(target_obj.get("versionToken") or target_obj.get("whiteoutVersion") or "") == ver_token
+            )
+            if already_same:
+                return matched_tag, False
+
+            if cur_fp != str(resolved):
+                if not target_obj.get("originalFilePath"):
+                    target_obj["originalFilePath"] = cur_fp
+                    target_obj["originalMediaUrl"] = target_obj.get("mediaUrl", "")
+                target_obj["filePath"] = str(resolved)
+                target_obj["mediaUrl"] = to_media_url(resolved)
+                target_obj["meta"] = run_preflight(resolved)
+                if not mark_whiteout:
+                    target_obj["whiteoutApplied"] = False
+                    target_obj["whiteoutVersion"] = ""
+                    target_obj["whiteoutParts"] = []
+
+            target_obj["versionToken"] = ver_token
+            if mark_whiteout:
+                target_obj["whiteoutApplied"] = True
+                target_obj["whiteoutVersion"] = ver_token
+                if not clean_parts:
+                    clean_parts = [
+                        str(x).strip()
+                        for x in (target_obj.get("whiteoutParts") or (shot.get("whiteoutOptions") or {}).get("parts") or ["自动涂白"])
+                        if str(x).strip()
+                    ]
+                target_obj["whiteoutParts"] = clean_parts
+            if clean_label:
+                target_obj["label"] = clean_label
+            if clean_role:
+                target_obj["roleHint"] = clean_role
+            if clean_nk is not None:
+                target_obj["libtvNodeKey"] = clean_nk
+            return matched_tag, True
+
+        if clean_action == "replace":
+            raise ValueError(f"找不到要替换的素材槽位: {clean_tag or clean_sid}")
+
+        # Append / backfill new reference image slot, reusing any matching path first
+        for cur_tag, existing in self._ordered_image_slots(shot):
+            ex_fp = str(existing.get("filePath") or "").strip()
+            if ex_fp and str(resolve_media_path(ex_fp)) == str(resolved):
+                changed = False
+                if clean_nk is not None and clean_nk and not existing.get("libtvNodeKey"):
+                    existing["libtvNodeKey"] = clean_nk
+                    changed = True
+                if clean_label and not existing.get("label"):
+                    existing["label"] = clean_label
+                    changed = True
+                return cur_tag, changed
+
+        ordered = self._ordered_image_slots(shot)
+        next_idx = len(ordered) + 1
+        entry: dict[str, Any] = {
+            "slotId": clean_sid or ("comp" if (not isinstance(shot.get("compImage"), dict) and clean_tag == "图片1") else f"custom_{next_idx}_{uuid.uuid4().hex[:6]}"),
+            "kind": "custom",
+            "presetId": "",
+            "label": clean_label or resolved.stem,
+            "roleHint": clean_role,
+            "filePath": str(resolved),
+            "mediaUrl": to_media_url(resolved),
+            "versionToken": ver_token,
+            "libtvNodeKey": clean_nk or "",
+            "meta": run_preflight(resolved),
+        }
+        if mark_whiteout:
+            entry["whiteoutApplied"] = True
+            entry["whiteoutVersion"] = ver_token
+            entry["whiteoutParts"] = clean_parts or ["自动涂白"]
+
+        if not isinstance(shot.get("compImage"), dict) and clean_tag == "图片1":
+            shot["compImage"] = entry
+            return "图片1", True
+        shot.setdefault("charRefs", []).append(entry)
+        return f"图片{len(ordered) + 1}", True
 
     def _apply_whiteout_file_to_slot(
         self,
@@ -1295,45 +1431,171 @@ class QueueStore:
         label: str = "",
         libtv_node_key: str | None = None,
     ) -> tuple[str, bool]:
-        resolved = resolve_media_path(str(file_path))
-        if not resolved.is_file() or DATA_ROOT.resolve() not in resolved.parents:
-            raise ValueError(f"涂白结果文件路径无效或不在数据目录内: {file_path}")
-        matched_tag, target_obj = self._resolve_image_slot(shot, slot_tag=slot_tag, slot_id=slot_id)
-        try:
-            ver_token = str(resolved.stat().st_mtime_ns)
-        except OSError:
-            ver_token = str(int(time.time() * 1000))
-
-        cur_fp = str(target_obj.get("filePath") or "")
-        already_same = (
-            cur_fp == str(resolved)
-            and bool(target_obj.get("whiteoutApplied"))
-            and str(target_obj.get("whiteoutVersion") or "") == ver_token
+        return self._upsert_image_slot_locked(
+            shot,
+            action="replace",
+            slot_tag=slot_tag,
+            slot_id=slot_id,
+            file_path=file_path,
+            label=label,
+            libtv_node_key=libtv_node_key,
+            mark_whiteout=True,
+            parts=parts,
         )
-        if already_same:
-            return matched_tag, False
 
-        if not target_obj.get("originalFilePath"):
-            target_obj["originalFilePath"] = cur_fp
-            target_obj["originalMediaUrl"] = target_obj.get("mediaUrl", "")
-        target_obj["filePath"] = str(resolved)
-        target_obj["mediaUrl"] = to_media_url(resolved)
-        target_obj["meta"] = run_preflight(resolved)
-        target_obj["whiteoutApplied"] = True
-        target_obj["whiteoutVersion"] = ver_token
-        clean_parts = [str(x).strip() for x in (parts or []) if str(x).strip()]
-        if not clean_parts:
-            clean_parts = [
-                str(x).strip()
-                for x in (target_obj.get("whiteoutParts") or (shot.get("whiteoutOptions") or {}).get("parts") or ["自动涂白"])
-                if str(x).strip()
-            ]
-        target_obj["whiteoutParts"] = clean_parts
-        if label:
-            target_obj["label"] = label.strip()
-        if libtv_node_key is not None:
-            target_obj["libtvNodeKey"] = str(libtv_node_key).strip()
-        return matched_tag, True
+    @staticmethod
+    def _is_image_attachment(att: dict[str, Any]) -> bool:
+        fp = str(att.get("filePath") or "").strip()
+        if not fp:
+            return False
+        kind = str((att.get("meta") or {}).get("kind") or "").strip().lower()
+        if kind == "video":
+            return False
+        if kind == "image":
+            return True
+        return Path(fp).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+    @classmethod
+    def _detect_feedback_replace_slot(
+        cls,
+        shot: dict[str, Any],
+        fb: dict[str, Any],
+        mixed_img_count: int,
+    ) -> str:
+        comment = str(fb.get("comment") or "").strip()
+        if not comment:
+            return ""
+        m = re.search(r"(?:把|将)\s*@?(图片\d+)\s*(?:换成|更换|替换|改为|改成|涂白)", comment) or re.search(
+            r"(?:替换|更换)\s*@?(图片\d+)", comment
+        )
+        if m:
+            tag = m.group(1)
+            found_tag, _ = cls._find_image_slot(shot, slot_tag=tag)
+            if found_tag:
+                return found_tag
+        cur_slots = cls._ordered_image_slots(shot)
+        has_replace_verb = any(v in comment for v in ("换成", "更换为", "替换为", "改为", "改成"))
+        has_add_verb = any(v in comment for v in ("补充", "新增", "加上", "添加", "增加"))
+        if has_replace_verb and not has_add_verb and mixed_img_count <= len(cur_slots):
+            for tag, obj in cur_slots:
+                lbl = str(obj.get("label") or "").strip()
+                if lbl and lbl in comment:
+                    return tag
+        return ""
+
+    def _reconcile_resolved_feedback_assets_locked(
+        self,
+        shot: dict[str, Any],
+        resolved_fbs: list[dict[str, Any]],
+        *,
+        skip_slots: set[str] | None = None,
+        append_only: bool = False,
+    ) -> set[str]:
+        changed: set[str] = set()
+        skips = set(skip_slots or set())
+        mixed_imgs = [
+            m
+            for m in (shot.get("libtvMixedOrder") or [])
+            if isinstance(m, dict) and str(m.get("mediaType") or "image").lower() == "image"
+        ]
+
+        # Backfill missing libtvNodeKey on existing slots when mixed_imgs is aligned and has >= slots
+        ordered_now = self._ordered_image_slots(shot)
+        if mixed_imgs and len(mixed_imgs) >= len(ordered_now):
+            used_nks = {str(obj.get("libtvNodeKey") or "").strip() for _, obj in ordered_now if obj.get("libtvNodeKey")}
+            for idx, (tag, obj) in enumerate(ordered_now):
+                if not obj.get("libtvNodeKey"):
+                    cand_nk = str(mixed_imgs[idx].get("nodeKey") or "").strip()
+                    if cand_nk and cand_nk not in used_nks:
+                        obj["libtvNodeKey"] = cand_nk
+                        used_nks.add(cand_nk)
+
+        def _existing_paths() -> set[str]:
+            paths: set[str] = set()
+            for _, obj in self._ordered_image_slots(shot):
+                for k in ("filePath", "originalFilePath"):
+                    raw = str(obj.get(k) or "").strip()
+                    if raw:
+                        paths.add(str(resolve_media_path(raw)))
+            return paths
+
+        existing_fps = _existing_paths()
+        used_node_keys = {
+            str(obj.get("libtvNodeKey") or "").strip()
+            for _, obj in self._ordered_image_slots(shot)
+            if obj.get("libtvNodeKey")
+        }
+
+        for fb in resolved_fbs:
+            if not isinstance(fb, dict):
+                continue
+            comment = str(fb.get("comment") or "").strip()
+            tags = list(fb.get("tags") or [])
+            if comment.startswith("用户已在画板中完成") or tags in (["手涂涂白"], ["还原原图"]):
+                continue
+            img_atts = [att for att in (fb.get("attachments") or []) if isinstance(att, dict) and self._is_image_attachment(att)]
+            if not img_atts:
+                continue
+
+            replace_tag = self._detect_feedback_replace_slot(shot, fb, len(mixed_imgs)) if not append_only else ""
+            for att_idx, att in enumerate(img_atts):
+                raw_fp = str(att.get("filePath") or "").strip()
+                resolved = resolve_media_path(raw_fp)
+                if not resolved.is_file() or DATA_ROOT.resolve() not in resolved.parents:
+                    continue
+                if str(resolved) in existing_fps:
+                    continue
+
+                if replace_tag and att_idx == 0 and replace_tag not in skips:
+                    try:
+                        matched, did_change = self._upsert_image_slot_locked(
+                            shot,
+                            action="replace",
+                            slot_tag=replace_tag,
+                            file_path=resolved,
+                            mark_whiteout=False,
+                        )
+                        if did_change:
+                            changed.add(matched)
+                            existing_fps = _existing_paths()
+                    except ValueError:
+                        pass
+                    continue
+
+                if append_only and len(mixed_imgs) <= len(self._ordered_image_slots(shot)):
+                    continue
+
+                cand_meta = next(
+                    (
+                        m
+                        for m in mixed_imgs
+                        if str(m.get("nodeKey") or "").strip()
+                        and str(m.get("nodeKey") or "").strip() not in used_node_keys
+                    ),
+                    None,
+                )
+                cand_nk = str((cand_meta or {}).get("nodeKey") or "").strip() or None
+                cand_label = str((cand_meta or {}).get("label") or "").strip()
+                if not cand_label:
+                    att_name = str(att.get("name") or "").strip()
+                    cand_label = Path(att_name).stem if att_name else resolved.stem
+                try:
+                    new_tag, did_change = self._upsert_image_slot_locked(
+                        shot,
+                        action="append",
+                        file_path=resolved,
+                        label=cand_label,
+                        libtv_node_key=cand_nk,
+                    )
+                    if did_change:
+                        changed.add(new_tag)
+                        existing_fps.add(str(resolved))
+                        if cand_nk:
+                            used_node_keys.add(cand_nk)
+                except ValueError:
+                    continue
+
+        return changed
 
     @staticmethod
     def _find_comp_masked_candidate(
@@ -4168,7 +4430,30 @@ class QueueStore:
                         )
                         updated_whiteout_slots.add(matched_tag)
 
-                if "图片1" not in updated_whiteout_slots and isinstance(shot.get("compImage"), dict):
+                updated_asset_slots: set[str] = set()
+                if "assetUpdates" in payload and isinstance(payload["assetUpdates"], list):
+                    for upd in payload["assetUpdates"]:
+                        if not isinstance(upd, dict):
+                            continue
+                        fp = upd.get("filePath")
+                        if not fp:
+                            continue
+                        matched_tag, did_change = self._upsert_image_slot_locked(
+                            shot,
+                            action=str(upd.get("action") or "").strip(),
+                            slot_tag=str(upd.get("slotTag") or "").strip(),
+                            slot_id=str(upd.get("slotId") or "").strip(),
+                            file_path=fp,
+                            label=str(upd.get("label") or "").strip(),
+                            role_hint=str(upd.get("roleHint") or "").strip(),
+                            libtv_node_key=upd.get("libtvNodeKey"),
+                            mark_whiteout=bool(upd.get("whiteoutApplied")),
+                            parts=upd.get("parts") if isinstance(upd.get("parts"), list) else None,
+                        )
+                        if did_change:
+                            updated_asset_slots.add(matched_tag)
+
+                if "图片1" not in (updated_whiteout_slots | updated_asset_slots) and isinstance(shot.get("compImage"), dict):
                     jm_payload = payload.get("jimengMeta") if isinstance(payload.get("jimengMeta"), dict) else {}
                     target_status = str(shot.get("status") or "")
                     should_autosync_mask = bool(
@@ -4319,6 +4604,13 @@ class QueueStore:
                             if updated_result_video is not None:
                                 fb["resultVideo"] = copy.deepcopy(updated_result_video)
                             resolved_fbs.append(fb)
+                    if resolved_fbs:
+                        promoted_slots = self._reconcile_resolved_feedback_assets_locked(
+                            shot,
+                            resolved_fbs,
+                            skip_slots=(updated_whiteout_slots | updated_asset_slots),
+                        )
+                        updated_asset_slots.update(promoted_slots)
 
                 if shot.get("status") == "error":
                     jm = shot.get("jimengMeta") or {}
@@ -4375,6 +4667,7 @@ class QueueStore:
                                     or prompt_changed
                                     or resolved_fbs
                                     or updated_whiteout_slots
+                                    or updated_asset_slots
                                 )
                             )
                         )
@@ -4409,6 +4702,7 @@ class QueueStore:
                         prompt_changed
                         or resolved_fbs
                         or updated_whiteout_slots
+                        or updated_asset_slots
                         or prev_task in {"prompt_update_requested", "feedback_queued"}
                     )
                 ):
@@ -4560,6 +4854,18 @@ class QueueStore:
                 if mixed_order is not None and mixed_order != shot.get("libtvMixedOrder"):
                     shot["libtvMixedOrder"] = mixed_order
                     metadata_changed = True
+                reconciled_sync_slots = self._reconcile_resolved_feedback_assets_locked(
+                    shot,
+                    [f for f in (shot.get("feedbacks") or []) if isinstance(f, dict) and f.get("status") == "resolved"],
+                    append_only=True,
+                )
+                if reconciled_sync_slots:
+                    metadata_changed = True
+                    if (
+                        not pre_has_ungenerated_changes
+                        and orig_status in {"draft_ready", "final_ready", "final_done"}
+                    ):
+                        shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
                 if node_key and node_key != shot.get("libtvSampleNodeKey"):
                     shot["libtvSampleNodeKey"] = node_key
                     metadata_changed = True

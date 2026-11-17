@@ -77,8 +77,8 @@ description: >-
 
 ### B. `feedback_queued`（修改意见 / @新图N / 改词）
 1. 解析 `latestFeedback` 中的文字修改意见、标签、`editedPrompt`、`targetSlot` 及新增附件 `newAttachments`（对应提示词中的 `@新图N`）。
-2. 如涉图片调整（重新涂白、更换参考槽位或接入 `@新图N`），先上传/替换素材并把提示词中的 `@新图N` 绑定为正式的 `@图片K` 槽位号，重新校验提示词结构与 LibTV `mixedList` 顺序。
-3. 更新 LibTV 节点后回传 `POST /api/shots/{shot_id}/agent-update`（并将反馈标记为 `resolveFeedbacks: true`）。**务必同时提供 `revisionDirection`**（1–2 句话写清你理解的修改方向：改了什么、保留了什么、原因是什么），系统会自动展示在提示词区并记入本轮版本历史，支持随时按对话轮次回滚。
+2. 如涉图片调整（重新涂白、更换参考槽位或补充接入 `@新图N`），先上传/替换素材并把提示词中的 `@新图N` 绑定为正式的 `@图片K` 槽位号，重新校验提示词结构与 LibTV `mixedList` / `libtvMixedOrder` 顺序。
+3. 更新画布节点后回传 `POST /api/shots/{shot_id}/agent-update`（并将反馈标记为 `resolveFeedbacks: true`；替换/追加参考图时同步传入 `assetUpdates: [{"action": "replace"|"append", "slotTag": "图片K", "filePath": "<绝对路径>", "label": "...", "libtvNodeKey": "<nodeKey>"}]` 与最新 `libtvMixedOrder` 确保「镜头素材」实时更新）。**务必同时提供 `revisionDirection`**（1–2 句话写清你理解的修改方向：改了什么、保留了什么、原因是什么），系统会自动展示在提示词区并记入本轮版本历史，支持随时按对话轮次回滚。
 
 ### C. `recheck_requested`（用户点击「↻ 重新处理·自检」）
 用户因处理中断、效果疑虑或想核对一致性触发该状态时，**必须执行完整断点续传 + 全链路自检**：

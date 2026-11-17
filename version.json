@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.13",
+  "version": "2026.11.17.14",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T20:14:21+08:00",
-  "changelog": "修改意见卡片与新建/详情全流程全面接入生成时长调整滑块（4-30秒或自动）：支持洗视频与正常生成双模式独立调整或恢复当前时长、随提交修改或触发重新生成自动生效并同步写入 Agent 节拍与节点 --duration",
+  "publishedAt": "2026-11-17T20:47:37+08:00",
+  "changelog": "修复修改意见新增/替换参考图后控制台「镜头素材」未同步更新的问题：新增 agent-update assetUpdates 槽位更新/追加接口，并在 resolveFeedbacks 与 sync-canvas 中自动同步关联反馈附件及 libtvMixedOrder 节点映射，同步更新工作区协作者与 Agent 提示规范",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

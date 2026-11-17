@@ -1201,6 +1201,7 @@ class AgentUpdateReq(BaseModel):
     errorSolution: str | None = None
     errorDetail: str | None = None
     whiteoutUpdates: list[dict[str, Any]] | None = None
+    assetUpdates: list[dict[str, Any]] | None = None
     confirmationRequest: dict[str, Any] | None = None
     draftVideo: dict[str, Any] | None = None
     finalVideo: dict[str, Any] | None = None
