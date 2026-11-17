@@ -12,7 +12,7 @@
     <link rel="manifest" href="/static/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/static/icon-192.png" />
     <link rel="icon" type="image/png" href="/static/icon-192.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=38" />
+    <link rel="stylesheet" href="/static/styles.css?v=39" />
   </head>
   <body>
     <div class="app-shell">
@@ -317,13 +317,13 @@
               <div class="coordinator-step-num" aria-hidden="true">1</div>
               <div class="coordinator-step-content">
                 <div class="coordinator-step-head">
-                  <strong>在 Antigravity 打开工作区并新建对话</strong>
+                  <strong>确认 Antigravity 已打开工作区并新建对话</strong>
                   <div class="coordinator-step-actions">
                     <button id="copyCoordinatorWorkspaceBtn" class="btn btn-secondary btn-xs" type="button">复制路径</button>
-                    <button id="openCoordinatorAntigravityBtn" class="btn btn-secondary btn-xs" type="button">🚀 打开 Antigravity</button>
+                    <button id="openCoordinatorFinderBtn" class="btn btn-secondary btn-xs" type="button" title="在访达中打开该工作区目录">📂 打开文件夹</button>
                   </div>
                 </div>
-                <p class="coordinator-step-hint">确保 Antigravity 已打开下列工作区目录，并点右上角「+」开一个干净对话：</p>
+                <p class="coordinator-step-hint">首次使用请在 Antigravity 打开下方工作区目录（选择目录时按 ⌘⇧G 可直接粘贴路径），再点右上角「+」新建干净对话：</p>
                 <code id="coordinatorWorkspaceCode" class="coordinator-path-code">-</code>
               </div>
             </section>
@@ -334,11 +334,11 @@
                 <div class="coordinator-step-head">
                   <strong>复制主控启动词并粘贴发送</strong>
                   <div class="coordinator-step-actions">
-                    <button id="copyCoordinatorPromptBtn" class="btn btn-primary btn-xs" type="button">📋 一键复制启动词</button>
-                    <button id="copyAndOpenCoordinatorBtn" class="btn btn-secondary btn-xs" type="button" title="复制启动词并立刻切换到 Antigravity 桌面端">📋+🚀 复制并打开</button>
+                    <button id="copyAndOpenCoordinatorBtn" class="btn btn-primary btn-sm" type="button" title="复制启动词并立刻切换到 Antigravity 桌面端">🚀 一键复制启动词并打开 Antigravity</button>
+                    <button id="copyCoordinatorPromptBtn" class="btn btn-secondary btn-xs" type="button">📋 仅复制</button>
                   </div>
                 </div>
-                <textarea id="coordinatorPromptInput" class="coordinator-prompt-textarea" readonly rows="7" spellcheck="false" aria-label="可复制的桌面主控启动词"></textarea>
+                <textarea id="coordinatorPromptInput" class="coordinator-prompt-textarea" readonly rows="6" spellcheck="false" aria-label="可复制的桌面主控启动词"></textarea>
                 <div class="coordinator-short-tip">
                   <span>💡 熟练后只要在工作区对话里直接发送短口令：</span>
                   <button id="copyCoordinatorShortTriggerBtn" class="coordinator-chip-btn" type="button" title="点击复制短口令">启动洗片监听</button>
@@ -353,17 +353,23 @@
                   <strong>开始监听后自动关掉本页面</strong>
                   <span id="coordinatorPollHint" class="coordinator-poll-hint">每 1.5 秒自动检测中…</span>
                 </div>
-                <div class="coordinator-env-grid">
-                  <div><span>监听状态：</span><strong id="coordinatorLiveConnText">尚未检测到桌面主控心跳</strong></div>
-                  <div><span>本地服务：</span><strong id="coordinatorBaseUrlText">http://127.0.0.1:8787</strong></div>
-                  <div class="coordinator-env-full"><span>Python 运行时：</span><code id="coordinatorPythonText">-</code></div>
+                <div class="coordinator-live-status-row">
+                  <span>监听状态：</span><strong id="coordinatorLiveConnText">尚未检测到桌面主控心跳</strong>
                 </div>
+                <details class="coordinator-tech-details">
+                  <summary>查看本机服务与运行环境详情</summary>
+                  <div class="coordinator-env-grid">
+                    <div><span>本地服务：</span><strong id="coordinatorBaseUrlText">http://127.0.0.1:8787</strong></div>
+                    <div class="coordinator-env-full"><span>Python 运行时：</span><code id="coordinatorPythonText">-</code></div>
+                  </div>
+                </details>
               </div>
             </section>
           </div>
 
           <div class="modal-actions coordinator-modal-actions">
             <button id="coordinatorRefreshBtn" class="btn btn-secondary btn-sm" type="button">↻ 立即检测</button>
+            <button id="coordinatorOpenPopoverBtn" class="btn btn-secondary btn-sm" type="button" title="打开右上角执行器状态浮层查看 PID 或启停本地 Fast-Path">⚙ 执行器状态</button>
             <button id="coordinatorSwitchCliBtn" class="btn btn-secondary btn-sm hidden" type="button" title="无需手动开桌面对话，直接由后台 agy CLI 并发接单">⚙ 改用后台 CLI 自动接单</button>
             <div class="modal-actions-spacer"></div>
             <button id="coordinatorSkipBtn" class="btn btn-secondary btn-sm" type="button">暂不接入，先进入控制台看片/改词</button>
@@ -431,6 +437,6 @@
     <datalist id="sceneDatalist"></datalist>
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=38" type="module"></script>
+    <script src="/static/app.js?v=39" type="module"></script>
   </body>
 </html>

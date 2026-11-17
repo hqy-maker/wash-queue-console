@@ -4511,6 +4511,13 @@ button {
   border-color: rgba(40, 167, 69, 0.36);
 }
 
+.coordinator-lead-banner.is-copied {
+  background: var(--green-soft);
+  border-color: rgba(40, 167, 69, 0.42);
+  color: var(--green-text);
+  font-weight: 550;
+}
+
 .coordinator-steps {
   display: flex;
   flex-direction: column;
@@ -4599,7 +4606,7 @@ button {
   width: 100%;
   box-sizing: border-box;
   resize: vertical;
-  min-height: 184px;
+  min-height: 158px;
   padding: 9px 11px;
   border-radius: 8px;
   border: 1px solid var(--border-strong);
@@ -4649,6 +4656,41 @@ button {
 
 .coordinator-poll-hint.is-online {
   color: var(--green-text);
+}
+
+.coordinator-live-status-row {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.coordinator-live-status-row strong {
+  color: var(--text);
+  font-weight: 550;
+}
+
+.coordinator-tech-details {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.coordinator-tech-details summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-muted);
+  display: inline-block;
+}
+
+.coordinator-tech-details summary:hover {
+  color: var(--text-secondary);
+}
+
+.coordinator-tech-details .coordinator-env-grid {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
 }
 
 .coordinator-env-grid {

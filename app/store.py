@@ -3420,7 +3420,8 @@ class QueueStore:
                     if eff_role == "480p"
                     else f"已选定版本「{short_ver}」标记为过条并定版。"
                 )
-                shot["latestRevisionDirection"] = mark_summary
+                if not (shot.get("latestRevisionDirection") or "").strip():
+                    shot["latestRevisionDirection"] = mark_summary
                 shot.setdefault("revisions", []).append(
                     {"at": now_iso(), "actor": "user", "summary": mark_summary}
                 )

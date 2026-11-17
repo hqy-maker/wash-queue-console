@@ -3085,7 +3085,7 @@ function getDesktopCoordinatorGuideData(st = getAgentStatusMeta()) {
     return srvGuide;
   }
   const baseUrl = window.location?.origin || "http://127.0.0.1:8787";
-  const waitCmd = "python3 scripts/wait_next_ai_task.py --timeout 3600";
+  const waitCmd = "python3 scripts/wait_next_ai_task.py --timeout 28800";
   return {
     baseUrl,
     workspaceRoot: "~/Documents/洗片控制台工作区",
@@ -3153,8 +3153,9 @@ function renderCoordinatorGuideModal() {
   const copyWsBtn = document.getElementById("copyCoordinatorWorkspaceBtn");
   const copyPromptBtn = document.getElementById("copyCoordinatorPromptBtn");
   const copyShortBtn = document.getElementById("copyCoordinatorShortTriggerBtn");
-  const openAgyBtn = document.getElementById("openCoordinatorAntigravityBtn");
+  const openFinderBtn = document.getElementById("openCoordinatorFinderBtn");
   const copyOpenBtn = document.getElementById("copyAndOpenCoordinatorBtn");
+  const openPopoverBtn = document.getElementById("coordinatorOpenPopoverBtn");
   const switchCliBtn = document.getElementById("coordinatorSwitchCliBtn");
   const skipBtn = document.getElementById("coordinatorSkipBtn");
 
@@ -3163,10 +3164,15 @@ function renderCoordinatorGuideModal() {
   if (badgeText) badgeText.textContent = online ? "当前桌面主控已在线" : "等待桌面 Agent 接入";
   if (titleEl) titleEl.textContent = online ? "重开 Antigravity 桌面主控对话" : "连接 Antigravity 桌面主控";
 
+  const copiedKey = state.coordinatorGuide.copiedKey;
   if (leadEl) {
-    leadEl.classList.toggle("is-online", online);
+    const isPromptCopied = copiedKey === "prompt";
+    leadEl.classList.toggle("is-copied", isPromptCopied);
+    leadEl.classList.toggle("is-online", !isPromptCopied && online);
     leadEl.textContent = state.serverUnreachable
       ? "当前未能连到本地控制台服务，请确认「洗片控制台.app」已启动后点下方「立即检测」。"
+      : isPromptCopied
+      ? "✓ 启动词已复制到剪贴板！请在 Antigravity 新建对话中按 ⌘V 粘贴并发送，挂起监听后本窗口将自动关闭。"
       : online
       ? "当前已有桌面主控保持监听。如需重开一个干净的新对话以释放上下文，请在 Antigravity 新建对话后粘贴发送下方主控词。"
       : "正在自动监测桌面监听心跳… 在 Antigravity 中发送下方主控指令并挂载监听后，本界面会在 1~2 秒内自动关闭并进入控制台。";
@@ -3193,18 +3199,20 @@ function renderCoordinatorGuideModal() {
       : "每 1.5 秒自动检测中…";
   }
 
-  const copiedKey = state.coordinatorGuide.copiedKey;
   if (copyWsBtn) copyWsBtn.textContent = copiedKey === "workspace" ? "✓ 已复制路径" : "复制路径";
-  if (copyPromptBtn) copyPromptBtn.textContent = copiedKey === "prompt" ? "✓ 已复制启动词" : "📋 一键复制启动词";
+  if (copyPromptBtn) copyPromptBtn.textContent = copiedKey === "prompt" ? "✓ 已复制" : "📋 仅复制";
   if (copyShortBtn) {
     const shortTxt = guide.shortTrigger || "启动洗片监听";
     copyShortBtn.textContent = copiedKey === "short" ? `✓ 已复制「${shortTxt}」` : shortTxt;
   }
-  if (openAgyBtn) openAgyBtn.disabled = Boolean(state.aiActionPending || state.serverUnreachable);
+  if (openFinderBtn) openFinderBtn.disabled = Boolean(state.aiActionPending || state.serverUnreachable);
   if (copyOpenBtn) {
     copyOpenBtn.disabled = Boolean(state.aiActionPending || state.serverUnreachable);
-    copyOpenBtn.textContent = state.aiActionPending ? "正在打开…" : "📋+🚀 复制并打开";
+    copyOpenBtn.textContent = state.aiActionPending
+      ? "正在唤起 Antigravity…"
+      : "🚀 一键复制启动词并打开 Antigravity";
   }
+  if (openPopoverBtn) openPopoverBtn.disabled = Boolean(state.serverUnreachable);
   if (switchCliBtn) {
     switchCliBtn.classList.toggle(
       "hidden",
@@ -5821,15 +5829,21 @@ function resolveShotVideoVersions(shot) {
       item.shortLabel = item.isCurrent
         ? outdatedFinal
           ? "旧版 1080P 归档"
+          : verSeq < totalForRole
+          ? `当前 1080P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`
           : "最新 1080P 正片"
+        : verSeq === totalForRole
+        ? `最新 1080P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`
         : `历史 1080P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`;
     } else {
       item.shortLabel = item.isCurrent
         ? draftInProg
           ? `上一版 480P${shortTs ? ` · ${shortTs}` : ""}`
           : totalForRole > 1
-          ? `最新 480P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`
+          ? `${verSeq === totalForRole ? "最新" : "当前"} 480P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`
           : "480P 样片"
+        : verSeq === totalForRole
+        ? `最新 480P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`
         : `历史 480P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`;
     }
   }
@@ -7534,6 +7548,13 @@ function bindGlobalEvents() {
     closeUpdatePopover();
     closeShotMoreMenu();
     closeShotChatMenu();
+    const st = getAgentStatusMeta();
+    const isDesktopMode = (st.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent") !== "cli_bridge";
+    const awaitingDesktop = !state.serverUnreachable && isDesktopMode && !st.desktopCoordinatorOnline && !st.busy;
+    if (!state.aiStatusOpen && awaitingDesktop) {
+      openCoordinatorGuide({ autoOpened: false });
+      return;
+    }
     state.aiStatusOpen = !state.aiStatusOpen;
     renderAiStatusPopover();
     if (state.aiStatusOpen) {
@@ -8406,8 +8427,15 @@ function bindGlobalEvents() {
       showToast("剪贴板不可用");
     }
   });
-  document.getElementById("openCoordinatorAntigravityBtn")?.addEventListener("click", async () => {
-    await launchForegroundAppWindow("antigravity");
+  document.getElementById("openCoordinatorFinderBtn")?.addEventListener("click", async () => {
+    await launchForegroundAppWindow("workspace_finder", { customToast: "已在访达中打开工作区目录" });
+  });
+  document.getElementById("coordinatorOpenPopoverBtn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeCoordinatorGuide({ dismissed: true });
+    state.aiStatusOpen = true;
+    renderAiStatusPopover();
+    refreshAgentStatus();
   });
   document.getElementById("copyAndOpenCoordinatorBtn")?.addEventListener("click", async () => {
     const guide = getDesktopCoordinatorGuideData();

@@ -130,7 +130,7 @@ def _build_desktop_coordinator_guide() -> dict[str, Any]:
     py_bin = sys.executable or "python3"
     wait_script = str((APP_ROOT / "scripts" / "wait_next_ai_task.py").resolve())
     port_arg = f" --base-url {base_url}" if port != 8787 else ""
-    wait_cmd = f"{shlex.quote(py_bin)} {shlex.quote(wait_script)}{port_arg} --timeout 3600"
+    wait_cmd = f"{shlex.quote(py_bin)} {shlex.quote(wait_script)}{port_arg} --timeout 28800"
     prompt_text = (
         "请读取 wash-queue-console 协议，专职担任洗片控制台桌面主控：\n"
         f"1. 调用 POST {base_url}/api/config/ai-dispatch-mode 将模式设为 desktop_subagent；\n"

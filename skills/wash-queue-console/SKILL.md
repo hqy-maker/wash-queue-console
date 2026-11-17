@@ -40,7 +40,7 @@ description: >-
    - 将模式确认切为桌面主控：`POST http://127.0.0.1:8787/api/config/ai-dispatch-mode`（`{"mode":"desktop_subagent"}`）
    - 查看待办队列：`curl -sf http://127.0.0.1:8787/api/agent/pending`
    - 启动桌面心跳与待办阻塞等待（作为后台非守护命令 `WaitMsBeforeAsync=500`）：
-     `"$PY_BIN" "$APP_DIR/scripts/wait_next_ai_task.py" --timeout 3600`
+     `"$PY_BIN" "$APP_DIR/scripts/wait_next_ai_task.py" --timeout 28800`
    - 桌面主控领单：`POST http://127.0.0.1:8787/api/agent/coordinator-claim`（`{"workerId":"desktop_coordinator","limit":2}`）
    - 绑定单镜子对话：`POST http://127.0.0.1:8787/api/shots/{shot_id}/bind-conversation`（`{"conversationId":"<subagent_id>","surface":"desktop"}`）
 

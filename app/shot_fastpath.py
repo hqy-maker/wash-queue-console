@@ -2027,12 +2027,25 @@ def launch_foreground_app_or_terminal(
     agy_bin: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Open Antigravity Desktop GUI or a clean interactive Terminal `agy` window."""
+    """Open Antigravity Desktop GUI, Workspace Finder, or a clean interactive Terminal `agy` window."""
     clean_target = (target or "antigravity").strip().lower()
     if clean_target == "terminal_agy":
         clean_target = "terminal"
-    if clean_target not in {"terminal", "antigravity"}:
+    if clean_target not in {"terminal", "antigravity", "workspace_finder"}:
         raise ValueError(f"不支持的启动目标: {target}")
+
+    if clean_target == "workspace_finder":
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        if not dry_run:
+            proc = subprocess.run(
+                ["/usr/bin/open", str(workspace_root)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or "无法在访达中打开工作区目录")
+        return {"ok": True, "target": "workspace_finder", "workspaceRoot": str(workspace_root)}
 
     if clean_target == "terminal":
         resolved_agy = agy_bin or find_agy_bin()

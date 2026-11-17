@@ -115,7 +115,7 @@ def wait_for_next_ai_task(
     base_url: str,
     *,
     watcher_id: str = "desktop_coordinator",
-    total_timeout: float = 3600.0,
+    total_timeout: float = 28800.0,
     poll_timeout: float = 25.0,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + max(5.0, float(total_timeout))
@@ -232,7 +232,7 @@ def main() -> int:
         help="Console server base URL",
     )
     parser.add_argument("--watcher-id", default="desktop_coordinator")
-    parser.add_argument("--timeout", type=float, default=3600.0)
+    parser.add_argument("--timeout", type=float, default=28800.0)
     parser.add_argument("--poll-timeout", type=float, default=25.0)
     args = parser.parse_args()
 
