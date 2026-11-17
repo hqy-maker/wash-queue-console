@@ -2472,6 +2472,29 @@ button {
   font-weight: 600;
 }
 
+.video-ver-chip.is-passed {
+  border-color: rgba(22, 163, 74, 0.45);
+  color: var(--green-text);
+  background: rgba(22, 163, 74, 0.08);
+}
+
+.video-ver-chip.is-passed.is-active {
+  background: var(--green-soft);
+  border-color: rgba(22, 163, 74, 0.72);
+  color: var(--green-text);
+}
+
+.btn.is-passed-cta {
+  background: #15803d;
+  border-color: #15803d;
+  color: #ffffff;
+}
+
+.btn.is-passed-cta:hover:not(:disabled) {
+  background: #166534;
+  border-color: #166534;
+}
+
 .video-capture-tray {
   margin-top: 10px;
   padding: 8px 10px;
@@ -4107,6 +4130,12 @@ button {
 .history-mini-pill.is-current {
   background: var(--blue-soft);
   color: var(--blue);
+}
+
+.history-mini-pill.is-passed {
+  background: var(--green-soft);
+  color: var(--green-text);
+  font-weight: 600;
 }
 
 .history-preview-pane {

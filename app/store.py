@@ -349,11 +349,17 @@ def infer_shot_stage_flags(
         st == "run_requested"
         or (st == "processing" and task == "run_requested")
     )
+    pv = shot.get("passedVersion") if isinstance(shot.get("passedVersion"), dict) else None
+    pv_role = str(pv.get("role") or "").strip().lower() if pv else ""
+    passed_role = ""
+    if passed_final:
+        passed_role = pv_role if pv_role in {"480p", "1080p"} else ("1080p" if has_final else "480p")
     return {
         "hasFinalVideo": has_final,
         "isFinalInProgress": final_in_progress,
         "isDraftInProgress": draft_in_progress,
         "isPassedFinal": passed_final,
+        "passedRole": passed_role,
         "hasOutdatedFinal": has_outdated_final,
         "draftUpdatedSinceFinalReopen": draft_after_reopen,
     }
@@ -781,9 +787,16 @@ def _collect_shot_video_versions(out: dict[str, Any]) -> list[dict[str, Any]]:
     raw_hist = [dict(x) for x in (out.get("videoHistory") or []) if isinstance(x, dict)]
     cur_draft = out.get("draftVideo") if isinstance(out.get("draftVideo"), dict) else None
     cur_final = out.get("finalVideo") if isinstance(out.get("finalVideo"), dict) else None
+    is_shot_passed = (
+        str(out.get("status") or "") in {"final_ready", "final_done"}
+        and not bool(out.get("finalModifiedReopened"))
+    )
+    pv = out.get("passedVersion") if isinstance(out.get("passedVersion"), dict) else {}
+    pv_sha = str(pv.get("sha256") or "").strip()
+    pv_role = str(pv.get("role") or "").strip().lower()
 
     entries: list[dict[str, Any]] = []
-    seen_sigs: set[str] = set()
+    seen_entries: dict[str, dict[str, Any]] = {}
 
     def _add_candidate(
         obj: dict[str, Any],
@@ -818,12 +831,14 @@ def _collect_shot_video_versions(out: dict[str, Any]) -> list[dict[str, Any]]:
         sha = str(obj.get("sha256") or "").strip()
         if not sha:
             sha = _file_sha256_hex(resolved)
-        sig_key = f"{role}:{sha or resolved.resolve()}"
-        if sig_key in seen_sigs:
-            return
-        seen_sigs.add(sig_key)
-
         rel_url = to_media_url(resolved)
+        sig_key = f"{role}:{sha or resolved.resolve()}"
+        if sig_key in seen_entries:
+            aliases = seen_entries[sig_key].setdefault("mediaUrls", [])
+            if rel_url not in aliases:
+                aliases.append(rel_url)
+            return
+
         w, h, dur = _extract_video_dims(obj)
         dl_at = str(obj.get("downloadedAt") or "").strip() or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime_val))
         stem = build_shot_download_filename(out, kind=role)
@@ -833,27 +848,37 @@ def _collect_shot_video_versions(out: dict[str, Any]) -> list[dict[str, Any]]:
             dl_name = f"{stem_base}_{ts_tag}{stem_ext}"
         else:
             dl_name = stem
-        entries.append(
-            {
-                "id": str(obj.get("id") or f"{'cur' if is_current else 'hist'}_{role}_{(sha or resolved.stem)[:8]}"),
-                "role": role,
-                "isCurrent": is_current,
-                "filePath": str(resolved),
-                "mediaUrl": rel_url,
-                "sha256": sha,
-                "versionToken": (sha[:10] if sha else str(st.st_mtime_ns)),
-                "width": w,
-                "height": h,
-                "durationSec": dur,
-                "bytes": fsize,
-                "downloadedAt": dl_at,
-                "resourceId": str(obj.get("resourceId") or ""),
-                "revisionDirection": str(obj.get("revisionDirection") or ""),
-                "promptVersion": str(obj.get("promptVersion") or ""),
-                "downloadName": dl_name,
-                "_sortKey": (dl_at, 1 if is_current else 0, mtime_val or sort_fallback),
-            }
-        )
+        if is_shot_passed:
+            if pv_sha and pv_role:
+                entry_passed = bool(sha == pv_sha and role == pv_role)
+            else:
+                entry_passed = bool(is_current and role == "1080p")
+        else:
+            entry_passed = False
+
+        item_obj = {
+            "id": str(obj.get("id") or f"{'cur' if is_current else 'hist'}_{role}_{(sha or resolved.stem)[:8]}"),
+            "role": role,
+            "isCurrent": is_current,
+            "isPassed": entry_passed,
+            "filePath": str(resolved),
+            "mediaUrl": rel_url,
+            "mediaUrls": [rel_url],
+            "sha256": sha,
+            "versionToken": (sha[:10] if sha else str(st.st_mtime_ns)),
+            "width": w,
+            "height": h,
+            "durationSec": dur,
+            "bytes": fsize,
+            "downloadedAt": dl_at,
+            "resourceId": str(obj.get("resourceId") or ""),
+            "revisionDirection": str(obj.get("revisionDirection") or ""),
+            "promptVersion": str(obj.get("promptVersion") or ""),
+            "downloadName": dl_name,
+            "_sortKey": (dl_at, 1 if is_current else 0, mtime_val or sort_fallback),
+        }
+        seen_entries[sig_key] = item_obj
+        entries.append(item_obj)
 
     # Current videos take precedence so `isCurrent=True` always resolves to draft_480p/final_1080p
     if cur_final and (cur_final.get("filePath") or cur_final.get("mediaUrl")):
@@ -3187,6 +3212,7 @@ class QueueStore:
                 shot["finalVideo"] = vobj
                 shot["finalModifiedReopened"] = False
                 shot["draftUpdatedSinceFinalReopen"] = False
+                shot.pop("passedVersion", None)
                 self._clear_claim_fields(shot)
                 self._clear_error_fields(shot)
                 if shot.get("status") != "processing":
@@ -3224,6 +3250,212 @@ class QueueStore:
                 )
                 self._save_queue(q, {"type": "final_replaced", "shotId": sid, "status": shot["status"]})
                 return {"shot": self._decorate_shot(q, shot), "syncResult": sync_res}
+        raise KeyError(f"镜头不存在: {shot_id}")
+
+    def mark_video_version_passed(
+        self,
+        shot_id: str,
+        *,
+        version_id: str = "",
+        sha256: str = "",
+        role: str = "",
+        media_url: str = "",
+        sync_local: bool = True,
+    ) -> dict[str, Any]:
+        """Adopt a historical (or current) video version as this shot's canonical passed result."""
+        sid = sanitize_shot_id(shot_id)
+        vid_id = (version_id or "").strip()
+        req_sha = (sha256 or "").strip().lower()
+        req_role = str(role or "").strip().lower()
+        req_url = (media_url or "").split("?", 1)[0].strip()
+
+        with self._lock:
+            q = self._load_queue()
+            self._ensure_export_config(q)
+            for shot in q["shots"]:
+                if shot["id"] != sid:
+                    continue
+                if shot.get("status") == "processing":
+                    raise ValueError("当前镜头正在后台处理中，请等待完成或中止后再标记过条")
+
+                candidates = _collect_shot_video_versions(shot)
+                if not candidates:
+                    raise ValueError("当前镜头暂无可标记过条的视频版本")
+
+                target: dict[str, Any] | None = None
+                if vid_id:
+                    target = next((c for c in candidates if str(c.get("id") or "") == vid_id), None)
+                if target is None and req_sha:
+                    same_sha = [c for c in candidates if str(c.get("sha256") or "").lower() == req_sha]
+                    if req_role in {"480p", "1080p"}:
+                        target = next((c for c in same_sha if c.get("role") == req_role), None)
+                    if target is None and same_sha:
+                        target = same_sha[0]
+                if target is None and req_url:
+                    target = next(
+                        (
+                            c
+                            for c in candidates
+                            if str(c.get("mediaUrl") or "").split("?", 1)[0].strip() == req_url
+                            or Path(str(c.get("filePath") or "")).name == Path(req_url).name
+                        ),
+                        None,
+                    )
+                if target is None:
+                    raise KeyError("未找到指定的视频版本（文件可能已移除）")
+
+                src_path = Path(str(target.get("filePath") or "")).resolve()
+                if not src_path.is_file() or DATA_ROOT.resolve() not in src_path.parents:
+                    raise ValueError("视频文件路径无效或不在数据目录内")
+
+                eff_role = "1080p" if target.get("role") == "1080p" else "480p"
+                eff_sha = str(target.get("sha256") or _file_sha256_hex(src_path))
+                field_key = "finalVideo" if eff_role == "1080p" else "draftVideo"
+                canon_stem = "final_1080p" if eff_role == "1080p" else "draft_480p"
+                ext = src_path.suffix.lower() or ".mp4"
+                dest = (SHOTS_DIR / sid / f"{canon_stem}{ext}").resolve()
+
+                rich_meta: dict[str, Any] = {}
+                for cand_obj in (
+                    [shot.get("finalVideo"), shot.get("draftVideo")] + list(shot.get("videoHistory") or [])
+                ):
+                    if not isinstance(cand_obj, dict):
+                        continue
+                    cand_sha = str(cand_obj.get("sha256") or "")
+                    if (eff_sha and cand_sha == eff_sha) or (str(cand_obj.get("id") or "") == str(target.get("id") or "")):
+                        rich_meta = copy.deepcopy(cand_obj)
+                        break
+
+                dl_at_orig = str(rich_meta.get("downloadedAt") or target.get("downloadedAt") or now_iso()).strip()
+                res_id_orig = str(rich_meta.get("resourceId") or target.get("resourceId") or "").strip()
+                remote_url_orig = str(rich_meta.get("remoteUrl") or "").strip()
+                created_ms_orig = rich_meta.get("createdAtMs")
+
+                old_vobj = copy.deepcopy(shot.get(field_key)) if isinstance(shot.get(field_key), dict) else None
+                old_sha = str((old_vobj or {}).get("sha256") or "").strip()
+                if not old_sha and isinstance(old_vobj, dict) and old_vobj.get("filePath"):
+                    op = resolve_media_path(str(old_vobj["filePath"]))
+                    if op.is_file():
+                        old_sha = _file_sha256_hex(op)
+
+                short_ver = f"{eff_role.upper()}" + (f" · {dl_at_orig}" if dl_at_orig else "")
+                mark_summary = f"手动标记历史版本过条（{short_ver}）"
+
+                if src_path != dest:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_dest = dest.parent / f".{canon_stem}_{uuid.uuid4().hex[:8]}{ext}"
+                    shutil.copy2(src_path, tmp_dest)
+                    replace_shot_video_with_archive(tmp_dest, dest, role=eff_role)
+                    meta = run_preflight(dest)
+                    new_vobj: dict[str, Any] = {
+                        "filePath": str(dest),
+                        "mediaUrl": to_media_url(dest),
+                        "remoteUrl": remote_url_orig,
+                        "watermark": rich_meta.get("watermark", False),
+                        "resourceId": res_id_orig,
+                        "sha256": eff_sha,
+                        "sourceSig": _file_stat_sig(str(dest)),
+                        "meta": meta,
+                        "downloadedAt": dl_at_orig,
+                        "source": "history_passed",
+                    }
+                    if created_ms_orig:
+                        new_vobj["createdAtMs"] = created_ms_orig
+                    if old_sha != eff_sha:
+                        self._record_video_history_locked(
+                            shot,
+                            role=eff_role,
+                            prev_video=old_vobj,
+                            new_video=new_vobj,
+                            revision_direction=mark_summary,
+                        )
+                    for h in shot.get("videoHistory") or []:
+                        if isinstance(h, dict) and h.get("role") == eff_role:
+                            h["isCurrent"] = False
+                    shot[field_key] = new_vobj
+                elif isinstance(old_vobj, dict):
+                    old_vobj["sha256"] = eff_sha
+                    old_vobj["sourceSig"] = _file_stat_sig(str(dest))
+                    shot[field_key] = old_vobj
+
+                if normalize_platform(shot.get("platform")) == "jimeng" and res_id_orig:
+                    jm = shot.setdefault("jimengMeta", {})
+                    if isinstance(jm, dict):
+                        if eff_role == "1080p":
+                            jm["downloadedFinalResourceId"] = res_id_orig
+                            jm["finalResourceId"] = res_id_orig
+                        else:
+                            jm["downloadedResourceId"] = res_id_orig
+                            jm["selectedResourceId"] = res_id_orig
+
+                self._clear_claim_fields(shot)
+                self._clear_error_fields(shot)
+                jm_cur = shot.get("jimengMeta")
+                if isinstance(jm_cur, dict) and jm_cur.get("pendingAction") == "promote_1080p":
+                    jm_cur["pendingAction"] = ""
+                shot["pendingPromptEdit"] = ""
+                shot["promptUpdatePrevStatus"] = ""
+                shot["finalModifiedReopened"] = False
+                shot["draftUpdatedSinceFinalReopen"] = False
+                shot["status"] = "final_ready"
+                shot["passedVersion"] = {
+                    "id": str(target.get("id") or ""),
+                    "role": eff_role,
+                    "sha256": eff_sha,
+                    "downloadedAt": dl_at_orig,
+                    "resourceId": res_id_orig,
+                    "markedAt": now_iso(),
+                    "label": short_ver,
+                }
+                shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
+                shot["lastGeneratedAt"] = dl_at_orig or now_iso()
+                shot["updatedAt"] = now_iso()
+                shot["agentSummary"] = f"已选定版本「{short_ver}」标记为过条并定版。"
+                shot["latestRevisionDirection"] = mark_summary
+                shot.setdefault("revisions", []).append(
+                    {"at": now_iso(), "actor": "user", "summary": mark_summary}
+                )
+
+                sync_res: dict[str, Any] | None = None
+                if sync_local and eff_role == "1080p" and q.get("autoSyncExport", True):
+                    try:
+                        sync_res = self._sync_shot_export_locked(q, shot, role="1080p", create_dir=True)
+                        if sync_res.get("synced") and not sync_res.get("unchanged"):
+                            shot.setdefault("revisions", []).append(
+                                {
+                                    "at": now_iso(),
+                                    "actor": "system",
+                                    "summary": f"标记过条后已自动同步本地目录：{sync_res['filePath']}",
+                                }
+                            )
+                    except (OSError, ValueError):
+                        sync_res = None
+
+                self._append_version_snapshot(
+                    shot,
+                    kind="history_passed",
+                    actor="user",
+                    title=f"标记版本过条（{short_ver}）",
+                    prompt_text=(shot.get("promptText") or "").strip(),
+                    revision_direction=mark_summary,
+                    draft_video_url=to_media_url(dest),
+                    draft_downloaded_at=dl_at_orig or now_iso(),
+                )
+                self._save_queue(
+                    q,
+                    {
+                        "type": "history_version_passed",
+                        "shotId": sid,
+                        "role": eff_role,
+                        "sha256": eff_sha,
+                        "status": shot["status"],
+                    },
+                )
+                return {
+                    "shot": self._decorate_shot(q, shot),
+                    "syncResult": sync_res,
+                    "passedVersion": shot["passedVersion"],
+                }
         raise KeyError(f"镜头不存在: {shot_id}")
 
     @staticmethod
@@ -3971,6 +4203,7 @@ class QueueStore:
                 ):
                     shot["finalModifiedReopened"] = False
                     shot["draftUpdatedSinceFinalReopen"] = False
+                    shot.pop("passedVersion", None)
                 elif (
                     shot.get("finalModifiedReopened")
                     or (shot.get("finalVideo") or {}).get("mediaUrl")
@@ -4320,14 +4553,25 @@ class QueueStore:
                                 else f"从 {plat_label} 补充同步既有 480P 样片（早于当前改词）"
                             ),
                         )
-                        shot["draftVideo"] = new_dv_obj
+                        pv_cur = (
+                            shot.get("passedVersion")
+                            if orig_status in {"final_ready", "final_done"}
+                            and not pre_reopened_final
+                            and isinstance(shot.get("passedVersion"), dict)
+                            else None
+                        )
+                        pv_marked_ms = _parse_timestamp_ms((pv_cur or {}).get("markedAt"))
+                        draft_locked_by_passed = bool(
+                            pv_cur and (draft_created_ms == 0 or pv_marked_ms <= 0 or draft_created_ms <= pv_marked_ms)
+                        )
+                        if not draft_locked_by_passed:
+                            shot["draftVideo"] = new_dv_obj
                         has_final_on_canvas = bool(final_path is not None and final_path.is_file())
                         draft_newer_than_final = bool(draft_created_ms and final_created_ms and draft_created_ms > final_created_ms)
                         keep_passed_final = bool(
                             orig_status in {"final_ready", "final_done"}
                             and not pre_reopened_final
-                            and has_final_on_canvas
-                            and not draft_newer_than_final
+                            and ((has_final_on_canvas and not draft_newer_than_final) or draft_locked_by_passed)
                         )
                         if not draft_matches_inputs:
                             draft_is_pre_edit = True
@@ -4438,10 +4682,25 @@ class QueueStore:
                                 else f"从 {plat_label} 补充同步既有 1080P 正片（早于当前改动）"
                             ),
                         )
-                        shot["finalVideo"] = new_fv_obj
-                        if final_matches_inputs:
+                        pv_cur_f = (
+                            shot.get("passedVersion")
+                            if orig_status in {"final_ready", "final_done"}
+                            and not pre_reopened_final
+                            and isinstance(shot.get("passedVersion"), dict)
+                            else None
+                        )
+                        pv_marked_ms_f = _parse_timestamp_ms((pv_cur_f or {}).get("markedAt"))
+                        final_locked_by_passed = bool(
+                            pv_cur_f and (final_created_ms == 0 or pv_marked_ms_f <= 0 or final_created_ms <= pv_marked_ms_f)
+                        )
+                        if final_locked_by_passed:
+                            final_is_pre_edit = True
+                        else:
+                            shot["finalVideo"] = new_fv_obj
+                        if final_matches_inputs and not final_locked_by_passed:
                             shot["finalModifiedReopened"] = False
                             shot["draftUpdatedSinceFinalReopen"] = False
+                            shot.pop("passedVersion", None)
                             self._clear_claim_fields(shot)
                             shot["status"] = "final_ready"
                             shot["agentSummary"] = f"已从 {plat_label} 画布同步最新 1080P 正片并归档。"
@@ -4464,7 +4723,7 @@ class QueueStore:
                                         )
                                 except (OSError, ValueError):
                                     pass
-                        else:
+                        elif not final_locked_by_passed:
                             final_is_pre_edit = True
                             shot.setdefault("revisions", []).append(
                                 {

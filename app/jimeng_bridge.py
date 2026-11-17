@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from store import WORKSPACE_ROOT, replace_shot_video_with_archive
+from store import WORKSPACE_ROOT, _parse_timestamp_ms, replace_shot_video_with_archive
 
 HOME_DIR = Path.home()
 APP_ROOT = Path(__file__).resolve().parent
@@ -789,11 +789,29 @@ def sync_shot_node(
             }
         )
 
+    pv = (
+        shot.get("passedVersion")
+        if str(shot.get("status") or "") in {"final_ready", "final_done"}
+        and not shot.get("finalModifiedReopened")
+        and isinstance(shot.get("passedVersion"), dict)
+        else None
+    )
+    pv_role = str((pv or {}).get("role") or "").strip().lower()
+    pv_marked_ms = _parse_timestamp_ms((pv or {}).get("markedAt"))
+
     draft_path: Path | None = None
     download_warning = ""
     existing_dl_res = str(jm.get("downloadedResourceId") or (shot.get("draftVideo") or {}).get("resourceId") or "").strip()
     target = shot_dir / "draft_480p.mp4"
-    if resource_id:
+    lock_draft_target = bool(
+        pv
+        and pv_role == "480p"
+        and target.is_file()
+        and (draft_created_ms == 0 or pv_marked_ms <= 0 or draft_created_ms <= pv_marked_ms)
+    )
+    if lock_draft_target:
+        draft_path = None
+    elif resource_id:
         if not target.is_file() or existing_dl_res != resource_id:
             try:
                 draft_path = download_resource(resource_id, target, project_uuid=resolved_proj)
@@ -845,7 +863,14 @@ def sync_shot_node(
             or ""
         ).strip()
         ftarget = shot_dir / "final_1080p.mp4"
-        if final_res_id:
+        lock_final_target = bool(
+            pv
+            and pv_role in {"480p", "1080p"}
+            and (final_created_ms == 0 or pv_marked_ms <= 0 or final_created_ms <= pv_marked_ms)
+        )
+        if lock_final_target:
+            final_path = None
+        elif final_res_id:
             if not ftarget.is_file() or existing_final_res != final_res_id:
                 try:
                     final_path = download_resource(final_res_id, ftarget, project_uuid=resolved_proj)

@@ -1004,6 +1004,14 @@ class RunShotReq(BaseModel):
     edited_prompt: str | None = None
 
 
+class MarkPassedReq(BaseModel):
+    versionId: str = ""
+    sha256: str = ""
+    role: str = ""
+    mediaUrl: str = ""
+    syncLocal: bool = True
+
+
 class RollbackReq(BaseModel):
     versionId: str
     syncToCanvas: bool = True
@@ -1815,6 +1823,25 @@ def approve_final(shot_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/shots/{shot_id}/mark-passed")
+def mark_version_passed(shot_id: str, req: MarkPassedReq | None = None) -> dict[str, Any]:
+    body = req or MarkPassedReq()
+    try:
+        res = store.mark_video_version_passed(
+            shot_id,
+            version_id=body.versionId,
+            sha256=body.sha256,
+            role=body.role,
+            media_url=body.mediaUrl,
+            sync_local=body.syncLocal,
+        )
+        return {"ok": True, **res}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/shots/{shot_id}/reprocess")
 def reprocess_shot(shot_id: str, req: ReprocessReq | None = None) -> dict[str, Any]:
     body = req or ReprocessReq()
@@ -2070,6 +2097,14 @@ def _sync_one_shot_with_canvas(
             prefetched_videos_by_proj=prefetched_videos_by_proj,
             prefetched_nodes_by_proj=prefetched_nodes_by_proj,
         )
+    elif (
+        str(shot.get("status") or "") in {"final_ready", "final_done"}
+        and not shot.get("finalModifiedReopened")
+        and isinstance(shot.get("passedVersion"), dict)
+    ):
+        updated = store.get_shot(shot["id"])
+        updated["_syncDelta"] = {"changed": False, "draftUpdated": False, "finalUpdated": False, "metadataUpdated": False}
+        return updated, {}, plat
     else:
         info = libtv_bridge.sync_shot_node(shot, shot_dir)
 

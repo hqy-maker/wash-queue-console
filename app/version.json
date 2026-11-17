@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.6",
+  "version": "2026.11.17.7",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T12:29:17+08:00",
-  "changelog": "修复改词/返工/涂白/回滚后未重新生成时点击刷新同步导致状态与指纹被旧视频误覆盖的 bug（按资源 createdAt 与 inputModifiedAtMs 对齐、保护待处理/待重生成状态、避免同内容 CDN URL 轮换与旧 1080P 误覆盖）",
+  "publishedAt": "2026-11-17T12:47:14+08:00",
+  "changelog": "新增在历史视频版本与历史回滚弹窗中一键「✓ 标记此版过条」功能（支持历史 480P 与历史 1080P 版本一键采用定版、保留其余历史版本、1080P 自动同步本地目录、480P 支持单独同步且防止刷新同步误覆盖）",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

@@ -60,17 +60,93 @@ function guardPassedFinalAction(
   if (!isPassedFinal(shot)) {
     return onProceed();
   }
-  const finTime = shot.finalVideo?.downloadedAt || shot.lastGeneratedAt || shot.updatedAt || "已归档";
+  const passedRoleText = shot.passedRole === "480p" ? "480P 版本" : "1080P 正片";
+  const finTime =
+    (shot.passedRole === "480p" ? shot.passedVersion?.downloadedAt : shot.finalVideo?.downloadedAt) ||
+    shot.lastGeneratedAt ||
+    shot.updatedAt ||
+    "已归档";
   openConfirmModal({
-    title: `本镜头已定版（1080P 已过条），确定要${actionName}吗？`,
+    title: `本镜头已定版（${passedRoleText}已过条），确定要${actionName}吗？`,
     message:
-      `「${shot.id}」已完成 1080P 正片定版。${consequenceText ? consequenceText + "\n\n" : ""}` +
-      "确认后将解锁本镜修改，后续可继续生成新版 480P 样片并重转 1080P 正片（原 1080P 归档视频仍会保留用于对照）。",
-    meta: `镜头：${shot.id} · 当前定版时间：${finTime}`,
+      `「${shot.id}」已完成${passedRoleText}过条定版。${consequenceText ? consequenceText + "\n\n" : ""}` +
+      "确认后将解锁本镜修改，后续可继续生成新版 480P 样片或重转 1080P 正片（既有历史视频与所有对话记录仍会保留用于对照）。",
+    meta: `镜头：${shot.id} · 当前过条版本时间：${finTime}`,
     okText: okText || `确认解锁并${actionName}`,
     cancelText: "取消（保持定版）",
     danger: true,
     onConfirm: onProceed,
+  });
+}
+
+function findMatchingVideoVersionForSnapshot(shot, snap) {
+  const rawUrl = String(snap?.draftVideoUrl || "").split("?")[0].trim();
+  if (!rawUrl || !shot) return null;
+  const list = resolveShotVideoVersions(shot);
+  const exact = list.find((v) => {
+    const urls = Array.isArray(v.mediaUrls) && v.mediaUrls.length ? v.mediaUrls : [v.mediaUrl];
+    return urls.some((u) => String(u || "").split("?")[0].trim() === rawUrl);
+  });
+  if (exact) return exact;
+  const baseName = rawUrl.split("/").pop() || "";
+  if (!baseName) return null;
+  return (
+    list.find((v) => {
+      const urls = Array.isArray(v.mediaUrls) && v.mediaUrls.length ? v.mediaUrls : [v.mediaUrl];
+      return urls.some((u) => (String(u || "").split("?")[0].split("/").pop() || "") === baseName);
+    }) || null
+  );
+}
+
+function confirmAndMarkVideoVersionPassed(
+  shot,
+  verObj,
+  { label = "", closeHistoryOnSuccess = false } = {}
+) {
+  if (!shot || !verObj) return;
+  const roleUpper = verObj.role === "1080p" ? "1080P" : "480P";
+  const displayLabel = label || verObj.shortLabel || `${roleUpper} 版本`;
+  const alreadyPassedOther = isPassedFinal(shot);
+  const actionSummary =
+    roleUpper === "1080p"
+      ? "确认后将把该版 1080P 设为本镜当前定版正片（原正片仍自动保留在视频版本历史中），并将状态标记为「已过条」；若已绑定本地导出目录将自动覆盖同步。"
+      : "确认后将把该版 480P 采用为当前有效版本，并直接将本镜状态标记为「已过条」定版（仅本地定版不消耗云端积分；后续仍可随时解锁重洗或重转）。";
+  openConfirmModal({
+    title: alreadyPassedOther
+      ? `改标「${displayLabel}」为本镜过条版本？`
+      : `将「${displayLabel}」标记为过条？`,
+    message: actionSummary,
+    meta: `镜头：${shot.id}${verObj.downloadedAt ? ` · 成片时间：${verObj.downloadedAt}` : ""}${verObj.revisionDirection ? `\n版本备注：${verObj.revisionDirection}` : ""}`,
+    okText: alreadyPassedOther ? "确认改标此版过条" : "确认标记过条",
+    cancelText: "取消",
+    onConfirm: async () => {
+      try {
+        const res = await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/mark-passed`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            versionId: verObj.id || "",
+            sha256: verObj.sha256 || "",
+            role: verObj.role || "",
+            mediaUrl: verObj.mediaUrl || "",
+            syncLocal: true,
+          }),
+        });
+        state.detailDraft.previewVersion = "auto";
+        if (closeHistoryOnSuccess && state.historyModal?.open) {
+          closeHistoryModal();
+        }
+        const sr = res.syncResult;
+        showToast(
+          sr?.synced
+            ? `已将「${displayLabel}」标记为过条，并同步本地目录：${sr.filePath}`
+            : `已将 ${shot.id} 的「${displayLabel}」标记为过条`
+        );
+        await refreshState();
+      } catch (err) {
+        showToast(err.message || "标记过条失败");
+      }
+    },
   });
 }
 
@@ -5388,7 +5464,9 @@ function renderShotActionBarHtml(shot) {
   }
 
   const passedMetaHtml = passed
-    ? `<span class="passed-lock-badge" title="该镜头已完成 1080P 正片，已过条">✓ 已过条 · 1080P 正片已定版</span>`
+    ? shot.passedRole === "480p"
+      ? `<span class="passed-lock-badge" title="已选定 480P 版本标记过条">✓ 已过条 · 480P 版本已定版</span>`
+      : `<span class="passed-lock-badge" title="该镜头已完成 1080P 正片，已过条">✓ 已过条 · 1080P 正片已定版</span>`
     : finalInProgress
     ? `<span class="pill pill-purple">⏳ 正在转为 1080P 正片</span>`
     : outdatedFinal
@@ -5492,17 +5570,18 @@ function resolveShotVideoVersions(shot) {
   return list;
 }
 
-function renderVideoReviewCard(shot) {
-  const draftVid = shot.draftVideo?.mediaUrl ? shot.draftVideo : null;
-  const finalVid = shot.finalVideo?.mediaUrl ? shot.finalVideo : null;
+function resolveActivePreviewVideo(shot) {
+  const draftVid = shot?.draftVideo?.mediaUrl ? shot.draftVideo : null;
+  const finalVid = shot?.finalVideo?.mediaUrl ? shot.finalVideo : null;
   const versions = resolveShotVideoVersions(shot);
   const draftInProgress = isDraftInProgress(shot);
-  const finalInProgress = isFinalInProgress(shot);
   const outdatedFinal = isOutdatedFinal(shot);
-  const draftRefreshed = Boolean(shot.draftUpdatedSinceFinalReopen);
+  const draftRefreshed = Boolean(shot?.draftUpdatedSinceFinalReopen);
   const changeInfo = getEffectiveShotChangeInfo(shot);
+  const passed = isPassedFinal(shot);
+  const passedRole = shot?.passedRole || (passed ? (finalVid ? "1080p" : "480p") : "");
 
-  let selectedVer = state.detailDraft.previewVersion;
+  const selectedVer = state.detailDraft.previewVersion;
   let activeEntry = versions.find((v) => v.id === selectedVer) || null;
   if (!activeEntry) {
     if (selectedVer === "final") {
@@ -5512,13 +5591,30 @@ function renderVideoReviewCard(shot) {
     }
   }
   if (!activeEntry) {
-    const preferDraft = !finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)) || draftInProgress;
+    const preferDraft =
+      (passed && passedRole === "480p") ||
+      !finalVid ||
+      (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)) ||
+      draftInProgress;
     activeEntry = preferDraft
       ? versions.find((v) => v.role === "480p" && v.isCurrent) || versions[0] || null
       : versions.find((v) => v.role === "1080p" && v.isCurrent) || versions[0] || null;
   }
+  const fallbackVid = activeEntry || finalVid || draftVid || null;
+  return { versions, activeEntry, activeVid: fallbackVid, passedRole };
+}
 
-  const activeVid = activeEntry || (finalVid || draftVid);
+function renderVideoReviewCard(shot) {
+  const draftVid = shot.draftVideo?.mediaUrl ? shot.draftVideo : null;
+  const finalVid = shot.finalVideo?.mediaUrl ? shot.finalVideo : null;
+  const draftInProgress = isDraftInProgress(shot);
+  const finalInProgress = isFinalInProgress(shot);
+  const outdatedFinal = isOutdatedFinal(shot);
+  const draftRefreshed = Boolean(shot.draftUpdatedSinceFinalReopen);
+  const changeInfo = getEffectiveShotChangeInfo(shot);
+
+  const passed = isPassedFinal(shot);
+  const { versions, activeEntry, activeVid, passedRole } = resolveActivePreviewVideo(shot);
   const activeVer = activeVid ? (activeVid.role === "1080p" ? "final" : "draft") : "draft";
   const hasBoth = Boolean(
     versions.some((v) => v.role === "480p") && versions.some((v) => v.role === "1080p")
@@ -5551,8 +5647,13 @@ function renderVideoReviewCard(shot) {
           ${versions
             .map((ver) => {
               const isSel = activeEntry && ver.id === activeEntry.id;
-              const titleText = [ver.downloadedAt, ver.revisionDirection].filter(Boolean).join(" · ");
-              return `<button type="button" class="video-ver-chip${isSel ? " is-active" : ""}" data-preview-ver="${escapeHtml(ver.id)}" title="${escapeHtml(titleText || ver.shortLabel)}">${escapeHtml(ver.shortLabel)}</button>`;
+              const isChipPassed = Boolean(
+                ver.isPassed || (passed && passedRole !== "480p" && ver.role === "1080p" && ver.isCurrent)
+              );
+              const titleText = [isChipPassed ? "已标记过条定版" : "", ver.downloadedAt, ver.revisionDirection]
+                .filter(Boolean)
+                .join(" · ");
+              return `<button type="button" class="video-ver-chip${isSel ? " is-active" : ""}${isChipPassed ? " is-passed" : ""}" data-preview-ver="${escapeHtml(ver.id)}" title="${escapeHtml(titleText || ver.shortLabel)}">${isChipPassed ? "✓ " : ""}${escapeHtml(ver.shortLabel)}</button>`;
             })
             .join("")}
         </div>
@@ -5596,14 +5697,40 @@ function renderVideoReviewCard(shot) {
 
   const metaStr = formatVideoMetaText(activeVid);
   const srcMetaStr = formatVideoMetaText(srcVid);
-  const passed = isPassedFinal(shot);
+  const isViewingCurrentDraft = Boolean(activeVid && activeVid.role === "480p" && activeVid.isCurrent);
+  const isThisVerPassed = Boolean(
+    activeVid?.isPassed ||
+      (passed && passedRole !== "480p" && activeVid?.role === "1080p" && activeVid?.isCurrent)
+  );
   const canApproveFinal = Boolean(
     draftVid &&
+      isViewingCurrentDraft &&
       !draftInProgress &&
       !finalInProgress &&
       !passed &&
       (!finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)))
   );
+  const showMarkPassedBtn = Boolean(
+    activeVid && !draftInProgress && !finalInProgress && !isThisVerPassed
+  );
+  const markPassedLabel =
+    activeVid?.isCurrent && outdatedFinal && activeVid?.role === "1080p"
+      ? "✓ 恢复此 1080P 过条"
+      : passed
+      ? "✓ 改标此版过条"
+      : activeVid?.isCurrent
+      ? "✓ 直接标过条"
+      : "✓ 标记此版过条";
+  const markPassedPrimary = Boolean(!activeVid?.isCurrent || outdatedFinal || passed || !canApproveFinal);
+  const markPassedBtnHtml = showMarkPassedBtn
+    ? `<button id="markHistoryPassedBtn" class="btn ${
+        markPassedPrimary ? "is-passed-cta" : "btn-secondary"
+      } btn-sm" type="button" title="${
+        activeVid?.role === "1080p"
+          ? "将该 1080P 版本采用为定版并标记「已过条」（同步更新本地导出目录）"
+          : "直接将该版本（480P）采用并标记为「已过条」定版（不消耗云端积分）"
+      }">${markPassedLabel}</button>`
+    : "";
   const downloadName =
     activeVid.downloadName ||
     (activeVer === "final"
@@ -5616,20 +5743,27 @@ function renderVideoReviewCard(shot) {
   const syncStatus = shot.exportSyncStatus1080p || (finalVid ? "unbound" : "no_final");
   const syncTargetDir = (shot.resolvedExportDir || "").trim();
   const syncedFilePath = shot.localExports?.["1080p"]?.filePath || "";
-  const localSyncBtnHtml = finalVid
-    ? syncStatus === "synced"
-      ? `<button id="syncLocalExportBtn" class="btn btn-secondary btn-sm is-synced" type="button" title="已自动覆盖同步到本地目录：${escapeHtml(syncedFilePath || `${syncTargetDir}/${shot.downloadName1080p}`)}（点击可手动重刷校验）">✓ 已同步本地 1080P</button>`
-      : syncStatus === "needs_sync"
-      ? `<button id="syncLocalExportBtn" class="btn btn-primary btn-sm" type="button" title="检测到 1080P 画面或名称有更新，点击立即覆盖写入 ${escapeHtml(`${syncTargetDir}/${shot.downloadName1080p || downloadName}`)}">↻ 更新本地 1080P</button>`
-      : `<button id="syncLocalExportBtn" class="btn btn-secondary btn-sm" type="button" title="绑定本地场次或默认成片目录，后续修改或重转 1080P 将自动覆盖更新">📁 同步到文件夹</button>`
-    : "";
+  const localSyncBtnHtml =
+    passed && passedRole === "480p"
+      ? `<button id="syncLocalPassed480Btn" class="btn btn-secondary btn-sm" type="button" title="${
+          syncTargetDir
+            ? `将已标过条的 480P 成片同步写入：${escapeHtml(syncTargetDir)}`
+            : "绑定本地场次或默认成片目录后导出过条成片"
+        }">📁 同步 480P 到文件夹</button>`
+      : finalVid
+      ? syncStatus === "synced"
+        ? `<button id="syncLocalExportBtn" class="btn btn-secondary btn-sm is-synced" type="button" title="已自动覆盖同步到本地目录：${escapeHtml(syncedFilePath || `${syncTargetDir}/${shot.downloadName1080p}`)}（点击可手动重刷校验）">✓ 已同步本地 1080P</button>`
+        : syncStatus === "needs_sync"
+        ? `<button id="syncLocalExportBtn" class="btn btn-primary btn-sm" type="button" title="检测到 1080P 画面或名称有更新，点击立即覆盖写入 ${escapeHtml(`${syncTargetDir}/${shot.downloadName1080p || downloadName}`)}">↻ 更新本地 1080P</button>`
+        : `<button id="syncLocalExportBtn" class="btn btn-secondary btn-sm" type="button" title="绑定本地场次或默认成片目录，后续修改或重转 1080P 将自动覆盖更新">📁 同步到文件夹</button>`
+      : "";
   const replaceFinalBtnHtml = finalVid
     ? `<button id="replaceFinalVideoBtn" class="btn btn-secondary btn-sm" type="button" title="选择本机修改过的新 1080P 视频替换当前正片，并自动覆盖同步到本地目录">↑ 替换 1080P</button><input id="replaceFinalVideoInput" type="file" accept="video/*" hidden />`
     : "";
   const localSyncBannerHtml =
-    finalVid && syncStatus === "synced" && syncedFilePath
+    finalVid && passedRole !== "480p" && syncStatus === "synced" && syncedFilePath
       ? `<div class="local-sync-status-line is-synced">📁 本地同步目录已就绪：<code>${escapeHtml(syncedFilePath)}</code></div>`
-      : finalVid && syncStatus === "needs_sync" && syncTargetDir
+      : finalVid && passedRole !== "480p" && syncStatus === "needs_sync" && syncTargetDir
       ? `<div class="local-sync-status-line is-needs-sync">⚠ 本地成片待同步更新：<code>${escapeHtml(syncTargetDir)}/${escapeHtml(shot.downloadName1080p || downloadName)}</code></div>`
       : "";
   const draftProgressBannerHtml = draftInProgress
@@ -5638,27 +5772,38 @@ function renderVideoReviewCard(shot) {
   const finalProgressBannerHtml = finalInProgress
     ? `<div class="final-progress-banner">⏳ <strong>正在转为 1080P 正片</strong>：${escapeHtml(shot.agentSummary || "已提交转正片队列，完成后将自动归档并标为「已过条」，无需重复点击。")}</div>`
     : "";
-  const passedBannerHtml =
-    passed && finalVid
-      ? `<div class="passed-status-banner">✓ <strong>本镜已过条（1080P 正片已归档定版）</strong>，如需继续修改将弹出二次确认弹窗防误触。</div>`
-      : outdatedFinal && finalVid
-      ? `<div class="outdated-final-banner">↺ <strong>已解锁定版修改</strong>：上方可对照旧版 1080P 正片归档；${
-          draftRefreshed || !changeInfo.hasChanges
-            ? "新版 480P 样片已就绪，满意后点右下角「✦ 重新转 1080P 正片」即可重新定版。"
-            : "请先点上方「▶ 按新修改重新生成」产出新版 480P 样片，出片后即可重新转 1080P 正片。"
+  const passedBannerHtml = passed
+    ? passedRole === "480p"
+      ? `<div class="passed-status-banner">✓ <strong>本镜已标记过条（采用 ${escapeHtml(shot.passedVersion?.label || "480P 版本")} 定版）</strong>${
+          finalVid ? "；注：下方既有 1080P 为其他版本归档，如需重改将弹窗二次确认。" : "，如需继续修改将弹出二次确认弹窗防误触。"
         }</div>`
-      : "";
-  const finalActionHtml = canApproveFinal
+      : finalVid
+      ? `<div class="passed-status-banner">✓ <strong>本镜已过条（1080P 正片已归档定版）</strong>，如需继续修改将弹出二次确认弹窗防误触。</div>`
+      : ""
+    : outdatedFinal && finalVid
+    ? `<div class="outdated-final-banner">↺ <strong>已解锁定版修改</strong>：上方可对照旧版 1080P 正片归档；${
+        draftRefreshed || !changeInfo.hasChanges
+          ? "新版 480P 样片已就绪，满意后点右下角「✦ 重新转 1080P 正片」即可重新定版。"
+          : "请先点上方「▶ 按新修改重新生成」产出新版 480P 样片，出片后即可重新转 1080P 正片。"
+      }</div>`
+    : "";
+  const approveOrBadgeHtml = canApproveFinal
     ? `<button id="approveFinalBtn" class="btn btn-primary btn-sm" type="button">${
         finalVid && outdatedFinal ? "✦ 重新转 1080P 正片" : "✦ 转 1080P 正片"
       }</button>`
     : finalInProgress
     ? `<button id="approveFinalBtn" class="btn btn-secondary btn-sm" type="button" disabled title="正片正在生成中，已锁定防误触">⏳ 转 1080P 正片中…</button>`
-    : passed
-    ? `<span class="passed-lock-badge" title="1080P 正片已完成归档">✓ 已过条 · 1080P 正片</span>`
-    : outdatedFinal
+    : isThisVerPassed
+    ? `<span class="passed-lock-badge" title="${
+        passedRole === "480p" ? "已选定此 480P 版本标记过条" : "1080P 正片已完成归档"
+      }">✓ ${passedRole === "480p" ? "当前已标过条 · 480P" : "已过条 · 1080P 正片"}</span>`
+    : outdatedFinal && !markPassedBtnHtml
     ? `<span class="outdated-final-badge" title="请先按新修改重新生成 480P 样片后再重新转 1080P 正片">↺ 待重洗 480P 后重转正片</span>`
     : "";
+  const finalActionHtml =
+    markPassedBtnHtml || approveOrBadgeHtml
+      ? `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">${markPassedBtnHtml}${approveOrBadgeHtml}</div>`
+      : "";
 
   const headerStatusPill = draftInProgress
     ? `<span class="pill pill-purple">⏳ 生成新样片中</span>`
@@ -6126,12 +6271,13 @@ function bindDetailEvents(shot) {
     openRenameShotModal(shot, { downloadVerAfter: ver });
   });
 
-  document.getElementById("syncLocalExportBtn")?.addEventListener("click", async (e) => {
+  const handleExportRoleClick = (role) => async (e) => {
     const btn = e.currentTarget;
     if (!shot.resolvedExportDir) {
       openExportConfigModal(getShotFolderName(shot));
       return;
     }
+    const roleLabel = role === "480p" ? "480P" : "1080P";
     const prevText = btn.textContent;
     btn.disabled = true;
     btn.textContent = "同步中…";
@@ -6139,15 +6285,15 @@ function bindDetailEvents(shot) {
       const res = await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/export-local`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: "1080p" }),
+        body: JSON.stringify({ role }),
       });
       const r = res.syncResult || {};
       showToast(
         r.renamedFrom
           ? `已同步覆盖并将旧文件重命名为：${r.fileName}`
           : r.unchanged
-          ? `本地 1080P 已是最新版本：${r.fileName}`
-          : `已同步最新 1080P 到：${r.filePath}`
+          ? `本地 ${roleLabel} 已是最新版本：${r.fileName}`
+          : `已同步最新 ${roleLabel} 到：${r.filePath}`
       );
       await refreshState();
     } catch (err) {
@@ -6155,7 +6301,9 @@ function bindDetailEvents(shot) {
       btn.disabled = false;
       btn.textContent = prevText;
     }
-  });
+  };
+  document.getElementById("syncLocalExportBtn")?.addEventListener("click", handleExportRoleClick("1080p"));
+  document.getElementById("syncLocalPassed480Btn")?.addEventListener("click", handleExportRoleClick("480p"));
 
   const replaceFinalInput = document.getElementById("replaceFinalVideoInput");
   document.getElementById("replaceFinalVideoBtn")?.addEventListener("click", () => {
@@ -6306,6 +6454,15 @@ function bindDetailEvents(shot) {
     setCapturedSlot("videoCapture", cap);
     renderDetailCaptureTray();
     showToast(`已截取原片帧 ${cap.timeLabel}（${cap.width}×${cap.height}）`);
+  });
+
+  document.getElementById("markHistoryPassedBtn")?.addEventListener("click", () => {
+    const { activeVid } = resolveActivePreviewVideo(shot);
+    if (!activeVid) {
+      showToast("未找到当前预览的视频版本");
+      return;
+    }
+    confirmAndMarkVideoVersionPassed(shot, activeVid);
   });
 
   document.getElementById("approveFinalBtn")?.addEventListener("click", async () => {
@@ -6768,6 +6925,8 @@ function renderHistoryModal() {
     .map((entry) => {
       const isActive = entry.id === selected.id;
       const isCurrentPrompt = Boolean(currentMatchId && entry.id === currentMatchId);
+      const matchedVid = entry.draftVideoUrl ? findMatchingVideoVersionForSnapshot(shot, entry) : null;
+      const isPassedSnap = Boolean(matchedVid?.isPassed);
       const snippet = entry.revisionDirection || entry.userFeedback || (entry.promptText ? entry.promptText.slice(0, 80) : "");
       return `
         <button type="button" class="history-item ${isActive ? "is-active" : ""}" data-history-ver="${escapeHtml(entry.id)}">
@@ -6778,6 +6937,7 @@ function renderHistoryModal() {
           <div class="history-item-title">${escapeHtml(entry.title || entry.kind || "版本快照")}</div>
           ${snippet ? `<div class="history-item-snippet">${escapeHtml(snippet)}</div>` : ""}
           <div class="history-item-badges">
+            ${isPassedSnap ? `<span class="history-mini-pill is-passed">✓ 已过条</span>` : ""}
             ${isCurrentPrompt ? `<span class="history-mini-pill is-current">当前版本</span>` : ""}
             ${entry.kind === "rollback" ? `<span class="history-mini-pill is-rollback">回滚记录</span>` : ""}
             ${entry.draftVideoUrl ? `<span class="history-mini-pill is-video">含成片</span>` : ""}
@@ -6873,6 +7033,19 @@ function renderHistoryModal() {
     <div class="history-actions">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         ${hasPrompt ? `<button type="button" class="btn btn-secondary btn-sm" id="copyHistoryPromptBtn">📋 复制此版提示词</button>` : ""}
+        ${
+          selected.draftVideoUrl
+            ? (() => {
+                const matchedSnapVer = findMatchingVideoVersionForSnapshot(shot, selected);
+                if (matchedSnapVer?.isPassed) {
+                  return `<button type="button" class="btn btn-secondary btn-sm" disabled>✓ 当前已标过条</button>`;
+                }
+                return `<button type="button" class="btn btn-sm is-passed-cta" id="markHistorySnapPassedBtn">${
+                  isPassedFinal(shot) ? "✓ 改标此版过条" : "✓ 标记此版过条"
+                }</button>`;
+              })()
+            : ""
+        }
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <button type="button" class="btn btn-primary btn-sm" id="rollbackVersionBtn" ${!hasPrompt || matchesCurrent ? "disabled" : ""}>
@@ -6887,6 +7060,23 @@ function renderHistoryModal() {
       setCapturedSlot("historyCapture", null);
       state.historyModal.selectedVersionId = btn.dataset.historyVer;
       renderHistoryModal();
+    });
+  });
+
+  document.getElementById("markHistorySnapPassedBtn")?.addEventListener("click", () => {
+    const matchedSnapVer = findMatchingVideoVersionForSnapshot(shot, selected);
+    const snapLabel = `${selected.version || "历史"} · ${selected.title || "历史版本"}`;
+    const verTarget = matchedSnapVer || {
+      id: "",
+      sha256: "",
+      role: String(selected.draftVideoUrl || "").includes("final_1080p") ? "1080p" : "480p",
+      mediaUrl: selected.draftVideoUrl,
+      downloadedAt: selected.draftDownloadedAt || selected.createdAt || "",
+      revisionDirection: selected.revisionDirection || "",
+    };
+    confirmAndMarkVideoVersionPassed(shot, verTarget, {
+      label: snapLabel,
+      closeHistoryOnSuccess: true,
     });
   });
 
