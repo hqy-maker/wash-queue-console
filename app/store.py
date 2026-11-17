@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -481,6 +482,107 @@ def resolve_cli_conversation_id(shot: dict[str, Any]) -> str:
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _parse_timestamp_ms(val: Any) -> int:
+    if val is None or isinstance(val, bool):
+        return 0
+    if isinstance(val, (int, float)):
+        num = int(val)
+        if num <= 0:
+            return 0
+        return num * 1000 if num < 10_000_000_000 else num
+    raw = str(val).strip()
+    if not raw:
+        return 0
+    if raw.isdigit():
+        return _parse_timestamp_ms(int(raw))
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            st = time.strptime(raw[:19], fmt)
+            return int(time.mktime(st) * 1000)
+        except ValueError:
+            pass
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _sync_video_matches_current_inputs(
+    *,
+    role: str,
+    orig_status: str,
+    orig_task: str,
+    pre_has_ungenerated_changes: bool,
+    pre_pending_edit: bool,
+    pre_last_fp: str,
+    pre_cur_fp: str,
+    input_mod_ms: int,
+    created_ms: int,
+    old_vid: dict[str, Any] | None,
+    old_sha: str,
+    new_sha: str,
+    reopened_final: bool,
+) -> bool:
+    """Return True only when a canvas video reflects current inputs rather than predating an edit."""
+    protected_statuses = {
+        "draft",
+        "drafting",
+        "queued",
+        "feedback_queued",
+        "prompt_update_requested",
+        "recheck_requested",
+    }
+    expected_run_task = "run_requested" if role == "480p" else "final_requested"
+    other_run_status = "final_requested" if role == "480p" else "run_requested"
+    if orig_status in protected_statuses or orig_status == other_run_status:
+        return False
+    if orig_status == "processing" and orig_task != expected_run_task:
+        return False
+    if not pre_has_ungenerated_changes:
+        return True
+    if created_ms > 0 and input_mod_ms > 0:
+        return bool(created_ms > input_mod_ms)
+    if created_ms > 0:
+        return not bool(pre_last_fp and pre_last_fp != pre_cur_fp)
+    if pre_pending_edit:
+        return False
+    if role == "1080p" and reopened_final:
+        return bool(old_vid and new_sha and old_sha and new_sha != old_sha)
+    return bool(
+        (old_vid is not None and new_sha and old_sha and new_sha != old_sha)
+        or (old_vid is None and not (pre_last_fp and pre_last_fp != pre_cur_fp))
+    )
+
+
+def _effective_input_modified_ms(shot: dict[str, Any]) -> int:
+    """Return latest Unix ms when generation inputs (prompt/assets/masks/feedback/rollback) changed."""
+    best = _parse_timestamp_ms(shot.get("inputModifiedAtMs"))
+    for fb in shot.get("feedbacks") or []:
+        if isinstance(fb, dict):
+            best = max(best, _parse_timestamp_ms(fb.get("createdAt")))
+            if fb.get("status") == "resolved":
+                best = max(best, _parse_timestamp_ms(fb.get("resolvedAt")))
+    for item in shot.get("versionHistory") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "") in {
+            "initial_submit",
+            "feedback_submitted",
+            "manual_prompt",
+            "manual_mask",
+            "rollback",
+            "feedback_resolved",
+            "agent_prompt",
+        }:
+            best = max(best, _parse_timestamp_ms(item.get("createdAt")))
+    return best
 
 
 def sanitize_shot_id(raw: str) -> str:
@@ -1269,6 +1371,7 @@ class QueueStore:
             has_video
             and not shot.get("lastGeneratedFingerprint")
             and not pending_edit
+            and not shot.get("finalModifiedReopened")
             and cur_status in {"draft_ready", "final_ready", "final_done"}
         ):
             shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
@@ -2175,6 +2278,7 @@ class QueueStore:
                 ),
                 "lastGeneratedFingerprint": "",
                 "lastGeneratedAt": "",
+                "inputModifiedAtMs": now_ms(),
                 "createdAt": now_iso(),
                 "updatedAt": now_iso(),
             }
@@ -2294,6 +2398,7 @@ class QueueStore:
                 )
                 shot["agentSummary"] = f"收到新修改（{summary_hint}），等待 Agent 同步修改并更新画布…"
                 shot["updatedAt"] = now_iso()
+                self._touch_input_modified(shot)
                 rev_summary = fb["comment"] or (
                     f"快捷涂白：{'、'.join(fb['tags'])}" + (f"（{fb['targetSlot']}）" if fb["targetSlot"] else "")
                     if fb["tags"]
@@ -2380,6 +2485,7 @@ class QueueStore:
                 action_label = "还原原图" if is_reset else "保存手涂涂白图"
                 self._mark_final_reopened_if_needed(shot)
                 shot["updatedAt"] = now_iso()
+                self._touch_input_modified(shot)
                 shot.setdefault("revisions", []).append(
                     {"at": now_iso(), "actor": "user", "summary": f"{action_label}：{matched_tag}"}
                 )
@@ -2531,6 +2637,7 @@ class QueueStore:
                     if new_clean != old_clean:
                         shot["previousPromptText"] = old_clean
                         shot["latestRevisionDirection"] = "用户在触发 Run 前直接更新了提示词，将同步新版提示词后生成样片。"
+                        self._touch_input_modified(shot)
                         self._append_version_snapshot(
                             shot,
                             kind="manual_prompt",
@@ -2589,6 +2696,7 @@ class QueueStore:
                 shot["status"] = "prompt_update_requested"
                 shot["agentSummary"] = f"已保存手动修改后的提示词，等待 Agent 同步更新到 {plat_label} 画布并记录…"
                 shot["updatedAt"] = now_iso()
+                self._touch_input_modified(shot)
                 rev_msg = f"手动更新提示词（{clean_note}），已通知 Agent 同步画布" if clean_note else "手动更新提示词并通知 Agent 同步画布"
                 shot.setdefault("revisions", []).append(
                     {
@@ -2647,6 +2755,7 @@ class QueueStore:
                     or clean_uuid != (shot.get("projectUuid") or "").strip()
                 ):
                     self._mark_final_reopened_if_needed(shot)
+                    self._touch_input_modified(shot)
                 shot["platform"] = eff_platform
                 shot["projectUuid"] = clean_uuid
                 shot["projectName"] = clean_name
@@ -2711,6 +2820,7 @@ class QueueStore:
                     if new_clean != old_clean:
                         shot["previousPromptText"] = old_clean
                         shot["latestRevisionDirection"] = "用户在触发重新处理·自检前更新了提示词，将一并核查并同步画布。"
+                        self._touch_input_modified(shot)
                         self._append_version_snapshot(
                             shot,
                             kind="manual_prompt",
@@ -2848,6 +2958,14 @@ class QueueStore:
                         old_dur = normalize_target_duration(shot.get("targetDuration"))
                         shot["targetDuration"] = new_dur
                         if new_dur != old_dur:
+                            self._mark_final_reopened_if_needed(shot)
+                            self._touch_input_modified(shot)
+                            if (
+                                shot.get("status") == "draft_ready"
+                                and str(shot.get("lastGeneratedFingerprint") or "").strip()
+                                and compute_generation_fingerprint(shot) != str(shot.get("lastGeneratedFingerprint") or "").strip()
+                            ):
+                                shot["status"] = "ready_on_canvas"
                             shot["updatedAt"] = now_iso()
                             shot.setdefault("revisions", []).append(
                                 {
@@ -3284,6 +3402,12 @@ class QueueStore:
         if has_final or str(shot.get("status") or "") in {"final_ready", "final_done"}:
             shot["finalModifiedReopened"] = True
             shot["draftUpdatedSinceFinalReopen"] = False
+
+    @staticmethod
+    def _touch_input_modified(shot: dict[str, Any], ts_ms: int | None = None) -> int:
+        val = max(int(shot.get("inputModifiedAtMs") or 0), int(ts_ms or now_ms()))
+        shot["inputModifiedAtMs"] = val
+        return val
 
     @staticmethod
     def _safe_prompt_update_prev_status(shot: dict[str, Any], cur_status: str) -> str:
@@ -3908,13 +4032,36 @@ class QueueStore:
                 elif shot.get("status") != "processing":
                     self._clear_error_fields(shot)
 
+                new_prompt = (shot.get("promptText") or "").strip()
+                prompt_changed = bool(new_prompt and new_prompt != prev_prompt)
+
                 if shot.get("status") != "processing":
                     self._clear_claim_fields(shot)
                     shot.pop("fastpathBypassSig", None)
                     shot["promptUpdatePrevStatus"] = ""
-                    if prev_task == "prompt_update_requested" and shot.get("status") == "draft_ready":
+                    if (
+                        updated_result_video is None
+                        and not final_video_updated
+                        and prev_task in {"prompt_update_requested", "feedback_queued", "recheck_requested", "queued"}
+                        and shot.get("status") in {"draft_ready", "final_ready", "final_done"}
+                    ):
                         last_fp = str(shot.get("lastGeneratedFingerprint") or "").strip()
-                        if last_fp and compute_generation_fingerprint(shot) != last_fp:
+                        cur_fp = compute_generation_fingerprint(shot)
+                        inputs_dirty = bool(
+                            (last_fp and cur_fp != last_fp)
+                            or (
+                                not last_fp
+                                and (
+                                    prev_task == "prompt_update_requested"
+                                    or prompt_changed
+                                    or resolved_fbs
+                                    or updated_whiteout_slots
+                                )
+                            )
+                        )
+                        if inputs_dirty:
+                            if shot.get("status") in {"final_ready", "final_done"}:
+                                self._mark_final_reopened_if_needed(shot)
                             shot["status"] = "ready_on_canvas"
                     if shot.get("status") in {"ready_on_canvas", "draft_ready", "final_ready"}:
                         shot["pendingPromptEdit"] = ""
@@ -3930,15 +4077,23 @@ class QueueStore:
 
                 produced_video = bool(
                     updated_result_video is not None
+                    or final_video_updated
                     or prev_task in {"run_requested", "final_requested"}
                     or shot.get("status") in {"final_ready", "final_done"}
                 )
                 if produced_video and shot.get("status") in {"draft_ready", "final_ready", "final_done"}:
                     shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
                     shot["lastGeneratedAt"] = now_iso()
-
-                new_prompt = (shot.get("promptText") or "").strip()
-                prompt_changed = bool(new_prompt and new_prompt != prev_prompt)
+                elif (
+                    shot.get("status") not in {"processing", "draft_ready", "final_ready", "final_done"}
+                    and (
+                        prompt_changed
+                        or resolved_fbs
+                        or updated_whiteout_slots
+                        or prev_task in {"prompt_update_requested", "feedback_queued"}
+                    )
+                ):
+                    self._touch_input_modified(shot)
                 if shot.get("status") != "processing" and (
                     updated_result_video is not None
                     or resolved_fbs
@@ -4052,6 +4207,27 @@ class QueueStore:
                 is_jimeng = shot.get("platform") == "jimeng"
                 metadata_changed = False
 
+                orig_status = str(shot.get("status") or "")
+                orig_task = str(shot.get("processingTaskType") or "")
+                pre_pending_edit = bool((shot.get("pendingPromptEdit") or "").strip())
+                pre_reopened_final = bool(shot.get("finalModifiedReopened"))
+                pre_last_fp = str(shot.get("lastGeneratedFingerprint") or "").strip()
+                pre_cur_fp = compute_generation_fingerprint(shot)
+                pre_has_ungenerated_changes = bool(
+                    pre_pending_edit
+                    or pre_reopened_final
+                    or orig_status
+                    in {
+                        "ready_on_canvas",
+                        "prompt_update_requested",
+                        "feedback_queued",
+                        "recheck_requested",
+                        "queued",
+                    }
+                    or (pre_last_fp and pre_last_fp != pre_cur_fp)
+                )
+                input_mod_ms = _effective_input_modified_ms(shot)
+
                 if project_uuid and project_uuid.strip() and project_uuid.strip() != str(shot.get("projectUuid") or "").strip():
                     shot["projectUuid"] = project_uuid.strip()
                     shot["canvasUrl"] = build_canvas_url(shot["projectUuid"], platform=shot.get("platform"))
@@ -4082,6 +4258,8 @@ class QueueStore:
                         metadata_changed = True
 
                 draft_synced_new = False
+                draft_promoted_status = False
+                draft_is_pre_edit = False
                 new_media_url = ""
                 if draft_path is not None and draft_path.is_file():
                     old_dv = copy.deepcopy(shot.get("draftVideo")) if isinstance(shot.get("draftVideo"), dict) else None
@@ -4092,8 +4270,9 @@ class QueueStore:
                         old_p = resolve_media_path(str(old_dv["filePath"]))
                         if old_p.is_file():
                             old_dv_sha = _file_sha256_hex(old_p)
+                    same_dv_sha = bool(old_dv and old_dv_sha and new_dv_sha and old_dv_sha == new_dv_sha)
                     url_changed = bool(remote_draft_url and remote_draft_url != str((old_dv or {}).get("remoteUrl") or ""))
-                    draft_synced_new = bool((not old_dv) or (new_dv_sha and new_dv_sha != old_dv_sha) or url_changed)
+                    draft_synced_new = bool((not old_dv) or (new_dv_sha and new_dv_sha != old_dv_sha) or (not same_dv_sha and url_changed))
 
                     if is_jimeng and isinstance(jm, dict) and resource_id:
                         if jm.get("downloadedResourceId") != resource_id or jm.get("selectedResourceId") != resource_id:
@@ -4102,55 +4281,90 @@ class QueueStore:
                             metadata_changed = True
 
                     if draft_synced_new:
+                        draft_matches_inputs = _sync_video_matches_current_inputs(
+                            role="480p",
+                            orig_status=orig_status,
+                            orig_task=orig_task,
+                            pre_has_ungenerated_changes=pre_has_ungenerated_changes,
+                            pre_pending_edit=pre_pending_edit,
+                            pre_last_fp=pre_last_fp,
+                            pre_cur_fp=pre_cur_fp,
+                            input_mod_ms=input_mod_ms,
+                            created_ms=draft_created_ms,
+                            old_vid=old_dv,
+                            old_sha=old_dv_sha,
+                            new_sha=new_dv_sha,
+                            reopened_final=pre_reopened_final,
+                        )
                         new_dv_obj = {
                             "filePath": str(draft_path),
                             "mediaUrl": new_media_url,
                             "remoteUrl": remote_draft_url,
                             "watermark": watermark,
                             "resourceId": resource_id,
+                            "createdAtMs": draft_created_ms or None,
                             "sha256": new_dv_sha,
                             "meta": run_preflight(draft_path),
                             "downloadedAt": now_iso(),
                         }
+                        if new_dv_obj["createdAtMs"] is None:
+                            new_dv_obj.pop("createdAtMs", None)
                         self._record_video_history_locked(
                             shot,
                             role="480p",
                             prev_video=old_dv,
                             new_video=new_dv_obj,
-                            revision_direction=f"从 {plat_label} 同步 480P 样片",
+                            revision_direction=(
+                                f"从 {plat_label} 同步 480P 样片"
+                                if draft_matches_inputs
+                                else f"从 {plat_label} 补充同步既有 480P 样片（早于当前改词）"
+                            ),
                         )
                         shot["draftVideo"] = new_dv_obj
                         has_final_on_canvas = bool(final_path is not None and final_path.is_file())
                         draft_newer_than_final = bool(draft_created_ms and final_created_ms and draft_created_ms > final_created_ms)
                         keep_passed_final = bool(
-                            shot.get("status") in {"final_ready", "final_done"}
-                            and not shot.get("finalModifiedReopened")
+                            orig_status in {"final_ready", "final_done"}
+                            and not pre_reopened_final
                             and has_final_on_canvas
                             and not draft_newer_than_final
                         )
-                        if not keep_passed_final and shot["status"] in {
-                            "ready_on_canvas",
-                            "run_requested",
-                            "processing",
-                            "queued",
-                            "feedback_queued",
-                            "final_ready",
-                            "final_done",
-                        }:
-                            self._clear_claim_fields(shot)
-                            shot["status"] = "draft_ready"
-                            shot["agentSummary"] = f"已从 {plat_label} 同步最新 480P 样片到本地，可在右侧预览看片或对比原片。"
-                        if not keep_passed_final and ((shot.get("finalVideo") or {}).get("mediaUrl") or shot.get("finalModifiedReopened")):
-                            shot["finalModifiedReopened"] = True
-                            shot["draftUpdatedSinceFinalReopen"] = True
-                        if not keep_passed_final:
-                            shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
-                            shot["lastGeneratedAt"] = now_iso()
-                        shot.setdefault("revisions", []).append(
-                            {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布拉取更新 480P 样片完成"}
-                        )
+                        if not draft_matches_inputs:
+                            draft_is_pre_edit = True
+                            shot.setdefault("revisions", []).append(
+                                {
+                                    "at": now_iso(),
+                                    "actor": "sync",
+                                    "summary": f"已补充同步 {plat_label} 既有 480P 样片（生成于当前改动之前，状态仍保留待重新生成）",
+                                }
+                            )
+                        else:
+                            if not keep_passed_final and shot["status"] in {
+                                "ready_on_canvas",
+                                "run_requested",
+                                "processing",
+                                "draft_ready",
+                                "final_ready",
+                                "final_done",
+                            }:
+                                self._clear_claim_fields(shot)
+                                shot["status"] = "draft_ready"
+                                shot["agentSummary"] = f"已从 {plat_label} 同步最新 480P 样片到本地，可在右侧预览看片或对比原片。"
+                                draft_promoted_status = True
+                            if not keep_passed_final and ((shot.get("finalVideo") or {}).get("mediaUrl") or shot.get("finalModifiedReopened")):
+                                shot["finalModifiedReopened"] = True
+                                shot["draftUpdatedSinceFinalReopen"] = True
+                            if not keep_passed_final:
+                                shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
+                                shot["lastGeneratedAt"] = now_iso()
+                            shot.setdefault("revisions", []).append(
+                                {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布拉取更新 480P 样片完成"}
+                            )
                     elif isinstance(shot.get("draftVideo"), dict):
                         cur_dv = shot["draftVideo"]
+                        if remote_draft_url and cur_dv.get("remoteUrl") != remote_draft_url:
+                            cur_dv["remoteUrl"] = remote_draft_url
+                            metadata_changed = True
                         if resource_id and cur_dv.get("resourceId") != resource_id:
                             cur_dv["resourceId"] = resource_id
                             metadata_changed = True
@@ -4159,6 +4373,8 @@ class QueueStore:
                             metadata_changed = True
 
                 final_synced_new = False
+                final_promoted_status = False
+                final_is_pre_edit = False
                 if final_path is not None and final_path.is_file():
                     old_fv = shot.get("finalVideo") if isinstance(shot.get("finalVideo"), dict) else {}
                     old_fv_sig = str(old_fv.get("sourceSig") or _file_stat_sig(old_fv.get("filePath")))
@@ -4171,7 +4387,23 @@ class QueueStore:
                             old_fv_sha = _file_sha256_hex(old_fp)
                     url_changed = bool(remote_final_url and remote_final_url != old_fv.get("remoteUrl"))
                     same_sha = bool(old_fv and old_fv_sha and new_fv_sha and old_fv_sha == new_fv_sha)
-                    final_synced_new = bool((not old_fv) or (not same_sha and new_fv_sig != old_fv_sig) or (new_fv_sha and old_fv_sha and new_fv_sha != old_fv_sha) or url_changed)
+                    final_synced_new = bool((not old_fv) or (new_fv_sha and new_fv_sha != old_fv_sha) or (not same_sha and new_fv_sig != old_fv_sig) or (not same_sha and url_changed))
+
+                    final_matches_inputs = _sync_video_matches_current_inputs(
+                        role="1080p",
+                        orig_status=orig_status,
+                        orig_task=orig_task,
+                        pre_has_ungenerated_changes=pre_has_ungenerated_changes,
+                        pre_pending_edit=pre_pending_edit,
+                        pre_last_fp=pre_last_fp,
+                        pre_cur_fp=pre_cur_fp,
+                        input_mod_ms=input_mod_ms,
+                        created_ms=final_created_ms,
+                        old_vid=old_fv if old_fv else None,
+                        old_sha=old_fv_sha,
+                        new_sha=new_fv_sha,
+                        reopened_final=pre_reopened_final,
+                    )
 
                     if is_jimeng and isinstance(jm, dict) and final_resource_id:
                         if jm.get("downloadedFinalResourceId") != final_resource_id or jm.get("finalResourceId") != final_resource_id:
@@ -4187,45 +4419,65 @@ class QueueStore:
                             "remoteUrl": remote_final_url,
                             "watermark": final_watermark,
                             "resourceId": final_resource_id,
+                            "createdAtMs": final_created_ms or None,
                             "sha256": new_fv_sha,
                             "meta": run_preflight(final_path),
                             "downloadedAt": now_iso(),
                             "sourceSig": new_fv_sig,
                         }
+                        if new_fv_obj["createdAtMs"] is None:
+                            new_fv_obj.pop("createdAtMs", None)
                         self._record_video_history_locked(
                             shot,
                             role="1080p",
                             prev_video=prev_fv_copy,
                             new_video=new_fv_obj,
-                            revision_direction=f"从 {plat_label} 同步 1080P 正片",
+                            revision_direction=(
+                                f"从 {plat_label} 同步 1080P 正片"
+                                if final_matches_inputs
+                                else f"从 {plat_label} 补充同步既有 1080P 正片（早于当前改动）"
+                            ),
                         )
                         shot["finalVideo"] = new_fv_obj
-                        shot["finalModifiedReopened"] = False
-                        shot["draftUpdatedSinceFinalReopen"] = False
-                        if shot["status"] != "processing":
+                        if final_matches_inputs:
+                            shot["finalModifiedReopened"] = False
+                            shot["draftUpdatedSinceFinalReopen"] = False
                             self._clear_claim_fields(shot)
                             shot["status"] = "final_ready"
                             shot["agentSummary"] = f"已从 {plat_label} 画布同步最新 1080P 正片并归档。"
-                        shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
-                        shot["lastGeneratedAt"] = now_iso()
-                        shot.setdefault("revisions", []).append(
-                            {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布同步更新 1080P 正片"}
-                        )
-                        if q.get("autoSyncExport", True):
-                            try:
-                                sync_res = self._sync_shot_export_locked(q, shot, role="1080p")
-                                if sync_res.get("synced") and not sync_res.get("unchanged"):
-                                    shot.setdefault("revisions", []).append(
-                                        {
-                                            "at": now_iso(),
-                                            "actor": "system",
-                                            "summary": f"同步画布 1080P 后已自动更新本地目录：{sync_res['filePath']}",
-                                        }
-                                    )
-                            except (OSError, ValueError):
-                                pass
+                            final_promoted_status = True
+                            shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
+                            shot["lastGeneratedAt"] = now_iso()
+                            shot.setdefault("revisions", []).append(
+                                {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布同步更新 1080P 正片"}
+                            )
+                            if q.get("autoSyncExport", True):
+                                try:
+                                    sync_res = self._sync_shot_export_locked(q, shot, role="1080p")
+                                    if sync_res.get("synced") and not sync_res.get("unchanged"):
+                                        shot.setdefault("revisions", []).append(
+                                            {
+                                                "at": now_iso(),
+                                                "actor": "system",
+                                                "summary": f"同步画布 1080P 后已自动更新本地目录：{sync_res['filePath']}",
+                                            }
+                                        )
+                                except (OSError, ValueError):
+                                    pass
+                        else:
+                            final_is_pre_edit = True
+                            shot.setdefault("revisions", []).append(
+                                {
+                                    "at": now_iso(),
+                                    "actor": "sync",
+                                    "summary": f"已补充同步 {plat_label} 既有 1080P 正片（生成于当前改动之前，状态仍保留待重新生成）",
+                                }
+                            )
                     else:
                         if isinstance(old_fv, dict):
+                            if remote_final_url and old_fv.get("remoteUrl") != remote_final_url:
+                                old_fv["remoteUrl"] = remote_final_url
+                                metadata_changed = True
                             if final_resource_id and old_fv.get("resourceId") != final_resource_id:
                                 old_fv["resourceId"] = final_resource_id
                                 metadata_changed = True
@@ -4235,14 +4487,19 @@ class QueueStore:
                             if old_fv.get("sourceSig") != new_fv_sig:
                                 old_fv["sourceSig"] = new_fv_sig
                                 metadata_changed = True
-                        if shot.get("status") in {"ready_on_canvas", "draft_ready"} and not shot.get("finalModifiedReopened"):
+                        if (
+                            shot.get("status") == "draft_ready"
+                            and not shot.get("finalModifiedReopened")
+                            and not pre_has_ungenerated_changes
+                            and final_matches_inputs
+                        ):
                             self._clear_claim_fields(shot)
                             shot["status"] = "final_ready"
                             metadata_changed = True
 
                 cur_prompt = (shot.get("promptText") or "").strip()
                 last_snap = (shot.get("versionHistory") or [{}])[-1]
-                if final_synced_new:
+                if final_synced_new and final_promoted_status:
                     fv_now = shot.get("finalVideo") or {}
                     self._append_version_snapshot(
                         shot,
@@ -4254,7 +4511,7 @@ class QueueStore:
                         draft_video_url=str(fv_now.get("mediaUrl") or ""),
                         draft_downloaded_at=str(fv_now.get("downloadedAt") or now_iso()),
                     )
-                elif draft_synced_new and new_media_url:
+                elif draft_synced_new and draft_promoted_status and new_media_url:
                     self._append_version_snapshot(
                         shot,
                         kind="run_completed",
@@ -4285,6 +4542,8 @@ class QueueStore:
                     "changed": any_change,
                     "draftUpdated": draft_synced_new,
                     "finalUpdated": final_synced_new,
+                    "draftIsPreEdit": draft_is_pre_edit,
+                    "finalIsPreEdit": final_is_pre_edit,
                     "metadataUpdated": metadata_changed,
                 }
                 return out
@@ -4342,6 +4601,7 @@ class QueueStore:
                     evt_type = "shot_rolled_back"
 
                 shot["updatedAt"] = now_iso()
+                self._touch_input_modified(shot)
                 shot.setdefault("revisions", []).append(
                     {"at": now_iso(), "actor": "user", "summary": f"版本回滚至 {target_ver}（{target_title}）"}
                 )

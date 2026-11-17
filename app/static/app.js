@@ -6083,17 +6083,27 @@ function bindDetailEvents(shot) {
       const platLabel = getPlatformLabel(shot.platform);
       const res = await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/sync-canvas`, { method: "POST" });
       if (res.syncDelta?.finalUpdated || res.libtv?.hasRemoteFinal) {
-        showToast(
-          res.syncDelta?.finalUpdated
-            ? `已从 ${platLabel} 拉取更新最新 1080P 正片并同步状态`
-            : `已核对 ${platLabel} 最新 1080P 正片与节点状态`
-        );
+        if (res.syncDelta?.finalIsPreEdit) {
+          showToast(`已补充同步 ${platLabel} 画布既有 1080P 正片（早于最新改动，仍待重新生成）`);
+        } else {
+          showToast(
+            res.syncDelta?.finalUpdated
+              ? `已从 ${platLabel} 拉取更新最新 1080P 正片并同步状态`
+              : `已核对 ${platLabel} 最新 1080P 正片与节点状态`
+          );
+        }
       } else if (res.syncDelta?.draftUpdated || res.libtv?.hasRemoteDraft) {
-        showToast(
-          res.syncDelta?.draftUpdated
-            ? `已从 ${platLabel} 拉取更新最新 480P 样片到本地`
-            : `已核对 ${platLabel} 样片与节点状态（当前已是最新）`
-        );
+        if (res.syncDelta?.draftIsPreEdit) {
+          showToast(`已补充同步 ${platLabel} 画布既有 480P 样片（早于当前改词，仍待重新生成）`);
+        } else if (!res.syncDelta?.draftUpdated && shot.status === "ready_on_canvas") {
+          showToast(`已核对 ${platLabel} 画布：当前仍保持改词后的「待重新生成」状态`);
+        } else {
+          showToast(
+            res.syncDelta?.draftUpdated
+              ? `已从 ${platLabel} 拉取更新最新 480P 样片到本地`
+              : `已核对 ${platLabel} 样片与节点状态（当前已是最新）`
+          );
+        }
       } else if (res.libtv?.loading) {
         showToast(`${platLabel} 云端仍在生成中，请稍后再拉取`);
       } else {
@@ -7175,6 +7185,7 @@ function bindGlobalEvents() {
       const parts = [];
       if (res.draftUpdatedIds?.length) parts.push(`更新样片 ${res.draftUpdatedIds.length} 个（${res.draftUpdatedIds.join(", ")}）`);
       if (res.finalUpdatedIds?.length) parts.push(`更新正片 ${res.finalUpdatedIds.length} 个（${res.finalUpdatedIds.join(", ")}）`);
+      if (res.preEditSyncedIds?.length) parts.push(`补充既有旧片 ${res.preEditSyncedIds.length} 个（${res.preEditSyncedIds.join(", ")}，仍保持待重生成）`);
       if (res.relinkedIds?.length) parts.push(`对齐节点 ${res.relinkedIds.length} 个`);
       const detailMsg = parts.length ? parts.join(" · ") : `全部 ${res.checkedCount || 0} 个镜头已与画布一致`;
       const errSuffix = res.errors?.length ? `（${res.errors.length} 个失败）` : "";

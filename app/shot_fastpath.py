@@ -43,6 +43,7 @@ import jimeng_bridge
 from store import (
     DATA_ROOT,
     SHOTS_DIR,
+    compute_generation_fingerprint,
     get_platform_label,
     replace_shot_video_with_archive,
     resolve_cli_conversation_id,
@@ -1084,9 +1085,16 @@ def try_fastpath_prompt_update(
         _sync_prompt_markdown(md_path, sid, prompt_text, get_platform_label(platform))
 
         prev_status = str(shot.get("promptUpdatePrevStatus") or "").strip()
-        target_status = safe_prompt_update_prev_status(shot, prev_status)
-        if target_status not in {"ready_on_canvas", "draft_ready"}:
-            target_status = "draft_ready" if (shot.get("draftVideo") or {}).get("mediaUrl") else "ready_on_canvas"
+        probe_shot = dict(shot)
+        probe_shot["promptText"] = prompt_text
+        cur_fp = compute_generation_fingerprint(probe_shot)
+        last_fp = str(shot.get("lastGeneratedFingerprint") or "").strip()
+        if not last_fp or cur_fp != last_fp:
+            target_status = "ready_on_canvas"
+        else:
+            target_status = safe_prompt_update_prev_status(shot, prev_status)
+            if target_status not in {"ready_on_canvas", "draft_ready"}:
+                target_status = "draft_ready" if (shot.get("draftVideo") or {}).get("mediaUrl") else "ready_on_canvas"
 
         meta_patch: dict[str, Any] = {"confirmationState": "quoted"}
         if draft_ver is not None:

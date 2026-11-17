@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.5",
+  "version": "2026.11.17.6",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T12:02:39+08:00",
-  "changelog": "修复即梦多资源排序、旧节点绑定覆盖、1080P 自动发现与防状态误回退等画布同步 bug；新增侧栏批量「↻ 同步」与看片区「↻ 刷新同步」按钮",
+  "publishedAt": "2026-11-17T12:29:17+08:00",
+  "changelog": "修复改词/返工/涂白/回滚后未重新生成时点击刷新同步导致状态与指纹被旧视频误覆盖的 bug（按资源 createdAt 与 inputModifiedAtMs 对齐、保护待处理/待重生成状态、避免同内容 CDN URL 轮换与旧 1080P 误覆盖）",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

@@ -2123,6 +2123,7 @@ def sync_all_shots_canvas() -> dict[str, Any]:
     updated_ids: list[str] = []
     draft_updated_ids: list[str] = []
     final_updated_ids: list[str] = []
+    pre_edit_synced_ids: list[str] = []
     relinked_ids: list[str] = []
     skipped_ids: list[str] = []
     errors: list[dict[str, str]] = []
@@ -2140,9 +2141,11 @@ def sync_all_shots_canvas() -> dict[str, Any]:
             delta = updated.pop("_syncDelta", {}) if isinstance(updated, dict) else {}
             if delta.get("changed"):
                 updated_ids.append(sid)
-            if delta.get("draftUpdated"):
+            if delta.get("draftIsPreEdit") or delta.get("finalIsPreEdit"):
+                pre_edit_synced_ids.append(sid)
+            if delta.get("draftUpdated") and not delta.get("draftIsPreEdit"):
                 draft_updated_ids.append(sid)
-            if delta.get("finalUpdated"):
+            if delta.get("finalUpdated") and not delta.get("finalIsPreEdit"):
                 final_updated_ids.append(sid)
             if delta.get("metadataUpdated") and not delta.get("draftUpdated") and not delta.get("finalUpdated"):
                 relinked_ids.append(sid)
@@ -2160,6 +2163,7 @@ def sync_all_shots_canvas() -> dict[str, Any]:
         "updatedShotIds": updated_ids,
         "draftUpdatedIds": draft_updated_ids,
         "finalUpdatedIds": final_updated_ids,
+        "preEditSyncedIds": pre_edit_synced_ids,
         "relinkedIds": relinked_ids,
         "skippedIds": skipped_ids,
         "errors": errors,
