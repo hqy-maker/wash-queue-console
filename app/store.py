@@ -146,6 +146,16 @@ def normalize_target_duration(raw: Any) -> int | None:
     return max(4, min(30, val))
 
 
+def _format_duration_label(shot: dict[str, Any], dur: int | None) -> str:
+    clean = normalize_target_duration(dur)
+    if clean is not None:
+        return f"{clean}s"
+    if normalize_work_mode(shot.get("workMode")) == "video_creation":
+        return "自动(5s)"
+    sug = normalize_target_duration(((shot.get("sourceVideo") or {}).get("meta") or {}).get("suggestedDuration"))
+    return f"自动(原片{sug}s)" if sug else "自动(原片对齐)"
+
+
 def get_platform_label(platform: str | None) -> str:
     return "即梦官网" if normalize_platform(platform) == "jimeng" else "LibTV"
 
@@ -958,7 +968,7 @@ def compute_generation_fingerprint(shot: dict[str, Any]) -> str:
     }
     if plat != DEFAULT_PLATFORM:
         payload["platform"] = plat
-    target_dur = normalize_target_duration(shot.get("targetDuration")) if normalize_work_mode(shot.get("workMode")) == "video_creation" else None
+    target_dur = normalize_target_duration(shot.get("targetDuration"))
     if target_dur is not None:
         payload["targetDuration"] = target_dur
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -973,7 +983,7 @@ def _decorate_shot_payload(
     out = copy.deepcopy(shot)
     out["title"] = str(out.get("title") or "").strip()
     out["workMode"] = normalize_work_mode(out.get("workMode"))
-    out["targetDuration"] = normalize_target_duration(out.get("targetDuration")) if out["workMode"] == "video_creation" else None
+    out["targetDuration"] = normalize_target_duration(out.get("targetDuration"))
     plat = normalize_platform(out.get("platform"))
     out["platform"] = plat
     out["platformLabel"] = get_platform_label(plat)
@@ -2227,7 +2237,7 @@ class QueueStore:
             elif not source_video_obj and not comp_obj and not char_refs:
                 raise ValueError("洗视频模式请至少拖入原片视频或参考图片")
 
-            clean_dur = normalize_target_duration(target_duration) if clean_work_mode == "video_creation" else None
+            clean_dur = normalize_target_duration(target_duration)
             clean_whiteout_parts = [str(p).strip() for p in (whiteout_parts or []) if str(p).strip()]
             clean_whiteout_target = whiteout_target.strip()
             mode_tag = "正常生成" if clean_work_mode == "video_creation" else "洗视频"
@@ -2356,6 +2366,19 @@ class QueueStore:
                     return self._decorate_shot(q, shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
+    @staticmethod
+    def _apply_target_duration_locked(
+        shot: dict[str, Any],
+        target_duration: Any,
+    ) -> tuple[bool, int | None, int | None, str]:
+        old_dur = normalize_target_duration(shot.get("targetDuration"))
+        new_dur = normalize_target_duration(target_duration)
+        shot["targetDuration"] = new_dur
+        if new_dur == old_dur:
+            return False, old_dur, new_dur, ""
+        note = f"生成时长调整：{_format_duration_label(shot, old_dur)} → {_format_duration_label(shot, new_dur)}"
+        return True, old_dur, new_dur, note
+
     def submit_feedback(
         self,
         shot_id: str,
@@ -2364,13 +2387,30 @@ class QueueStore:
         target_slot: str,
         attachments: list[tuple[str, bytes]],
         edited_prompt: str = "",
+        target_duration: Any = None,
+        update_target_duration: bool = False,
     ) -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
+        clean_comment = comment.strip()
+        clean_tags = [t.strip() for t in tags if str(t or "").strip()]
+        edited_clean = edited_prompt.strip()
         with self._lock:
             q = self._load_queue()
             for shot in q["shots"]:
                 if shot["id"] != sid:
                     continue
+                if update_target_duration:
+                    dur_changed, old_dur, new_dur, dur_note = self._apply_target_duration_locked(
+                        shot, target_duration
+                    )
+                else:
+                    old_dur = normalize_target_duration(shot.get("targetDuration"))
+                    new_dur = old_dur
+                    dur_changed, dur_note = False, ""
+
+                if not clean_comment and not clean_tags and not attachments and not edited_clean and not dur_changed:
+                    raise ValueError("请至少修改提示词、调整时长、填写修改意见、勾选标签或附带图片")
+
                 fb_id = f"fb_{uuid.uuid4().hex[:8]}"
                 fb_dir = SHOTS_DIR / sid / "feedback_assets" / fb_id
                 saved_files: list[dict[str, Any]] = []
@@ -2388,19 +2428,23 @@ class QueueStore:
                             }
                         )
 
-                fb = {
+                fb: dict[str, Any] = {
                     "id": fb_id,
-                    "comment": comment.strip(),
-                    "tags": [t for t in tags if t.strip()],
+                    "comment": clean_comment or dur_note,
+                    "tags": clean_tags,
                     "targetSlot": target_slot.strip(),
-                    "editedPrompt": edited_prompt.strip(),
+                    "editedPrompt": edited_clean,
                     "attachments": saved_files,
                     "status": "pending",
                     "createdAt": now_iso(),
                     "resolvedAt": "",
                 }
+                if dur_changed:
+                    fb["targetDuration"] = new_dur
+                    fb["previousTargetDuration"] = old_dur
+                    fb["targetDurationChanged"] = True
+
                 prev_prompt = (shot.get("promptText") or "").strip()
-                edited_clean = edited_prompt.strip()
                 shot.setdefault("feedbacks", []).append(fb)
                 if fb["tags"]:
                     shot["whiteoutOptions"] = {
@@ -2417,17 +2461,21 @@ class QueueStore:
                 self._clear_error_fields(shot)
                 shot["status"] = "feedback_queued"
                 summary_hint = (
-                    fb["comment"][:40]
+                    (f"{clean_comment} · {dur_note}" if clean_comment and dur_note else fb["comment"])[:48]
                     or ("涂白：" + "、".join(fb["tags"]) if fb["tags"] else "")
                     or ("含修改后提示词" if edited_clean else "含附件修改")
                 )
                 shot["agentSummary"] = f"收到新修改（{summary_hint}），等待 Agent 同步修改并更新画布…"
                 shot["updatedAt"] = now_iso()
                 self._touch_input_modified(shot)
-                rev_summary = fb["comment"] or (
+                rev_base = clean_comment or (
                     f"快捷涂白：{'、'.join(fb['tags'])}" + (f"（{fb['targetSlot']}）" if fb["targetSlot"] else "")
                     if fb["tags"]
-                    else ("直接编辑并提交了新版提示词" if edited_clean else "附带新素材")
+                    else (dur_note if dur_changed else ("直接编辑并提交了新版提示词" if edited_clean else "附带新素材"))
+                )
+                rev_summary = f"{rev_base}（{dur_note}）" if (dur_changed and clean_comment) else rev_base
+                snapshot_feedback = (
+                    f"{clean_comment}\n[{dur_note}]" if (clean_comment and dur_note) else (clean_comment or dur_note)
                 )
                 shot.setdefault("revisions", []).append(
                     {
@@ -2443,7 +2491,7 @@ class QueueStore:
                     title=f"提交修改意见（{rev_summary[:24]}）",
                     prompt_text=edited_clean or (shot.get("promptText") or ""),
                     previous_prompt_text=prev_prompt if (edited_clean and edited_clean != prev_prompt) else "",
-                    user_feedback=comment.strip(),
+                    user_feedback=snapshot_feedback,
                     feedback_tags=fb["tags"],
                     target_slot=fb["targetSlot"],
                     attachments=saved_files,
@@ -2647,13 +2695,29 @@ class QueueStore:
                 return _decorate_shot_payload(shot)
         raise KeyError(f"镜头不存在: {shot_id}")
 
-    def request_run(self, shot_id: str, edited_prompt: str | None = None) -> dict[str, Any]:
+    def request_run(
+        self,
+        shot_id: str,
+        edited_prompt: str | None = None,
+        *,
+        target_duration: Any = None,
+        update_target_duration: bool = False,
+    ) -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
         with self._lock:
             q = self._load_queue()
             for shot in q["shots"]:
                 if shot["id"] != sid:
                     continue
+                if update_target_duration:
+                    dur_changed, _old_d, _new_d, dur_note = self._apply_target_duration_locked(
+                        shot, target_duration
+                    )
+                    if dur_changed:
+                        self._touch_input_modified(shot)
+                        shot.setdefault("revisions", []).append(
+                            {"at": now_iso(), "actor": "user", "summary": f"触发生成前{dur_note}"}
+                        )
                 if edited_prompt is not None and edited_prompt.strip():
                     new_clean = edited_prompt.strip()
                     old_clean = (shot.get("promptText") or "").strip()
@@ -2974,31 +3038,22 @@ class QueueStore:
                         }
                     )
                 if update_target_duration:
-                    new_dur = normalize_target_duration(target_duration)
-                    if normalize_work_mode(shot.get("workMode")) != "video_creation":
-                        if new_dur is not None:
-                            raise ValueError("洗视频模式自动按原视频长度对齐，不支持单独修改生成时长")
-                        shot["targetDuration"] = None
-                    else:
-                        old_dur = normalize_target_duration(shot.get("targetDuration"))
-                        shot["targetDuration"] = new_dur
-                        if new_dur != old_dur:
-                            self._mark_final_reopened_if_needed(shot)
-                            self._touch_input_modified(shot)
-                            if (
-                                shot.get("status") == "draft_ready"
-                                and str(shot.get("lastGeneratedFingerprint") or "").strip()
-                                and compute_generation_fingerprint(shot) != str(shot.get("lastGeneratedFingerprint") or "").strip()
-                            ):
-                                shot["status"] = "ready_on_canvas"
-                            shot["updatedAt"] = now_iso()
-                            shot.setdefault("revisions", []).append(
-                                {
-                                    "at": now_iso(),
-                                    "actor": "user",
-                                    "summary": f"生成时长调整：{f'{old_dur}s' if old_dur else '自动'} → {f'{new_dur}s' if new_dur else '自动'}",
-                                }
-                            )
+                    dur_changed, _old_d, _new_d, dur_note = self._apply_target_duration_locked(
+                        shot, target_duration
+                    )
+                    if dur_changed:
+                        self._mark_final_reopened_if_needed(shot)
+                        self._touch_input_modified(shot)
+                        if (
+                            shot.get("status") == "draft_ready"
+                            and str(shot.get("lastGeneratedFingerprint") or "").strip()
+                            and compute_generation_fingerprint(shot) != str(shot.get("lastGeneratedFingerprint") or "").strip()
+                        ):
+                            shot["status"] = "ready_on_canvas"
+                        shot["updatedAt"] = now_iso()
+                        shot.setdefault("revisions", []).append(
+                            {"at": now_iso(), "actor": "user", "summary": dur_note}
+                        )
 
                 synced_results: list[dict[str, Any]] = []
                 if sync_local:

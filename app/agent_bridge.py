@@ -341,6 +341,8 @@ def _build_worker_prompt(
             if is_jimeng
             else TASK_SECTION_HINTS.get(task_type)
         ) or "请按 wash-queue-console 协议完整处理当前任务。"
+        if not is_creation and task_type == "feedback_queued" and shot.get("targetDuration"):
+            section_hint += f"（用户明确指定目标生成时长为 {int(shot['targetDuration'])}s：请同步调整提示词节奏并在节点中传入 `--duration {int(shot['targetDuration'])}`）"
 
     all_fbs = shot.get("feedbacks") or []
     pending_fbs = [f for f in all_fbs if isinstance(f, dict) and f.get("status") == "pending"]
@@ -492,7 +494,7 @@ def _build_worker_prompt(
         refs_cli_hint = " ".join(ordered_refs) if ordered_refs else ""
         pid = str(shot.get("projectUuid") or "")
 
-        raw_target_dur = shot.get("targetDuration") if is_creation else None
+        raw_target_dur = shot.get("targetDuration")
         explicit_dur = int(round(float(raw_target_dur))) if raw_target_dur else 0
         if explicit_dur > 0:
             explicit_dur = max(4, min(30, explicit_dur))
@@ -608,7 +610,7 @@ def _build_worker_prompt(
             f"请先阅读 `{wash_skill_md}` 及本任务涉及的配套 Skill{skill_list}，然后端到端处理下方这一个已被你原子签收（claimed）的镜头：\n\n"
         )
 
-    hdr_dur = shot.get("targetDuration") if is_creation else None
+    hdr_dur = shot.get("targetDuration")
     hdr_dur_label = (
         f"{int(hdr_dur)}s（用户明确指定，须严格传 --duration {int(hdr_dur)}）"
         if hdr_dur

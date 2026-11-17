@@ -1110,6 +1110,7 @@ class ReprocessReq(BaseModel):
 
 class RunShotReq(BaseModel):
     edited_prompt: str | None = None
+    targetDuration: int | str | None = None
 
 
 class MarkPassedReq(BaseModel):
@@ -1845,6 +1846,8 @@ async def submit_feedback(
     tags_json: str = Form(default="[]"),
     target_slot: str = Form(default=""),
     edited_prompt: str = Form(default=""),
+    target_duration: str = Form(default=""),
+    update_target_duration: str = Form(default=""),
     attachments: list[UploadFile] = File(default=[]),
 ) -> dict[str, Any]:
     try:
@@ -1858,14 +1861,26 @@ async def submit_feedback(
         if data:
             saved_attachments.append((up.filename or "attachment.png", data))
 
-    if not comment.strip() and not tags and not saved_attachments and not edited_prompt.strip():
-        raise HTTPException(status_code=400, detail="请至少修改提示词、填写修改意见、勾选标签或附带图片")
+    upd_dur = update_target_duration.strip().lower() in {"1", "true", "yes", "on"}
+    if not comment.strip() and not tags and not saved_attachments and not edited_prompt.strip() and not upd_dur:
+        raise HTTPException(status_code=400, detail="请至少修改提示词、调整时长、填写修改意见、勾选标签或附带图片")
 
     try:
-        shot = store.submit_feedback(shot_id, comment, tags, target_slot, saved_attachments, edited_prompt)
+        shot = store.submit_feedback(
+            shot_id,
+            comment,
+            tags,
+            target_slot,
+            saved_attachments,
+            edited_prompt,
+            target_duration=target_duration.strip(),
+            update_target_duration=upd_dur,
+        )
         return {"ok": True, "shot": shot}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/shots/{shot_id}/mask-image")
@@ -1920,7 +1935,12 @@ async def resolve_confirmation(
 def run_shot(shot_id: str, req: RunShotReq | None = None) -> dict[str, Any]:
     body = req or RunShotReq()
     try:
-        shot = store.request_run(shot_id, edited_prompt=body.edited_prompt)
+        shot = store.request_run(
+            shot_id,
+            edited_prompt=body.edited_prompt,
+            target_duration=body.targetDuration,
+            update_target_duration=("targetDuration" in body.model_fields_set),
+        )
         return {"ok": True, "shot": shot}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
