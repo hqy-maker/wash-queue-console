@@ -305,10 +305,10 @@ class AgentPresenceTracker:
 
         if is_processing:
             if claimed_by == "desktop_coordinator" or (ai_mode == "desktop_subagent" and claimed_by != "agy_bridge" and not worker):
-                if not desktop_online and elapsed_sec >= 45:
+                if not desktop_online and elapsed_sec >= 300:
                     health = "stalled"
-                    health_label = "🟡 桌面协同监听已离线"
-                    diagnosis = f"该镜头已由桌面一镜一对话接管（{elapsed_sec} 秒），但桌面监听脚本当前离线；可点击「↻ 刷新重试」恢复或等待桌面子对话回写。"
+                    health_label = "🟡 桌面协同监听已离线（耗时较长）"
+                    diagnosis = f"该镜头已由桌面一镜一对话接管（{elapsed_sec} 秒），但桌面监听脚本已超过 {elapsed_sec} 秒未上报；如已中断可点击「↻ 刷新重试」。"
                     suggested_action = "retry"
                 elif elapsed_sec >= 600:
                     health = "slow"
@@ -407,6 +407,7 @@ class AgentPresenceTracker:
             "resumed": bool(worker.get("resumed")),
             "conversationId": str(worker.get("conversationId") or desktop_conv_id or shot.get("cliConversationId") or ""),
             "desktopConversationId": desktop_conv_id,
+            "desktopOnline": desktop_online,
             "aiDispatchMode": ai_mode,
             "agyPid": agy_pid,
             "agyPidAlive": agy_pid_alive,
@@ -426,8 +427,11 @@ class AgentPresenceTracker:
         wall_now = time.time()
         live_pid = _read_bridge_pid()
         paused = self.is_paused()
+        counts_fallback = store.get_runtime_counts() if state_data is None else None
         ai_mode = normalize_ai_dispatch_mode(
-            (state_data or {}).get("aiDispatchMode") if state_data is not None else store.get_ai_dispatch_mode()
+            (state_data or {}).get("aiDispatchMode")
+            if state_data is not None
+            else (counts_fallback or {}).get("aiDispatchMode")
         )
         with self._lock:
             self._prune_locked(now)
@@ -458,6 +462,13 @@ class AgentPresenceTracker:
             else:
                 processing_ids = list(state_data.get("processingShotIds") or [])
                 pending_count = int(state_data.get("pendingCount", 0))
+                ai_pending_count = int(state_data.get("aiPendingCount", 0))
+                fastpath_pending_count = int(state_data.get("fastpathPendingCount", 0))
+        elif counts_fallback:
+            processing_ids = list(counts_fallback.get("processingShotIds") or [])
+            pending_count = int(counts_fallback.get("pendingCount", 0))
+            ai_pending_count = int(counts_fallback.get("aiPendingCount", 0))
+            fastpath_pending_count = int(counts_fallback.get("fastpathPendingCount", 0))
 
         bridge_active_ids = bridge_meta.get("activeShotIds") or []
         desktop_active_ids = desktop_meta.get("activeShotIds") or []
@@ -1099,6 +1110,7 @@ class AiDispatchModeReq(BaseModel):
 class ReleaseFastpathReq(BaseModel):
     claimToken: str = ""
     reason: str = ""
+    nextStatus: str = ""
 
 
 class BindConvReq(BaseModel):
@@ -2211,7 +2223,12 @@ def restart_agent_bridge() -> dict[str, Any]:
 @app.post("/api/shots/{shot_id}/release-fastpath")
 def release_fastpath_shot(shot_id: str, req: ReleaseFastpathReq) -> dict[str, Any]:
     try:
-        shot = store.release_fastpath_claim(shot_id, claim_token=req.claimToken, reason=req.reason)
+        shot = store.release_fastpath_claim(
+            shot_id,
+            claim_token=req.claimToken,
+            reason=req.reason,
+            next_status=req.nextStatus,
+        )
         return {"ok": True, "shot": shot}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

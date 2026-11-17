@@ -2755,6 +2755,7 @@ async function switchAiDispatchMode(mode) {
   try {
     const res = await apiJson("/api/config/ai-dispatch-mode", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode }),
     });
     state.serverUnreachable = false;
@@ -2928,16 +2929,37 @@ function getShotRuntimeSnapshot(shot) {
   const isProc = st === "processing";
   const isWait = ACTIONABLE_QUEUE_STATUSES.has(st);
   const agyMeta = getAgentStatusMeta();
+  const aiMode = agyMeta.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent";
+  const isDesktopMode = aiMode !== "cli_bridge";
+  const isMechanicalCandidate =
+    (shot.platform || "libtv") === "jimeng" &&
+    ["prompt_update_requested", "run_requested", "final_requested"].includes(st);
+  const isDesktopShot =
+    shot.claimedBy === "desktop_coordinator" || (isDesktopMode && !isMechanicalCandidate);
+
   let health = isProc ? "running" : isWait ? "queued" : "idle";
-  let healthLabel = isProc ? "🟢 Agent 正在后台处理中" : isWait ? "⏳ 正在排队等待接单" : "当前未在运行";
+  let healthLabel = isProc
+    ? isDesktopShot
+      ? "🟢 桌面单镜子对话处理中"
+      : "🟢 Agent 正在后台处理中"
+    : isWait
+    ? isDesktopShot
+      ? "⏳ 等待桌面一镜一对话接单"
+      : "⏳ 正在排队等待接单"
+    : "当前未在运行";
   let diagnosis = shot.agentSummary || "";
   const elapsedSec = w?.elapsedSec ?? 0;
   const idleSec = w?.idleSec ?? 0;
   if (isProc) {
-    if (!agyMeta.bridgeOnline && !state.serverUnreachable) {
+    if (isDesktopShot) {
+      if (!agyMeta.desktopCoordinatorOnline && elapsedSec >= 300) {
+        health = "stalled";
+        healthLabel = "🟡 桌面协同监听已离线（耗时较长）";
+      }
+    } else if (!agyMeta.bridgeOnline && !state.serverUnreachable) {
       health = "stalled";
-      healthLabel = "🔴 后台桥接未运行";
-      diagnosis = "镜头状态为「处理中」，但后台桥接未在线；建议点「↻ 刷新重试」。";
+      healthLabel = "🔴 后台执行器未运行";
+      diagnosis = "镜头状态为「处理中」，但后台执行器未在线；建议点「↻ 刷新重试」。";
     } else if (idleSec >= 180) {
       health = "stalled";
       healthLabel = `🟠 已 ${idleSec} 秒无新动作（疑似卡住）`;
@@ -2945,9 +2967,16 @@ function getShotRuntimeSnapshot(shot) {
       health = "slow";
       healthLabel = `🟡 等待平台/工具响应中（${idleSec} 秒前更新）`;
     }
-  } else if (isWait && agyMeta.bridgePaused) {
-    health = "paused";
-    healthLabel = "⏸ 后台桥接已暂停";
+  } else if (isWait) {
+    if (isDesktopShot) {
+      if (!agyMeta.desktopCoordinatorOnline && !state.serverUnreachable) {
+        health = "offline";
+        healthLabel = "🟡 等待桌面协同监听上线";
+      }
+    } else if (agyMeta.bridgePaused) {
+      health = "paused";
+      healthLabel = "⏸ 后台执行器已暂停";
+    }
   }
   return {
     shotId: shot.id,
@@ -3147,16 +3176,26 @@ function renderRuntimeModalBody() {
   }
   const rt = getShotRuntimeSnapshot(shot) || {};
   const health = rt.health || "idle";
-  const pidText = rt.agyPid
+  const isDesktopRuntime =
+    rt.claimedBy === "desktop_coordinator" ||
+    (rt.aiDispatchMode !== "cli_bridge" && !rt.agyPid && Boolean(rt.desktopConversationId));
+  const pidText = isDesktopRuntime
+    ? rt.desktopConversationId
+      ? `桌面专属子对话 (${rt.desktopConversationId.slice(0, 8)}…)`
+      : "Antigravity 桌面专属子对话"
+    : rt.agyPid
     ? `PID ${rt.agyPid}（${rt.agyPidAlive === true ? "进程运行中 ✓" : rt.agyPidAlive === false ? "进程已退出 ✕" : "检查中"}）`
     : rt.isProcessing
-    ? "未匹配到活跃子进程"
+    ? "本地 Fast-Path / CLI 执行中"
     : "尚未拉起";
-  const bridgeText = rt.bridgePaused
-    ? "已暂停"
-    : rt.bridgeOnline
-    ? `在线（PID ${rt.bridgePid || "-"}）`
-    : "离线";
+  const bridgeText =
+    rt.aiDispatchMode !== "cli_bridge"
+      ? `桌面监听：${rt.desktopOnline ? "在线" : "离线"} · Fast-Path：${rt.bridgePaused ? "已暂停" : rt.bridgeOnline ? `在线 (PID ${rt.bridgePid || "-"})` : "离线"}`
+      : rt.bridgePaused
+      ? "已暂停"
+      : rt.bridgeOnline
+      ? `在线（PID ${rt.bridgePid || "-"}）`
+      : "离线";
   const stepsText = (rt.recentSteps || []).length
     ? rt.recentSteps.map((st) => `[${st.at || ""}] ${st.text || ""}`).join("\n")
     : rt.isProcessing
@@ -5497,6 +5536,7 @@ function bindDetailEvents(shot) {
     try {
       await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/meta`, {
         method: "PATCH",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ targetDuration: nextDur, syncLocal: false }),
       });
       showToast(nextDur ? `已设置目标时长 ${nextDur}s（生成/同步时生效）` : "已恢复自动时长");

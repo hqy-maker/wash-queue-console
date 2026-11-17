@@ -1006,12 +1006,21 @@ class BridgeRuntime:
         except Exception as exc:
             _log(f"{shot_id} failed-state cleanup error: {exc}")
 
-    def _release_to_desktop_ai(self, shot_id: str, claim_token: str, reason: str = "") -> None:
+    def _release_to_desktop_ai(
+        self,
+        shot_id: str,
+        claim_token: str,
+        reason: str = "",
+        next_status: str = "",
+    ) -> None:
         try:
             with httpx.Client(base_url=self.base_url, timeout=10.0) as client:
+                body: dict[str, Any] = {"claimToken": claim_token, "reason": reason}
+                if next_status:
+                    body["nextStatus"] = next_status
                 r = client.post(
                     f"/api/shots/{shot_id}/release-fastpath",
-                    json={"claimToken": claim_token, "reason": reason},
+                    json=body,
                 )
                 if r.status_code not in {200, 409}:
                     _log(f"{shot_id} release-fastpath unexpected status={r.status_code} body={r.text[:200]}")
@@ -1253,6 +1262,7 @@ class BridgeRuntime:
         last_status = ""
         released_to_ai = False
         fp_reason = ""
+        release_next_status = ""
         try:
             prepped: dict[str, Any] = {}
             if SETTINGS["fastPathEnabled"] and task_type == "prompt_update_requested":
@@ -1294,14 +1304,29 @@ class BridgeRuntime:
                     return
                 if isinstance(fp_res.get("preppedOverride"), dict) and ai_mode == "cli_bridge":
                     prepped = dict(fp_res["preppedOverride"])
+                elif isinstance(fp_res.get("preppedOverride"), dict) and fp_res["preppedOverride"].get("renderFastCompleted"):
+                    ov = fp_res["preppedOverride"]
+                    release_next_status = "recheck_requested"
+                    target_st = str(ov.get("targetFinalStatus") or ("final_ready" if task_type == "final_requested" else "draft_ready"))
+                    dl_path = str(ov.get("downloadedVideoPath") or "")
+                    fp_reason = (
+                        f"⚡ 样片/正片已由 Fast-Path 生成并下载至 {dl_path}，请桌面子对话仅用 read_file 完成视听自检后"
+                        f"回写 status={target_st}（切勿重复触发生成）"
+                    )
+                    _log(f"{shot_id} {task_type} fast-path rendered; handing QA to desktop_subagent as recheck_requested")
                 else:
                     fp_reason = str(fp_res.get("reason") or f"{task_type} Fast-Path 跳过")
                     _log(f"{shot_id} {task_type} fast-path skipped ({fp_reason})")
 
             if ai_mode != "cli_bridge":
                 reason = fp_reason or f"{task_type or 'ai'} 需 AI 处理，交由桌面一镜一对话"
-                _log(f"{shot_id} releasing fast-path claim to desktop_subagent: {reason}")
-                self._release_to_desktop_ai(shot_id, claim_token, reason=reason)
+                _log(f"{shot_id} releasing fast-path claim to desktop_subagent (next={release_next_status or 'keep'}): {reason}")
+                self._release_to_desktop_ai(
+                    shot_id,
+                    claim_token,
+                    reason=reason,
+                    next_status=release_next_status,
+                )
                 released_to_ai = True
                 return
 

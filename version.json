@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.1",
+  "version": "2026.11.17.2",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T03:38:21+08:00",
-  "changelog": "新增桌面「一镜一对话」派单模式（默认）与纯本地零LLM Fast-Path 执行器，消除独立 CLI 登录弹窗与并发冲突",
+  "publishedAt": "2026-11-17T10:43:44+08:00",
+  "changelog": "自检修复桌面一镜一对话切换请求头、runtime 心跳诊断、cli_bridge 空转与自检防重跑问题",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

@@ -1372,6 +1372,22 @@ class QueueStore:
             )
             return {"aiDispatchMode": clean_val}
 
+    def get_runtime_counts(self) -> dict[str, Any]:
+        with self._lock:
+            q = self._load_queue()
+            shots = q.get("shots", [])
+            proc_ids = [str(s["id"]) for s in shots if s.get("status") == "processing"]
+            pending = [s for s in shots if s.get("status") in ACTIONABLE_STATUSES]
+            fp_cnt = sum(1 for s in pending if is_fastpath_mechanical_candidate(s))
+            ai_cnt = len(pending) - fp_cnt
+            return {
+                "aiDispatchMode": self._get_ai_dispatch_mode(q),
+                "processingShotIds": proc_ids,
+                "pendingCount": len(pending),
+                "aiPendingCount": ai_cnt,
+                "fastpathPendingCount": fp_cnt,
+            }
+
     @staticmethod
     def _decorate_shot(q: dict[str, Any], shot: dict[str, Any]) -> dict[str, Any]:
         return _decorate_shot_payload(shot, export_config=_extract_export_config(q))
@@ -2910,6 +2926,7 @@ class QueueStore:
         shot["claimedBy"] = ""
         shot["claimedAt"] = ""
         shot["processingTaskType"] = ""
+        shot.pop("fastpathBypassSig", None)
 
     @staticmethod
     def _clear_error_fields(shot: dict[str, Any]) -> None:
@@ -3154,9 +3171,19 @@ class QueueStore:
                 "digestMarkdown": digest,
             }
 
-    def release_fastpath_claim(self, shot_id: str, claim_token: str, reason: str = "") -> dict[str, Any]:
+    def release_fastpath_claim(
+        self,
+        shot_id: str,
+        claim_token: str,
+        reason: str = "",
+        *,
+        next_status: str = "",
+    ) -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
         tok = (claim_token or "").strip()
+        override_status = (next_status or "").strip()
+        if override_status and override_status not in ACTIONABLE_STATUSES:
+            raise ValueError(f"无效的回退队列状态: {override_status}")
         with self._lock:
             q = self._load_queue()
             for shot in q["shots"]:
@@ -3167,17 +3194,23 @@ class QueueStore:
                 prev_task = str(shot.get("processingTaskType") or "queued").strip()
                 if prev_task not in ACTIONABLE_STATUSES:
                     prev_task = "queued"
+                target_status = override_status or prev_task
                 self._clear_claim_fields(shot)
-                shot["status"] = prev_task
+                shot["status"] = target_status
                 shot["updatedAt"] = now_iso()
-                shot["fastpathBypassSig"] = compute_fastpath_bypass_sig(shot)
-                shot["agentSummary"] = f"该操作需 AI 介入（{reason or 'fastpath_bypass'}），等待桌面一镜一对话领单…"
+                if target_status in {"prompt_update_requested", "run_requested", "final_requested"}:
+                    shot["fastpathBypassSig"] = compute_fastpath_bypass_sig(shot)
+                shot["agentSummary"] = (
+                    reason.strip()
+                    if reason.strip() and override_status == "recheck_requested"
+                    else f"该操作需 AI 介入（{reason or 'fastpath_bypass'}），等待桌面一镜一对话领单…"
+                )
                 self._save_queue(
                     q,
                     {
                         "type": "fastpath_released_to_ai",
                         "shotId": sid,
-                        "status": prev_task,
+                        "status": target_status,
                     },
                 )
                 return self._decorate_shot(q, shot)
@@ -3608,7 +3641,7 @@ class QueueStore:
                         revision_direction=eff_dir,
                         draft_video_url=vid_url,
                         draft_downloaded_at=vid_at,
-                        conversation_id=conv_id,
+                        conversation_id=desktop_conv_id or conv_id,
                     )
 
                 shot["updatedAt"] = now_iso()
@@ -3979,7 +4012,11 @@ class QueueStore:
                 queue_ai_mode = normalize_ai_dispatch_mode(q.get("aiDispatchMode"))
                 raw_pending = [s for s in q.get("shots", []) if s.get("status") in ACTIONABLE_STATUSES]
                 if ai_only:
-                    pending = [s for s in raw_pending if not is_fastpath_mechanical_candidate(s)]
+                    pending = (
+                        []
+                        if queue_ai_mode == "cli_bridge"
+                        else [s for s in raw_pending if not is_fastpath_mechanical_candidate(s)]
+                    )
                 elif fastpath_only and queue_ai_mode != "cli_bridge":
                     pending = [s for s in raw_pending if is_fastpath_mechanical_candidate(s)]
                 else:
