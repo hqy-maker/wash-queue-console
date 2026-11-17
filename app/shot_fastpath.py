@@ -44,6 +44,7 @@ from store import (
     DATA_ROOT,
     SHOTS_DIR,
     get_platform_label,
+    replace_shot_video_with_archive,
     resolve_cli_conversation_id,
     run_preflight,
     safe_prompt_update_prev_status,
@@ -1245,7 +1246,7 @@ def _download_dreamina_mp4(project_uuid: str, resource_id: str, dest_path: Path)
         )
         if not tmp_path.is_file() or tmp_path.stat().st_size < 10000:
             raise RuntimeError(f"下载视频文件异常或过小: {tmp_path}")
-        os.replace(tmp_path, dest_path)
+        replace_shot_video_with_archive(tmp_path, dest_path)
     finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)

@@ -344,9 +344,14 @@ def infer_shot_stage_flags(
     draft_after_reopen = bool(shot.get("draftUpdatedSinceFinalReopen")) or bool(
         has_outdated_final and st == "draft_ready" and (has_changes is False)
     )
+    draft_in_progress = bool(
+        st == "run_requested"
+        or (st == "processing" and task == "run_requested")
+    )
     return {
         "hasFinalVideo": has_final,
         "isFinalInProgress": final_in_progress,
+        "isDraftInProgress": draft_in_progress,
         "isPassedFinal": passed_final,
         "hasOutdatedFinal": has_outdated_final,
         "draftUpdatedSinceFinalReopen": draft_after_reopen,
@@ -610,6 +615,171 @@ def _file_stat_sig(file_path: str | None) -> str:
         return str(file_path)
 
 
+def _file_sha256_hex(file_path: Path | str | None) -> str:
+    if not file_path:
+        return ""
+    try:
+        p = Path(file_path).expanduser().resolve()
+        if not p.is_file():
+            return ""
+        h = hashlib.sha256()
+        with p.open("rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def replace_shot_video_with_archive(
+    tmp_path: Path,
+    dest_path: Path,
+    *,
+    role: str = "",
+) -> Path | None:
+    """Atomically replace `dest_path` with `tmp_path`, preserving differing prior output in `video_history/`."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    archived_path: Path | None = None
+    try:
+        if dest_path.is_file() and dest_path.stat().st_size > 0:
+            old_sha = _file_sha256_hex(dest_path)
+            new_sha = _file_sha256_hex(tmp_path)
+            if old_sha and new_sha and old_sha != new_sha:
+                clean_role = str(role or "").strip().lower()
+                eff_role = "1080p" if (clean_role == "1080p" or "final" in dest_path.stem.lower()) else "480p"
+                ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(dest_path.stat().st_mtime))
+                hist_dir = dest_path.parent / "video_history"
+                hist_dir.mkdir(parents=True, exist_ok=True)
+                ext = dest_path.suffix.lower() or ".mp4"
+                archived_path = hist_dir / f"{eff_role}_{ts}_{old_sha[:10]}{ext}"
+                if not archived_path.is_file():
+                    shutil.copy2(dest_path, archived_path)
+    except OSError:
+        archived_path = None
+    os.replace(tmp_path, dest_path)
+    return archived_path
+
+
+def _extract_video_dims(vobj: dict[str, Any]) -> tuple[int, int, float]:
+    meta = vobj.get("meta") if isinstance(vobj.get("meta"), dict) else {}
+    w = int(vobj.get("width") or meta.get("width") or 0)
+    h = int(vobj.get("height") or meta.get("height") or 0)
+    dur = float(vobj.get("durationSec") or meta.get("durationSec") or 0.0)
+    return w, h, dur
+
+
+def _collect_shot_video_versions(out: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build deduplicated current + archived video version list (newest first) for playback & screenshot."""
+    sid = str(out.get("id") or "").strip()
+    if not sid:
+        return []
+    raw_hist = [dict(x) for x in (out.get("videoHistory") or []) if isinstance(x, dict)]
+    cur_draft = out.get("draftVideo") if isinstance(out.get("draftVideo"), dict) else None
+    cur_final = out.get("finalVideo") if isinstance(out.get("finalVideo"), dict) else None
+
+    entries: list[dict[str, Any]] = []
+    seen_sigs: set[str] = set()
+
+    def _add_candidate(
+        obj: dict[str, Any],
+        *,
+        role_hint: str,
+        is_current: bool,
+        sort_fallback: float = 0.0,
+    ) -> None:
+        fp_str = str(obj.get("filePath") or "").strip()
+        url_str = str(obj.get("mediaUrl") or "").strip()
+        resolved: Path | None = None
+        if fp_str:
+            p = resolve_media_path(fp_str)
+            if p.is_file() and DATA_ROOT.resolve() in p.parents:
+                resolved = p
+        elif url_str.startswith("/media/"):
+            p = resolve_media_path(url_str.removeprefix("/media/"))
+            if p.is_file() and DATA_ROOT.resolve() in p.parents:
+                resolved = p
+        if resolved is None:
+            return
+        try:
+            st = resolved.stat()
+            mtime_val = st.st_mtime
+            fsize = st.st_size
+        except OSError:
+            return
+        if fsize <= 0:
+            return
+
+        role = "1080p" if str(obj.get("role") or role_hint).strip().lower() == "1080p" else "480p"
+        sha = str(obj.get("sha256") or "").strip()
+        if not sha:
+            sha = _file_sha256_hex(resolved)
+        sig_key = f"{role}:{sha or resolved.resolve()}"
+        if sig_key in seen_sigs:
+            return
+        seen_sigs.add(sig_key)
+
+        rel_url = to_media_url(resolved)
+        w, h, dur = _extract_video_dims(obj)
+        dl_at = str(obj.get("downloadedAt") or "").strip() or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime_val))
+        stem = build_shot_download_filename(out, kind=role)
+        if not is_current:
+            stem_base, stem_ext = os.path.splitext(stem)
+            ts_tag = re.sub(r"[^0-9]", "", dl_at)[:14] or str(int(mtime_val))
+            dl_name = f"{stem_base}_{ts_tag}{stem_ext}"
+        else:
+            dl_name = stem
+        entries.append(
+            {
+                "id": str(obj.get("id") or f"{'cur' if is_current else 'hist'}_{role}_{(sha or resolved.stem)[:8]}"),
+                "role": role,
+                "isCurrent": is_current,
+                "filePath": str(resolved),
+                "mediaUrl": rel_url,
+                "sha256": sha,
+                "versionToken": (sha[:10] if sha else str(st.st_mtime_ns)),
+                "width": w,
+                "height": h,
+                "durationSec": dur,
+                "bytes": fsize,
+                "downloadedAt": dl_at,
+                "resourceId": str(obj.get("resourceId") or ""),
+                "revisionDirection": str(obj.get("revisionDirection") or ""),
+                "promptVersion": str(obj.get("promptVersion") or ""),
+                "downloadName": dl_name,
+                "_sortKey": (dl_at, 1 if is_current else 0, mtime_val or sort_fallback),
+            }
+        )
+
+    # Current videos take precedence so `isCurrent=True` always resolves to draft_480p/final_1080p
+    if cur_final and (cur_final.get("filePath") or cur_final.get("mediaUrl")):
+        _add_candidate(cur_final, role_hint="1080p", is_current=True, sort_fallback=9e12)
+    if cur_draft and (cur_draft.get("filePath") or cur_draft.get("mediaUrl")):
+        _add_candidate(cur_draft, role_hint="480p", is_current=True, sort_fallback=8e12)
+
+    for idx, item in enumerate(reversed(raw_hist)):
+        item_role = "1080p" if str(item.get("role") or "").lower() == "1080p" else "480p"
+        _add_candidate(item, role_hint=item_role, is_current=False, sort_fallback=float(len(raw_hist) - idx))
+
+    hist_dir = SHOTS_DIR / sid / "video_history"
+    if hist_dir.is_dir():
+        disk_files = sorted(
+            [p for p in hist_dir.iterdir() if p.is_file() and p.suffix.lower() in preflight_check.VIDEO_EXTS],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for p in disk_files:
+            f_role = "1080p" if p.name.startswith("1080p_") else "480p"
+            _add_candidate({"filePath": str(p), "role": f_role}, role_hint=f_role, is_current=False)
+
+    entries.sort(key=lambda x: x["_sortKey"], reverse=True)
+    for item in entries:
+        item.pop("_sortKey", None)
+    return entries
+
+
 def _summarize_shot_assets(shot: dict[str, Any]) -> list[str]:
     summary: list[str] = []
     idx = 1
@@ -794,6 +964,15 @@ def _decorate_shot_payload(
     out["localExports"] = copy.deepcopy(local_exports)
     out["exportSyncStatus1080p"] = sync_status
     out["exportSyncMessage1080p"] = sync_msg
+
+    # Ensure video sha256/version tokens & archived history list are attached cleanly
+    for vkey in ("draftVideo", "finalVideo"):
+        vcur = out.get(vkey)
+        if isinstance(vcur, dict) and vcur.get("filePath") and not vcur.get("sha256"):
+            fp_v = resolve_media_path(str(vcur["filePath"]))
+            if fp_v.is_file() and DATA_ROOT.resolve() in fp_v.parents:
+                vcur["sha256"] = _file_sha256_hex(fp_v)
+    out["videoVersions"] = _collect_shot_video_versions(out)
     return out
 
 
@@ -2867,7 +3046,8 @@ class QueueStore:
                 if ext != ".mp4":
                     target_name = f"final_1080p{ext}"
                     dest = shot_dir / target_name
-                os.replace(tmp_dest, dest)
+                old_fv = copy.deepcopy(shot.get("finalVideo")) if isinstance(shot.get("finalVideo"), dict) else None
+                replace_shot_video_with_archive(tmp_dest, dest, role="1080p")
                 meta["path"] = str(dest)
                 vobj = {
                     "filePath": str(dest),
@@ -2875,9 +3055,17 @@ class QueueStore:
                     "watermark": False,
                     "downloadedAt": now_iso(),
                     "sourceSig": _file_stat_sig(str(dest)),
+                    "sha256": _file_sha256_hex(dest),
                     "meta": meta,
                     "source": "manual_replace",
                 }
+                self._record_video_history_locked(
+                    shot,
+                    role="1080p",
+                    prev_video=old_fv,
+                    new_video=vobj,
+                    revision_direction=f"手动替换 1080P 正片（{filename}）",
+                )
                 shot["finalVideo"] = vobj
                 shot["finalModifiedReopened"] = False
                 shot["draftUpdatedSinceFinalReopen"] = False
@@ -2932,6 +3120,162 @@ class QueueStore:
     def _clear_error_fields(shot: dict[str, Any]) -> None:
         for k in ("errorCode", "errorTag", "errorReason", "errorSolution", "errorDetail", "lastFailedTask"):
             shot.pop(k, None)
+
+    @staticmethod
+    def _record_video_history_locked(
+        shot: dict[str, Any],
+        *,
+        role: str,
+        prev_video: dict[str, Any] | None,
+        new_video: dict[str, Any],
+        revision_direction: str = "",
+    ) -> None:
+        """Record generated/synced video into `shot['videoHistory']` and relink archived history URLs."""
+        sid = str(shot.get("id") or "").strip()
+        if not sid:
+            return
+        eff_role = "1080p" if str(role or "").strip().lower() == "1080p" else "480p"
+        hist = shot.setdefault("videoHistory", [])
+        if not isinstance(hist, list):
+            hist = []
+            shot["videoHistory"] = hist
+
+        new_fp_raw = str(new_video.get("filePath") or "").strip()
+        new_fp = resolve_media_path(new_fp_raw) if new_fp_raw else None
+        new_sha = str(new_video.get("sha256") or "").strip()
+        if not new_sha and new_fp and new_fp.is_file():
+            new_sha = _file_sha256_hex(new_fp)
+            new_video["sha256"] = new_sha
+
+        hist_dir = SHOTS_DIR / sid / "video_history"
+        if isinstance(prev_video, dict) and (prev_video.get("filePath") or prev_video.get("mediaUrl")):
+            prev_sha = str(prev_video.get("sha256") or "").strip()
+            arch_path: Path | None = None
+            if hist_dir.is_dir():
+                if prev_sha:
+                    matches = sorted(
+                        [p for p in hist_dir.glob(f"{eff_role}_*_{prev_sha[:10]}*") if p.is_file()],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if matches:
+                        arch_path = matches[0]
+                if arch_path is None:
+                    known_paths = {str(h.get("filePath") or "") for h in hist if isinstance(h, dict)}
+                    candidates = sorted(
+                        [
+                            p
+                            for p in hist_dir.glob(f"{eff_role}_*")
+                            if p.is_file() and str(p) not in known_paths and not p.stem.endswith(new_sha[:10] or "NONE")
+                        ],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if candidates:
+                        arch_path = candidates[0]
+                        if not prev_sha:
+                            prev_sha = _file_sha256_hex(arch_path)
+
+            if arch_path is not None and arch_path.is_file() and (not new_sha or prev_sha != new_sha):
+                arch_url = to_media_url(arch_path)
+                prev_url = str(prev_video.get("mediaUrl") or "").strip()
+                pw, ph, pdur = _extract_video_dims(prev_video)
+                if not prev_sha:
+                    prev_sha = _file_sha256_hex(arch_path)
+                existing_prev = next(
+                    (
+                        h
+                        for h in hist
+                        if isinstance(h, dict)
+                        and h.get("role") == eff_role
+                        and ((prev_sha and h.get("sha256") == prev_sha) or h.get("isCurrent"))
+                    ),
+                    None,
+                )
+                if existing_prev is not None:
+                    existing_prev["filePath"] = str(arch_path)
+                    existing_prev["mediaUrl"] = arch_url
+                    existing_prev["isCurrent"] = False
+                    if prev_sha:
+                        existing_prev["sha256"] = prev_sha
+                else:
+                    hist.append(
+                        {
+                            "id": f"vh_{eff_role}_{uuid.uuid4().hex[:8]}",
+                            "role": eff_role,
+                            "filePath": str(arch_path),
+                            "mediaUrl": arch_url,
+                            "sha256": prev_sha,
+                            "width": pw,
+                            "height": ph,
+                            "durationSec": pdur,
+                            "meta": copy.deepcopy(prev_video.get("meta") or {}),
+                            "downloadedAt": str(prev_video.get("downloadedAt") or ""),
+                            "resourceId": str(prev_video.get("resourceId") or ""),
+                            "revisionDirection": str(shot.get("latestRevisionDirection") or "").strip(),
+                            "isCurrent": False,
+                        }
+                    )
+                canon_name = "final_1080p" if eff_role == "1080p" else "draft_480p"
+                for snap in shot.get("versionHistory") or []:
+                    if not isinstance(snap, dict):
+                        continue
+                    surl = str(snap.get("draftVideoUrl") or "")
+                    if surl and (surl == prev_url or f"/{canon_name}." in surl) and "/video_history/" not in surl:
+                        snap["draftVideoUrl"] = arch_url
+                for fb in shot.get("feedbacks") or []:
+                    if not isinstance(fb, dict):
+                        continue
+                    rv = fb.get("resultVideo")
+                    if isinstance(rv, dict):
+                        rurl = str(rv.get("mediaUrl") or "")
+                        if rurl and (rurl == prev_url or f"/{canon_name}." in rurl) and "/video_history/" not in rurl:
+                            rv["mediaUrl"] = arch_url
+                            rv["filePath"] = str(arch_path)
+
+        for item in hist:
+            if isinstance(item, dict) and item.get("role") == eff_role:
+                item["isCurrent"] = False
+
+        nw, nh, ndur = _extract_video_dims(new_video)
+        matched_cur = next(
+            (
+                h
+                for h in hist
+                if isinstance(h, dict) and h.get("role") == eff_role and new_sha and h.get("sha256") == new_sha
+            ),
+            None,
+        )
+        cur_url = str(new_video.get("mediaUrl") or (to_media_url(new_fp) if new_fp and new_fp.is_file() else "")).strip()
+        cur_dir = (revision_direction or str(shot.get("latestRevisionDirection") or "")).strip()
+        if matched_cur is not None:
+            matched_cur["filePath"] = str(new_fp or new_fp_raw)
+            matched_cur["mediaUrl"] = cur_url
+            matched_cur["isCurrent"] = True
+            matched_cur["downloadedAt"] = str(new_video.get("downloadedAt") or matched_cur.get("downloadedAt") or now_iso())
+            if cur_dir:
+                matched_cur["revisionDirection"] = cur_dir
+        elif cur_url:
+            hist.append(
+                {
+                    "id": f"vh_{eff_role}_{uuid.uuid4().hex[:8]}",
+                    "role": eff_role,
+                    "filePath": str(new_fp or new_fp_raw),
+                    "mediaUrl": cur_url,
+                    "sha256": new_sha,
+                    "width": nw,
+                    "height": nh,
+                    "durationSec": ndur,
+                    "meta": copy.deepcopy(new_video.get("meta") or {}),
+                    "downloadedAt": str(new_video.get("downloadedAt") or now_iso()),
+                    "resourceId": str(new_video.get("resourceId") or ""),
+                    "revisionDirection": cur_dir,
+                    "promptVersion": str(((shot.get("versionHistory") or [{}])[-1]).get("version") or ""),
+                    "isCurrent": True,
+                }
+            )
+        if len(hist) > 40:
+            del hist[:-40]
 
     @staticmethod
     def _mark_final_reopened_if_needed(shot: dict[str, Any]) -> None:
@@ -3429,6 +3773,7 @@ class QueueStore:
                 final_video_updated = False
                 for vid_field in ("draftVideo", "finalVideo"):
                     if vid_field in payload and payload[vid_field] is not None:
+                        old_vobj = copy.deepcopy(shot.get(vid_field)) if isinstance(shot.get(vid_field), dict) else None
                         vobj = dict(payload[vid_field])
                         if vobj.get("filePath"):
                             resolved = resolve_media_path(vobj["filePath"])
@@ -3436,7 +3781,16 @@ class QueueStore:
                                 vobj["filePath"] = str(resolved)
                                 vobj["mediaUrl"] = vobj.get("mediaUrl") or to_media_url(resolved)
                                 vobj["meta"] = run_preflight(resolved)
+                                if not vobj.get("sha256"):
+                                    vobj["sha256"] = _file_sha256_hex(resolved)
                         vobj.setdefault("downloadedAt", now_iso())
+                        self._record_video_history_locked(
+                            shot,
+                            role="1080p" if vid_field == "finalVideo" else "480p",
+                            prev_video=old_vobj,
+                            new_video=vobj,
+                            revision_direction=rev_dir or str(payload.get("revisionSummary") or "").strip(),
+                        )
                         shot[vid_field] = vobj
                         updated_result_video = copy.deepcopy(vobj)
                         if vid_field == "finalVideo":
@@ -3549,6 +3903,10 @@ class QueueStore:
                     self._clear_claim_fields(shot)
                     shot.pop("fastpathBypassSig", None)
                     shot["promptUpdatePrevStatus"] = ""
+                    if prev_task == "prompt_update_requested" and shot.get("status") == "draft_ready":
+                        last_fp = str(shot.get("lastGeneratedFingerprint") or "").strip()
+                        if last_fp and compute_generation_fingerprint(shot) != last_fp:
+                            shot["status"] = "ready_on_canvas"
                     if shot.get("status") in {"ready_on_canvas", "draft_ready", "final_ready"}:
                         shot["pendingPromptEdit"] = ""
                     if shot.get("status") in {"final_ready", "draft_ready", "ready_on_canvas"}:
@@ -3690,19 +4048,30 @@ class QueueStore:
                     shot["libtvFinalNodeKey"] = final_node_key
                 new_media_url = ""
                 if draft_path is not None and draft_path.is_file():
+                    old_dv = copy.deepcopy(shot.get("draftVideo")) if isinstance(shot.get("draftVideo"), dict) else None
                     new_media_url = to_media_url(draft_path)
                     if resource_id:
                         jm = shot.setdefault("jimengMeta", {})
                         if isinstance(jm, dict):
                             jm["downloadedResourceId"] = resource_id
-                    shot["draftVideo"] = {
+                    new_dv_obj = {
                         "filePath": str(draft_path),
                         "mediaUrl": new_media_url,
                         "remoteUrl": remote_draft_url,
                         "watermark": watermark,
+                        "resourceId": resource_id,
+                        "sha256": _file_sha256_hex(draft_path),
                         "meta": run_preflight(draft_path),
                         "downloadedAt": now_iso(),
                     }
+                    self._record_video_history_locked(
+                        shot,
+                        role="480p",
+                        prev_video=old_dv,
+                        new_video=new_dv_obj,
+                        revision_direction=f"从 {plat_label} 同步 480P 样片",
+                    )
+                    shot["draftVideo"] = new_dv_obj
                     if shot["status"] in {"ready_on_canvas", "run_requested", "processing", "queued", "feedback_queued", "final_ready", "final_done"}:
                         self._clear_claim_fields(shot)
                         shot["status"] = "draft_ready"
@@ -3725,20 +4094,30 @@ class QueueStore:
                     res_changed = bool(final_resource_id and final_resource_id != (shot.get("jimengMeta") or {}).get("downloadedFinalResourceId"))
                     if not old_fv or new_fv_sig != old_fv_sig or url_changed or res_changed:
                         final_synced_new = True
+                        prev_fv_copy = copy.deepcopy(old_fv) if old_fv else None
                         if final_resource_id:
                             jm = shot.setdefault("jimengMeta", {})
                             if isinstance(jm, dict):
                                 jm["downloadedFinalResourceId"] = final_resource_id
-                        shot["finalVideo"] = {
+                        new_fv_obj = {
                             "filePath": str(final_path),
                             "mediaUrl": to_media_url(final_path),
                             "remoteUrl": remote_final_url,
                             "watermark": final_watermark,
                             "resourceId": final_resource_id,
+                            "sha256": _file_sha256_hex(final_path),
                             "meta": run_preflight(final_path),
                             "downloadedAt": now_iso(),
                             "sourceSig": new_fv_sig,
                         }
+                        self._record_video_history_locked(
+                            shot,
+                            role="1080p",
+                            prev_video=prev_fv_copy,
+                            new_video=new_fv_obj,
+                            revision_direction=f"从 {plat_label} 同步 1080P 正片",
+                        )
+                        shot["finalVideo"] = new_fv_obj
                         shot["finalModifiedReopened"] = False
                         shot["draftUpdatedSinceFinalReopen"] = False
                         if shot["status"] != "processing":

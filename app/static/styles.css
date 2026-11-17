@@ -2411,7 +2411,116 @@ button {
 
 .video-review-tabs {
   display: inline-flex;
+  flex-wrap: wrap;
   gap: 4px;
+}
+
+.video-version-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-bottom: 10px;
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+}
+
+.video-version-strip-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-right: 2px;
+}
+
+.video-ver-chip {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
+}
+
+.video-ver-chip:hover {
+  border-color: var(--blue);
+  color: var(--text);
+}
+
+.video-ver-chip.is-active {
+  background: var(--blue-soft);
+  border-color: var(--blue);
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.video-capture-tray {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.video-capture-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.video-capture-thumb {
+  width: 72px;
+  height: 42px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+  background: #000;
+}
+
+.video-capture-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.video-capture-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.video-capture-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.video-capture-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.video-frame-step-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 
 .card-head-actions {
@@ -2529,7 +2638,8 @@ button {
   padding-top: 2px;
 }
 
-.final-progress-banner {
+.final-progress-banner,
+.draft-progress-banner {
   font-size: 12.5px;
   line-height: 1.5;
   color: #5b21b6;
@@ -2705,6 +2815,34 @@ button {
   border-radius: 10px;
   background: #000000;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+
+.lightbox-video-tools {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.lightbox-capture-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: rgba(20, 24, 34, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #f3f4f6;
+  padding: 7px 12px;
+  border-radius: 10px;
+}
+
+.lightbox-capture-bar .video-capture-title {
+  color: #fff;
+}
+
+.lightbox-capture-bar .video-capture-sub {
+  color: rgba(255, 255, 255, 0.72);
 }
 
 .lightbox-caption {

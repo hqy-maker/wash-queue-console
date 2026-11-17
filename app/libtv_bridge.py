@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from store import WORKSPACE_ROOT
+from store import WORKSPACE_ROOT, replace_shot_video_with_archive
 
 HOME_DIR = Path.home()
 APP_ROOT = Path(__file__).resolve().parent
@@ -438,7 +438,7 @@ def download_node_video(
                 continue
             tmp_target = dest_file.with_name(f".{dest_file.name}.tmp")
             shutil.copy2(videos[0], tmp_target)
-            os.replace(tmp_target, dest_file)
+            replace_shot_video_with_archive(tmp_target, dest_file)
             return dest_file, (watermark_flag == "true")
     raise RuntimeError(last_err or f"下载节点 {node_ref} 失败")
 

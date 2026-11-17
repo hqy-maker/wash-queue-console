@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from store import WORKSPACE_ROOT
+from store import WORKSPACE_ROOT, replace_shot_video_with_archive
 
 HOME_DIR = Path.home()
 APP_ROOT = Path(__file__).resolve().parent
@@ -480,7 +480,7 @@ def download_resource(resource_id: str, dest_file: Path, project_uuid: str | Non
 
         tmp_target = dest_file.with_name(f".{dest_file.name}.tmp")
         shutil.copy2(out_path, tmp_target)
-        os.replace(tmp_target, dest_file)
+        replace_shot_video_with_archive(tmp_target, dest_file)
         return dest_file
 
 

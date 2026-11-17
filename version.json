@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.2",
+  "version": "2026.11.17.3",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T10:43:44+08:00",
-  "changelog": "自检修复桌面一镜一对话切换请求头、runtime 心跳诊断、cli_bridge 空转与自检防重跑问题",
+  "publishedAt": "2026-11-17T11:32:01+08:00",
+  "changelog": "新增视频历史版本归档与切换、修复生成新样片时已出样片标志误显示、支持全视频原生分辨率逐帧截图并一键加为参考图",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

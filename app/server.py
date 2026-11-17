@@ -150,6 +150,12 @@ class AgentPresenceTracker:
         expired = [k for k, v in self._watchers.items() if now >= float(v.get("expiresAt", 0.0))]
         for k in expired:
             self._watchers.pop(k, None)
+        if not any(w.get("mode") == "desktop" for w in self._watchers.values()):
+            self._desktop_meta["busy"] = False
+            self._desktop_meta["activeShotIds"] = []
+        if not any(w.get("mode") == "bridge" for w in self._watchers.values()):
+            self._bridge_meta["busy"] = False
+            self._bridge_meta["activeShotIds"] = []
         expired_workers = [
             sid for sid, w in self._shot_workers.items() if now - float(w.get("heartbeatMono", now)) >= 45.0
         ]

@@ -12,7 +12,7 @@
     <link rel="manifest" href="/static/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/static/icon-192.png" />
     <link rel="icon" type="image/png" href="/static/icon-192.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=32" />
+    <link rel="stylesheet" href="/static/styles.css?v=33" />
   </head>
   <body>
     <div class="app-shell">
@@ -338,6 +338,12 @@
           </div>
         </div>
 
+        <div id="lightboxVideoTools" class="lightbox-video-tools hidden">
+          <button id="lightboxStepBackBtn" type="button" class="btn btn-secondary btn-xs" title="后退 1 帧 (约 0.04s)">◀ -1帧</button>
+          <button id="lightboxStepFwdBtn" type="button" class="btn btn-secondary btn-xs" title="前进 1 帧 (约 0.04s)">+1帧 ▶</button>
+          <button id="lightboxCaptureBtn" type="button" class="btn btn-primary btn-xs" title="按视频原生分辨率截取当前画面">📸 截当前帧</button>
+        </div>
+        <div id="lightboxCaptureBar" class="lightbox-capture-bar hidden"></div>
         <div id="lightboxCaption" class="lightbox-caption"></div>
       </div>
     </div>
@@ -345,6 +351,6 @@
     <datalist id="sceneDatalist"></datalist>
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=32" type="module"></script>
+    <script src="/static/app.js?v=33" type="module"></script>
   </body>
 </html>

@@ -10,7 +10,7 @@ const STATUS_META = {
   needs_confirmation: { label: "待确认", cls: "pill-orange" },
   ready_on_canvas: { label: "已就绪", cls: "pill-ready" },
   prompt_update_requested: { label: "待更新提示词", cls: "pill-purple" },
-  run_requested: { label: "待运行", cls: "pill-purple" },
+  run_requested: { label: "待生成样片", cls: "pill-purple" },
   draft_ready: { label: "已出样片", cls: "pill-green" },
   feedback_queued: { label: "待修改", cls: "pill-orange" },
   final_requested: { label: "转正片中", cls: "pill-purple" },
@@ -28,6 +28,16 @@ function isFinalInProgress(shot) {
     st === "final_requested" ||
       (st === "processing" && shot.processingTaskType === "final_requested") ||
       (["queued", "processing", "needs_confirmation"].includes(st) && pendingAction === "promote_1080p")
+  );
+}
+
+function isDraftInProgress(shot) {
+  if (!shot) return false;
+  if (typeof shot.isDraftInProgress === "boolean") return shot.isDraftInProgress;
+  const st = shot.status;
+  return Boolean(
+    st === "run_requested" ||
+      (st === "processing" && shot.processingTaskType === "run_requested")
   );
 }
 
@@ -95,6 +105,12 @@ function getDisplayStatusMeta(shot) {
       return { label: "正片·待确认", cls: "pill-orange" };
     }
     return { label: "转正片中", cls: "pill-purple" };
+  }
+  if (isDraftInProgress(shot)) {
+    return {
+      label: shot.status === "processing" ? "生成样片中" : "待生成样片",
+      cls: "pill-purple",
+    };
   }
   if (isPassedFinal(shot)) {
     return STATUS_META.final_ready;
@@ -197,8 +213,11 @@ const state = {
     whiteoutParts: [],
     whiteoutTarget: "",
     compareSource: false,
-    previewVersion: "auto", // "auto" | "draft" | "final"
+    previewVersion: "auto", // "auto" | "draft" | "final" | <videoVersion.id>
   },
+  videoCapture: null,
+  historyCapture: null,
+  lightboxCapture: null,
 };
 
 function escapeHtml(str) {
@@ -363,7 +382,8 @@ function getBuilderItemPresetId(it) {
 function withMediaVersion(url, obj) {
   const raw = String(url || "").trim();
   if (!raw || raw.startsWith("blob:") || raw.startsWith("data:")) return raw;
-  const ver = obj?.whiteoutVersion || obj?.meta?.bytes || "";
+  const shaVer = obj?.sha256 ? String(obj.sha256).slice(0, 10) : "";
+  const ver = obj?.whiteoutVersion || obj?.versionToken || shaVer || obj?.meta?.bytes || obj?.downloadedAt || "";
   if (!ver) return raw;
   return `${raw}${raw.includes("?") ? "&" : "?"}v=${encodeURIComponent(String(ver))}`;
 }
@@ -1736,6 +1756,193 @@ function bindPaintModalEvents() {
   });
 }
 
+function setCapturedSlot(slotKey, cap) {
+  const prev = state[slotKey];
+  if (prev?.url?.startsWith("blob:")) {
+    URL.revokeObjectURL(prev.url);
+  }
+  state[slotKey] = cap || null;
+}
+
+function formatCaptureTime(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const mins = Math.floor(s / 60);
+  const rem = s - mins * 60;
+  const whole = Math.floor(rem);
+  const cs = Math.min(99, Math.round((rem - whole) * 100));
+  return `${String(mins).padStart(2, "0")}:${String(whole).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+}
+
+function stepVideoFrame(videoEl, deltaSec) {
+  if (!videoEl || !Number.isFinite(videoEl.duration || 0)) return false;
+  videoEl.pause();
+  const dur = Number.isFinite(videoEl.duration) ? videoEl.duration : 9999;
+  const next = Math.max(0, Math.min(dur, (videoEl.currentTime || 0) + deltaSec));
+  videoEl.currentTime = next;
+  return true;
+}
+
+async function captureVideoFrameFromEl(videoEl, { shotId = "", tag = "frame", title = "视频截图" } = {}) {
+  if (!videoEl || videoEl.readyState < 2 || !videoEl.videoWidth || !videoEl.videoHeight) {
+    showToast("视频帧尚未加载完成，请先播放或拖动到目标画面再截图");
+    return null;
+  }
+  videoEl.pause();
+  const w = videoEl.videoWidth;
+  const h = videoEl.videoHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(videoEl, 0, 0, w, h);
+
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!blob) {
+    showToast("生成 PNG 截图失败");
+    return null;
+  }
+  const curSec = Number(videoEl.currentTime || 0);
+  const mins = Math.floor(curSec / 60);
+  const secs = Math.floor(curSec % 60);
+  const ms = Math.min(999, Math.round((curSec - Math.floor(curSec)) * 1000));
+  const safePrefix = String(shotId || "video").replace(/[^A-Za-z0-9_-]+/g, "_") || "video";
+  const safeTag = String(tag || "frame").replace(/[^A-Za-z0-9_-]+/g, "_") || "frame";
+  const filename = `${safePrefix}_${safeTag}_${String(mins).padStart(2, "0")}m${String(secs).padStart(2, "0")}s${String(ms).padStart(3, "0")}.png`;
+  const file = new File([blob], filename, { type: "image/png" });
+  const url = URL.createObjectURL(blob);
+  return {
+    id: uid(),
+    shotId,
+    tag,
+    title,
+    blob,
+    file,
+    url,
+    filename,
+    width: w,
+    height: h,
+    currentTime: curSec,
+    timeLabel: formatCaptureTime(curSec),
+  };
+}
+
+async function copyCapturedImageToClipboard(cap) {
+  if (!cap?.blob) return false;
+  try {
+    if (navigator.clipboard && window.ClipboardItem) {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": cap.blob })]);
+      showToast("已复制高清截图到剪贴板");
+      return true;
+    }
+  } catch {}
+  showToast("浏览器限制了剪贴板写入图片，请点「⬇ 下载 PNG」或直接点「＋ 加为参考图」");
+  return false;
+}
+
+function refreshDetailFeedbackAttachDom() {
+  const wrap = document.getElementById("fbAttachPreviewWrap");
+  const shot = (state.data?.shots || []).find((s) => s.id === state.selectedShotId);
+  if (wrap) {
+    wrap.innerHTML = renderFeedbackAttachmentsHtml();
+    wrap.querySelectorAll("[data-remove-fb-att]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.removeFbAtt);
+        const removed = state.detailDraft.attachments.splice(idx, 1)[0];
+        if (removed?.url?.startsWith("blob:")) URL.revokeObjectURL(removed.url);
+        refreshDetailFeedbackAttachDom();
+      });
+    });
+  }
+  if (shot) {
+    const mentionItems = buildDetailMentionAssets(shot);
+    state.detailPromptEditor?.syncAssets(mentionItems);
+    state.fbCommentEditor?.syncAssets(mentionItems);
+  }
+}
+
+function appendFilesToActiveDraft(files) {
+  const valid = Array.from(files || []).filter((f) => isImageFile(f) || isVideoFile(f));
+  if (!valid.length) return false;
+  if (state.view === "detail") {
+    for (const f of valid) {
+      state.detailDraft.attachments.push({
+        id: uid(),
+        file: f,
+        url: URL.createObjectURL(f),
+        kind: isVideoFile(f) ? "video" : "image",
+        name: f.name,
+      });
+    }
+    refreshDetailFeedbackAttachDom();
+    document.getElementById("fbDropzone")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    showToast("已加入修改意见参考图（可用 @新图 引用）");
+    return true;
+  }
+  if (state.view === "builder") {
+    const imgs = valid.filter(isImageFile);
+    if (imgs.length) {
+      addBuilderImageFiles(imgs);
+      showToast("已加入新建镜头的参考图");
+      return true;
+    }
+  }
+  return false;
+}
+
+function renderCaptureTrayHtml(cap, { prefix = "review", dark = false } = {}) {
+  if (!cap) return "";
+  const refBtnLabel = state.view === "detail" ? "＋ 加为修改参考图" : "＋ 加为构图参考图";
+  return `
+    <div class="${dark ? "lightbox-capture-bar" : "video-capture-tray"}" data-capture-tray="${prefix}">
+      <div class="video-capture-info">
+        <img
+          class="video-capture-thumb"
+          src="${escapeHtml(cap.url)}"
+          alt="${escapeHtml(cap.filename)}"
+          data-zoom-url="${escapeHtml(cap.url)}"
+          data-zoom-kind="image"
+          data-zoom-caption="${escapeHtml(`${cap.title} · ${cap.timeLabel} (${cap.width}×${cap.height})`)}"
+        />
+        <div class="video-capture-meta">
+          <div class="video-capture-title">📸 ${escapeHtml(cap.title)} · ${escapeHtml(cap.timeLabel)}</div>
+          <div class="video-capture-sub">${cap.width}×${cap.height} PNG · ${escapeHtml(cap.filename)}</div>
+        </div>
+      </div>
+      <div class="video-capture-actions">
+        <button type="button" class="btn btn-primary btn-xs" data-cap-add-ref="${prefix}">${refBtnLabel}</button>
+        <button type="button" class="btn btn-secondary btn-xs" data-cap-copy="${prefix}">📋 复制图片</button>
+        <a class="btn btn-secondary btn-xs" href="${escapeHtml(cap.url)}" download="${escapeHtml(cap.filename)}">⬇ 下载 PNG</a>
+        <button type="button" class="btn btn-secondary btn-xs" data-cap-close="${prefix}" title="收起">✕</button>
+      </div>
+    </div>
+  `;
+}
+
+function bindCaptureTrayEvents(rootEl, slotKey, prefix, { closeHistoryOnAdd = false, closeLightboxOnAdd = false } = {}) {
+  if (!rootEl) return;
+  const cap = state[slotKey];
+  if (!cap) return;
+  rootEl.querySelector(`[data-cap-copy="${prefix}"]`)?.addEventListener("click", () => {
+    copyCapturedImageToClipboard(state[slotKey]);
+  });
+  rootEl.querySelector(`[data-cap-add-ref="${prefix}"]`)?.addEventListener("click", () => {
+    const cur = state[slotKey];
+    if (!cur?.file) return;
+    if (appendFilesToActiveDraft([cur.file])) {
+      if (closeLightboxOnAdd) closeLightbox();
+      if (closeHistoryOnAdd) closeHistoryModal();
+    }
+  });
+  rootEl.querySelector(`[data-cap-close="${prefix}"]`)?.addEventListener("click", () => {
+    setCapturedSlot(slotKey, null);
+    rootEl.innerHTML = "";
+    if (rootEl.classList.contains("lightbox-capture-bar")) {
+      rootEl.classList.add("hidden");
+    }
+  });
+}
+
 function openLightbox(url, kind, caption) {
   if (!url) return;
   const modal = document.getElementById("lightboxModal");
@@ -1745,6 +1952,8 @@ function openLightbox(url, kind, caption) {
   const imgEl = document.getElementById("lightboxImg");
   const vidEl = document.getElementById("lightboxVideo");
   const capEl = document.getElementById("lightboxCaption");
+  const vidTools = document.getElementById("lightboxVideoTools");
+  const vidCaptureBar = document.getElementById("lightboxCaptureBar");
   const closeImgBtn = document.getElementById("closeLightboxBtn");
 
   paintState.openToken += 1;
@@ -1754,6 +1963,11 @@ function openLightbox(url, kind, caption) {
   viewport.classList.add("hidden");
   closeImgBtn.classList.remove("hidden");
   capEl.classList.remove("hidden");
+  setCapturedSlot("lightboxCapture", null);
+  if (vidCaptureBar) {
+    vidCaptureBar.innerHTML = "";
+    vidCaptureBar.classList.add("hidden");
+  }
 
   vidEl.pause();
   vidEl.removeAttribute("src");
@@ -1762,10 +1976,12 @@ function openLightbox(url, kind, caption) {
   if (kind === "video") {
     imgEl.hidden = true;
     vidEl.hidden = false;
+    vidTools?.classList.remove("hidden");
     vidEl.src = url;
     vidEl.play().catch(() => {});
   } else {
     vidEl.hidden = true;
+    vidTools?.classList.add("hidden");
     imgEl.hidden = false;
     imgEl.src = url;
   }
@@ -1781,6 +1997,8 @@ function closeLightbox() {
   const imgEl = document.getElementById("lightboxImg");
   const vidEl = document.getElementById("lightboxVideo");
   const ring = document.getElementById("paintCursorRing");
+  const vidTools = document.getElementById("lightboxVideoTools");
+  const vidCaptureBar = document.getElementById("lightboxCaptureBar");
 
   paintState.openToken += 1;
   paintState.isPaint = false;
@@ -1799,6 +2017,12 @@ function closeLightbox() {
   toolbar.classList.add("hidden");
   viewport.classList.add("hidden");
   ring?.classList.add("hidden");
+  vidTools?.classList.add("hidden");
+  setCapturedSlot("lightboxCapture", null);
+  if (vidCaptureBar) {
+    vidCaptureBar.innerHTML = "";
+    vidCaptureBar.classList.add("hidden");
+  }
   document.getElementById("closeLightboxBtn")?.classList.remove("hidden");
   document.getElementById("lightboxCaption")?.classList.remove("hidden");
 
@@ -4677,6 +4901,7 @@ function syncDetailDraftForShot(shot) {
   const serverPrompt = shot.pendingPromptEdit || shot.promptText || shot.userPrompt || "";
   if (state.detailDraft.shotId !== shot.id) {
     clearDetailDraftAttachments();
+    setCapturedSlot("videoCapture", null);
     state.detailDraft = {
       shotId: shot.id,
       lastSyncedPrompt: serverPrompt,
@@ -4879,6 +5104,26 @@ function getEffectiveShotChangeInfo(shot) {
       badgeCls: "is-changed",
       badgeText: hasDraft ? "● 提示词已修改，待同步" : "● 提示词已修改",
       badgeTitle: shot?.generationChangeSummary || "提示词有本地未同步修改",
+    };
+  }
+  if (isFinalInProgress(shot)) {
+    return {
+      hasChanges: false,
+      hasDraft,
+      dirty: false,
+      badgeCls: "is-changed",
+      badgeText: "⏳ 正在转为 1080P 正片",
+      badgeTitle: "正在云端转为 1080P 正片并归档",
+    };
+  }
+  if (isDraftInProgress(shot)) {
+    return {
+      hasChanges: false,
+      hasDraft,
+      dirty: false,
+      badgeCls: "is-changed",
+      badgeText: "⏳ 正在生成新版 480P 样片",
+      badgeTitle: "正在云端生成新版 480P 样片，完成后将自动刷新并保留历史版本",
     };
   }
   if (!hasDraft || shot?.generationChangeState === "never_generated") {
@@ -5091,24 +5336,103 @@ function renderShotActionBarHtml(shot) {
   `;
 }
 
+function resolveShotVideoVersions(shot) {
+  const draftVid = shot.draftVideo?.mediaUrl ? shot.draftVideo : null;
+  const finalVid = shot.finalVideo?.mediaUrl ? shot.finalVideo : null;
+  const raw = Array.isArray(shot.videoVersions) && shot.videoVersions.length ? shot.videoVersions : [];
+  let list = raw.filter((v) => v && v.mediaUrl).map((v) => ({ ...v }));
+  if (!list.length) {
+    if (finalVid) {
+      list.push({
+        id: "cur_1080p",
+        role: "1080p",
+        isCurrent: true,
+        ...finalVid,
+        downloadName: shot.downloadName1080p || buildClientDownloadFilename(shot, "1080p"),
+      });
+    }
+    if (draftVid) {
+      list.push({
+        id: "cur_480p",
+        role: "480p",
+        isCurrent: true,
+        ...draftVid,
+        downloadName: shot.downloadName480p || buildClientDownloadFilename(shot, "480p"),
+      });
+    }
+  }
+  const roleTotals = { "480p": 0, "1080p": 0 };
+  for (const item of list) {
+    const r = item.role === "1080p" ? "1080p" : "480p";
+    item.role = r;
+    roleTotals[r] += 1;
+  }
+  const roleSeen = { "480p": 0, "1080p": 0 };
+  const draftInProg = isDraftInProgress(shot);
+  const outdatedFinal = isOutdatedFinal(shot);
+  for (const item of list) {
+    const r = item.role;
+    const totalForRole = roleTotals[r];
+    const verSeq = totalForRole - roleSeen[r];
+    roleSeen[r] += 1;
+    const shortTs = item.downloadedAt ? String(item.downloadedAt).slice(5, 16) : "";
+    if (r === "1080p") {
+      item.shortLabel = item.isCurrent
+        ? outdatedFinal
+          ? "旧版 1080P 归档"
+          : "最新 1080P 正片"
+        : `历史 1080P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`;
+    } else {
+      item.shortLabel = item.isCurrent
+        ? draftInProg
+          ? `上一版 480P${shortTs ? ` · ${shortTs}` : ""}`
+          : totalForRole > 1
+          ? `最新 480P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`
+          : "480P 样片"
+        : `历史 480P v${verSeq}${shortTs ? ` · ${shortTs}` : ""}`;
+    }
+  }
+  return list;
+}
+
 function renderVideoReviewCard(shot) {
   const draftVid = shot.draftVideo?.mediaUrl ? shot.draftVideo : null;
   const finalVid = shot.finalVideo?.mediaUrl ? shot.finalVideo : null;
-  const hasBoth = Boolean(draftVid && finalVid);
+  const versions = resolveShotVideoVersions(shot);
+  const draftInProgress = isDraftInProgress(shot);
+  const finalInProgress = isFinalInProgress(shot);
   const outdatedFinal = isOutdatedFinal(shot);
   const draftRefreshed = Boolean(shot.draftUpdatedSinceFinalReopen);
   const changeInfo = getEffectiveShotChangeInfo(shot);
-  let activeVer = state.detailDraft.previewVersion;
-  if (activeVer === "auto") {
-    activeVer = finalVid && !(outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)) ? "final" : "draft";
-  }
-  if (activeVer === "final" && !finalVid) activeVer = "draft";
-  if (activeVer === "draft" && !draftVid) activeVer = "final";
 
-  const activeVid = activeVer === "final" ? finalVid : draftVid;
-  const draftTabLabel = outdatedFinal && draftRefreshed ? "新版 480P 样片" : "480P 样片";
+  let selectedVer = state.detailDraft.previewVersion;
+  let activeEntry = versions.find((v) => v.id === selectedVer) || null;
+  if (!activeEntry) {
+    if (selectedVer === "final") {
+      activeEntry = versions.find((v) => v.role === "1080p" && v.isCurrent) || versions.find((v) => v.role === "1080p");
+    } else if (selectedVer === "draft") {
+      activeEntry = versions.find((v) => v.role === "480p" && v.isCurrent) || versions.find((v) => v.role === "480p");
+    }
+  }
+  if (!activeEntry) {
+    const preferDraft = !finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)) || draftInProgress;
+    activeEntry = preferDraft
+      ? versions.find((v) => v.role === "480p" && v.isCurrent) || versions[0] || null
+      : versions.find((v) => v.role === "1080p" && v.isCurrent) || versions[0] || null;
+  }
+
+  const activeVid = activeEntry || (finalVid || draftVid);
+  const activeVer = activeVid ? (activeVid.role === "1080p" ? "final" : "draft") : "draft";
+  const hasBoth = Boolean(
+    versions.some((v) => v.role === "480p") && versions.some((v) => v.role === "1080p")
+  );
+  const draftTabLabel = draftInProgress
+    ? "上一版 480P（对照）"
+    : outdatedFinal && draftRefreshed
+    ? "新版 480P 样片"
+    : "480P 样片";
   const finalTabLabel = outdatedFinal ? "旧版 1080P 归档" : "1080P 正片";
-  const activeLabel = activeVer === "final" ? finalTabLabel : draftTabLabel;
+  const activeLabel = activeEntry?.shortLabel || (activeVer === "final" ? finalTabLabel : draftTabLabel);
   const srcVid = shot.sourceVideo?.mediaUrl ? shot.sourceVideo : null;
   const canCompare = Boolean(activeVid && srcVid);
   const isComparing = canCompare && Boolean(state.detailDraft.compareSource);
@@ -5122,16 +5446,32 @@ function renderVideoReviewCard(shot) {
     `
     : "";
 
+  const versionStripHtml =
+    versions.length > 1
+      ? `
+        <div class="video-version-strip" role="group" aria-label="生成视频历史版本切换">
+          <span class="video-version-strip-label">视频版本 (${versions.length})</span>
+          ${versions
+            .map((ver) => {
+              const isSel = activeEntry && ver.id === activeEntry.id;
+              const titleText = [ver.downloadedAt, ver.revisionDirection].filter(Boolean).join(" · ");
+              return `<button type="button" class="video-ver-chip${isSel ? " is-active" : ""}" data-preview-ver="${escapeHtml(ver.id)}" title="${escapeHtml(titleText || ver.shortLabel)}">${escapeHtml(ver.shortLabel)}</button>`;
+            })
+            .join("")}
+        </div>
+      `
+      : "";
+
   const isSteadyVideoState = ["draft_ready", "final_ready", "final_done"].includes(shot.status);
   const summaryHtml =
-    shot.agentSummary && (!activeVid || !isSteadyVideoState)
+    shot.agentSummary && (!activeVid || (!isSteadyVideoState && !draftInProgress && !finalInProgress))
       ? `<div class="video-review-summary">${escapeHtml(shot.agentSummary)}</div>`
       : "";
 
   if (!activeVid) {
     const platLabel = getPlatformLabel(shot.platform);
     let hintText = "点击上方「▶ 生成样片」后，成片会自动下载到这里供看片。";
-    if (shot.status === "run_requested" || (shot.status === "processing" && shot.processingTaskType === "run_requested")) {
+    if (draftInProgress) {
       hintText = "已触发生成，Agent 正在等待出片并下载到本地…";
     } else if (shot.status === "prompt_update_requested") {
       hintText = `已记录修改后的提示词，正在同步到 ${platLabel} 画布…`;
@@ -5143,6 +5483,7 @@ function renderVideoReviewCard(shot) {
         <div class="card-head">
           <div class="card-title-group">
             <h2 class="card-title">成片看片</h2>
+            ${draftInProgress ? `<span class="pill pill-purple">⏳ 生成样片中</span>` : ""}
           </div>
         </div>
         <div style="font-size:12.5px;color:var(--text-secondary);line-height:1.55;">${escapeHtml(hintText)}</div>
@@ -5153,18 +5494,20 @@ function renderVideoReviewCard(shot) {
 
   const metaStr = formatVideoMetaText(activeVid);
   const srcMetaStr = formatVideoMetaText(srcVid);
-  const finalInProgress = isFinalInProgress(shot);
   const passed = isPassedFinal(shot);
   const canApproveFinal = Boolean(
     draftVid &&
+      !draftInProgress &&
       !finalInProgress &&
       !passed &&
       (!finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)))
   );
   const downloadName =
-    activeVer === "final"
+    activeVid.downloadName ||
+    (activeVer === "final"
       ? shot.downloadName1080p || buildClientDownloadFilename(shot, "1080p")
-      : shot.downloadName480p || buildClientDownloadFilename(shot, "480p");
+      : shot.downloadName480p || buildClientDownloadFilename(shot, "480p"));
+  const activeVideoSrc = withMediaVersion(activeVid.mediaUrl, activeVid);
   const downloadHref = `${activeVid.mediaUrl}${
     String(activeVid.mediaUrl || "").includes("?") ? "&" : "?"
   }download_name=${encodeURIComponent(downloadName)}`;
@@ -5187,6 +5530,9 @@ function renderVideoReviewCard(shot) {
       : finalVid && syncStatus === "needs_sync" && syncTargetDir
       ? `<div class="local-sync-status-line is-needs-sync">⚠ 本地成片待同步更新：<code>${escapeHtml(syncTargetDir)}/${escapeHtml(shot.downloadName1080p || downloadName)}</code></div>`
       : "";
+  const draftProgressBannerHtml = draftInProgress
+    ? `<div class="draft-progress-banner">⏳ <strong>正在生成新版 480P 样片</strong>：${escapeHtml(shot.agentSummary || "已提交生成请求，下方为旧版对照；新版出片下载完成后将自动切换并归档旧版。")}</div>`
+    : "";
   const finalProgressBannerHtml = finalInProgress
     ? `<div class="final-progress-banner">⏳ <strong>正在转为 1080P 正片</strong>：${escapeHtml(shot.agentSummary || "已提交转正片队列，完成后将自动归档并标为「已过条」，无需重复点击。")}</div>`
     : "";
@@ -5212,17 +5558,45 @@ function renderVideoReviewCard(shot) {
     ? `<span class="outdated-final-badge" title="请先按新修改重新生成 480P 样片后再重新转 1080P 正片">↺ 待重洗 480P 后重转正片</span>`
     : "";
 
+  const headerStatusPill = draftInProgress
+    ? `<span class="pill pill-purple">⏳ 生成新样片中</span>`
+    : finalInProgress
+    ? `<span class="pill pill-purple">⏳ 转正片中</span>`
+    : `<span class="pill ${activeVer === "final" ? "pill-passed" : "pill-blue"}">${escapeHtml(activeLabel)}</span>`;
+  const captureButtonsHtml = isComparing
+    ? `
+      <div class="video-frame-step-group">
+        <button id="reviewStepBackBtn" class="btn btn-secondary btn-xs" type="button" title="后退 1 帧 (约 0.04s)">◀ -1帧</button>
+        <button id="reviewStepFwdBtn" class="btn btn-secondary btn-xs" type="button" title="前进 1 帧 (约 0.04s)">+1帧 ▶</button>
+      </div>
+      <button id="captureSourceVideoBtn" class="btn btn-secondary btn-sm" type="button" title="截取左侧原片当前帧">📸 截原片帧</button>
+      <button id="captureActiveVideoBtn" class="btn btn-secondary btn-sm" type="button" title="截取右侧成片当前帧">📸 截成片帧</button>
+    `
+    : `
+      <div class="video-frame-step-group">
+        <button id="reviewStepBackBtn" class="btn btn-secondary btn-xs" type="button" title="后退 1 帧 (约 0.04s)">◀ -1帧</button>
+        <button id="reviewStepFwdBtn" class="btn btn-secondary btn-xs" type="button" title="前进 1 帧 (约 0.04s)">+1帧 ▶</button>
+      </div>
+      <button id="captureActiveVideoBtn" class="btn btn-secondary btn-sm" type="button" title="按原生分辨率截取当前视频帧（可保存 PNG / 复制 / 一键加为参考图）">📸 截当前帧</button>
+    `;
+  const captureTrayHtml =
+    state.videoCapture && (!state.videoCapture.shotId || state.videoCapture.shotId === shot.id)
+      ? renderCaptureTrayHtml(state.videoCapture, { prefix: "review" })
+      : "";
+
   return `
     <section class="card">
       <div class="card-head">
         <div class="card-title-group">
           <h2 class="card-title">成片看片</h2>
-          <span class="pill ${activeVer === "final" ? "pill-passed" : "pill-blue"}">${activeLabel}</span>
+          ${headerStatusPill}
         </div>
         ${versionTabsHtml}
       </div>
 
+      ${draftProgressBannerHtml}
       ${finalProgressBannerHtml}
+      ${versionStripHtml}
 
       <div class="video-review-grid ${isComparing ? "is-compare" : ""}">
         ${
@@ -5240,15 +5614,16 @@ function renderVideoReviewCard(shot) {
         }
         <div class="video-review-slot">
           ${
-            isComparing
-              ? `<div class="video-review-slot-head"><span>${activeLabel}</span>${metaStr ? `<span class="video-review-slot-meta">${escapeHtml(metaStr)}</span>` : ""}</div>`
+            isComparing || !activeEntry?.isCurrent
+              ? `<div class="video-review-slot-head"><span>${escapeHtml(activeLabel)}</span>${metaStr ? `<span class="video-review-slot-meta">${escapeHtml(metaStr)}</span>` : ""}</div>`
               : ""
           }
-          <video id="reviewActiveVideo" class="video-review-player" controls playsinline preload="metadata" src="${escapeHtml(activeVid.mediaUrl)}"></video>
+          <video id="reviewActiveVideo" class="video-review-player" controls playsinline preload="metadata" src="${escapeHtml(activeVideoSrc)}"></video>
         </div>
       </div>
 
-      ${!isComparing && metaStr ? `<div class="video-review-meta">${escapeHtml(metaStr)}</div>` : ""}
+      ${!isComparing && activeEntry?.isCurrent && metaStr ? `<div class="video-review-meta">${escapeHtml(metaStr)}</div>` : ""}
+      ${activeEntry && !activeEntry.isCurrent && activeEntry.revisionDirection ? `<div class="video-review-meta">该版备注：${escapeHtml(activeEntry.revisionDirection)}</div>` : ""}
       ${localSyncBannerHtml}
       ${passedBannerHtml}
       ${summaryHtml}
@@ -5265,6 +5640,7 @@ function renderVideoReviewCard(shot) {
               ? `<button id="syncPlayCompareBtn" class="btn btn-secondary btn-sm" type="button">▶ 同步播放</button>`
               : ""
           }
+          ${captureButtonsHtml}
           <a id="downloadActiveVideoBtn" class="btn btn-secondary btn-sm" href="${escapeHtml(downloadHref)}" download="${escapeHtml(downloadName)}" title="保存为 ${escapeHtml(downloadName)}">↓ 下载</a>
           <button id="renameDownloadShotBtn" class="btn btn-secondary btn-sm" type="button" data-download-ver="${escapeHtml(activeVer)}" title="设置或修改镜头名称（自动应用到下载文件名与本地目录文件）">✎ 重命名</button>
           ${localSyncBtnHtml}
@@ -5272,6 +5648,7 @@ function renderVideoReviewCard(shot) {
         </div>
         ${finalActionHtml}
       </div>
+      <div id="videoCaptureTrayWrap">${captureTrayHtml}</div>
     </section>
   `;
 }
@@ -5492,22 +5869,7 @@ function bindDetailEvents(shot) {
     },
   });
 
-  const refreshAttachPreview = () => {
-    fbPreviewWrap.innerHTML = renderFeedbackAttachmentsHtml();
-    fbPreviewWrap.querySelectorAll("[data-remove-fb-att]").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const idx = Number(btn.dataset.removeFbAtt);
-        const removed = state.detailDraft.attachments.splice(idx, 1)[0];
-        if (removed?.url?.startsWith("blob:")) URL.revokeObjectURL(removed.url);
-        refreshAttachPreview();
-      });
-    });
-    const mentionItems = buildDetailMentionAssets(shot);
-    state.detailPromptEditor?.syncAssets(mentionItems);
-    state.fbCommentEditor?.syncAssets(mentionItems);
-  };
-  refreshAttachPreview();
+  refreshDetailFeedbackAttachDom();
 
   const addFeedbackFiles = (fileList) => {
     const files = Array.from(fileList || []).filter((f) => isImageFile(f) || isVideoFile(f));
@@ -5521,7 +5883,7 @@ function bindDetailEvents(shot) {
         name: f.name,
       });
     }
-    refreshAttachPreview();
+    refreshDetailFeedbackAttachDom();
   };
 
   bindDropzoneEl(fbDropEl, fbFilesEl, addFeedbackFiles, { clickToOpen: false });
@@ -5788,6 +6150,49 @@ function bindDetailEvents(shot) {
       state.detailDraft.previewVersion = btn.dataset.previewVer;
       renderDetailView();
     });
+  });
+
+  const handleReviewStep = (deltaSec) => {
+    const actEl = document.getElementById("reviewActiveVideo");
+    const srcEl = document.getElementById("compareSourceVideo");
+    stepVideoFrame(actEl, deltaSec);
+    if (srcEl) stepVideoFrame(srcEl, deltaSec);
+  };
+  document.getElementById("reviewStepBackBtn")?.addEventListener("click", () => handleReviewStep(-1 / 24));
+  document.getElementById("reviewStepFwdBtn")?.addEventListener("click", () => handleReviewStep(1 / 24));
+
+  const renderDetailCaptureTray = () => {
+    const wrap = document.getElementById("videoCaptureTrayWrap");
+    if (!wrap) return;
+    wrap.innerHTML = renderCaptureTrayHtml(state.videoCapture, { prefix: "review" });
+    bindCaptureTrayEvents(wrap, "videoCapture", "review");
+  };
+  renderDetailCaptureTray();
+
+  document.getElementById("captureActiveVideoBtn")?.addEventListener("click", async () => {
+    const actEl = document.getElementById("reviewActiveVideo");
+    const cap = await captureVideoFrameFromEl(actEl, {
+      shotId: shot.id,
+      tag: "preview",
+      title: "成片截图",
+    });
+    if (!cap) return;
+    setCapturedSlot("videoCapture", cap);
+    renderDetailCaptureTray();
+    showToast(`已截取成片帧 ${cap.timeLabel}（${cap.width}×${cap.height}）`);
+  });
+
+  document.getElementById("captureSourceVideoBtn")?.addEventListener("click", async () => {
+    const srcEl = document.getElementById("compareSourceVideo");
+    const cap = await captureVideoFrameFromEl(srcEl, {
+      shotId: shot.id,
+      tag: "source",
+      title: "原片截图",
+    });
+    if (!cap) return;
+    setCapturedSlot("videoCapture", cap);
+    renderDetailCaptureTray();
+    showToast(`已截取原片帧 ${cap.timeLabel}（${cap.width}×${cap.height}）`);
   });
 
   document.getElementById("approveFinalBtn")?.addEventListener("click", async () => {
@@ -6199,6 +6604,7 @@ function openHistoryModal(shot, preferredVersionId = null) {
 }
 
 function closeHistoryModal() {
+  setCapturedSlot("historyCapture", null);
   document.getElementById("historyModal")?.classList.add("hidden");
   state.historyModal.open = false;
 }
@@ -6341,8 +6747,12 @@ function renderHistoryModal() {
       selected.draftVideoUrl
         ? `
           <div class="history-section">
-            <div class="history-section-label">本轮对应成片${selected.draftDownloadedAt ? `（${escapeHtml(selected.draftDownloadedAt)}）` : ""}</div>
-            <video class="history-video" src="${escapeHtml(selected.draftVideoUrl)}" controls playsinline preload="metadata"></video>
+            <div class="history-section-label" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+              <span>本轮对应成片${selected.draftDownloadedAt ? `（${escapeHtml(selected.draftDownloadedAt)}）` : ""}</span>
+              <button type="button" class="btn btn-secondary btn-xs" id="historyCaptureVideoBtn">📸 截当前帧</button>
+            </div>
+            <video id="historyPreviewVideo" class="history-video" src="${escapeHtml(withMediaVersion(selected.draftVideoUrl, { downloadedAt: selected.draftDownloadedAt }))}" controls playsinline preload="metadata"></video>
+            <div id="historyCaptureTrayWrap"></div>
           </div>`
         : ""
     }
@@ -6361,9 +6771,27 @@ function renderHistoryModal() {
 
   listEl.querySelectorAll("[data-history-ver]").forEach((btn) => {
     btn.addEventListener("click", () => {
+      setCapturedSlot("historyCapture", null);
       state.historyModal.selectedVersionId = btn.dataset.historyVer;
       renderHistoryModal();
     });
+  });
+
+  document.getElementById("historyCaptureVideoBtn")?.addEventListener("click", async () => {
+    const hvEl = document.getElementById("historyPreviewVideo");
+    const cap = await captureVideoFrameFromEl(hvEl, {
+      shotId: shot.id,
+      tag: selected.version || "history",
+      title: `${selected.version || "历史"}成片截图`,
+    });
+    if (!cap) return;
+    setCapturedSlot("historyCapture", cap);
+    const hWrap = document.getElementById("historyCaptureTrayWrap");
+    if (hWrap) {
+      hWrap.innerHTML = renderCaptureTrayHtml(cap, { prefix: "history" });
+      bindCaptureTrayEvents(hWrap, "historyCapture", "history", { closeHistoryOnAdd: true });
+    }
+    showToast(`已截取历史视频帧 ${cap.timeLabel}（${cap.width}×${cap.height}）`);
   });
 
   document.getElementById("copyHistoryPromptBtn")?.addEventListener("click", async () => {
@@ -7227,6 +7655,29 @@ function bindGlobalEvents() {
 
   // Lightbox & Paint Canvas modal
   bindPaintModalEvents();
+  document.getElementById("lightboxStepBackBtn")?.addEventListener("click", () => {
+    stepVideoFrame(document.getElementById("lightboxVideo"), -1 / 24);
+  });
+  document.getElementById("lightboxStepFwdBtn")?.addEventListener("click", () => {
+    stepVideoFrame(document.getElementById("lightboxVideo"), 1 / 24);
+  });
+  document.getElementById("lightboxCaptureBtn")?.addEventListener("click", async () => {
+    const vidEl = document.getElementById("lightboxVideo");
+    const cap = await captureVideoFrameFromEl(vidEl, {
+      shotId: state.view === "detail" ? state.selectedShotId || "shot" : state.builder.shotId || "video",
+      tag: "lightbox",
+      title: "视频截图",
+    });
+    if (!cap) return;
+    setCapturedSlot("lightboxCapture", cap);
+    const bar = document.getElementById("lightboxCaptureBar");
+    if (bar) {
+      bar.innerHTML = renderCaptureTrayHtml(cap, { prefix: "lightbox", dark: true });
+      bar.classList.remove("hidden");
+      bindCaptureTrayEvents(bar, "lightboxCapture", "lightbox", { closeLightboxOnAdd: true });
+    }
+    showToast(`已截取高清帧 ${cap.timeLabel}（${cap.width}×${cap.height}）`);
+  });
   document.getElementById("closeLightboxBtn").addEventListener("click", closeLightbox);
   document.getElementById("lightboxModal").addEventListener("click", (e) => {
     if (e.target.id === "lightboxModal" && !paintState.isDrawing && !paintState.isPanning) {
