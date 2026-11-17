@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.11",
+  "version": "2026.11.17.12",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T15:55:08+08:00",
-  "changelog": "深度优化启动引导与看片体验：监听默认延长至 8 小时 (--timeout 28800)；简化启动界面并收敛主按钮为「一键复制启动词并打开 Antigravity」，支持访达打开工作区与折叠技术细节；未监听时顶栏橙色胶囊一键直达启动界面；修复旧版标过条后版本标签顺序矛盾，并保护原有修改方向备注不被覆盖",
+  "publishedAt": "2026-11-17T17:23:05+08:00",
+  "changelog": "修复 AgentPresenceTracker 与 QueueStore 之间的 ABBA 互锁死锁（拆分独立 _token_lock、在锁外执行 record_heartbeat/snapshot 与 notify_waiters，并将 /api/health 设为 async），彻底解决并发长轮询/活动心跳触发全部工作线程卡死导致视频播放无限转圈与界面无响应问题",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

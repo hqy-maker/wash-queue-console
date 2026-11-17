@@ -157,7 +157,10 @@ class AgentPresenceTracker:
     """In-memory heartbeat & live per-shot runtime telemetry for the agy bridge pool."""
 
     def __init__(self) -> None:
-        self._lock = threading.RLock()
+        # Use a non-reentrant lock and never acquire store locks while holding it.
+        self._lock = threading.Lock()
+        # Leaf lock strictly for _active_desktop_token so store.wait_for_events abort_check never nests locks.
+        self._token_lock = threading.Lock()
         self._watchers: dict[str, dict[str, Any]] = {}
         self._active_desktop_token: str = ""
         self._shot_workers: dict[str, dict[str, Any]] = {}
@@ -234,11 +237,15 @@ class AgentPresenceTracker:
             self._prune_locked(now)
             return list(self._cancel_tokens.keys())
 
+    def _get_active_desktop_token(self) -> str:
+        with self._token_lock:
+            return self._active_desktop_token
+
     def is_desktop_token_superseded(self, token: str) -> bool:
         clean = (token or "").strip()
         if not clean:
             return False
-        with self._lock:
+        with self._token_lock:
             return bool(self._active_desktop_token and clean != self._active_desktop_token)
 
     def touch_desktop_activity(
@@ -247,19 +254,20 @@ class AgentPresenceTracker:
         active_shot_ids: list[str] | None = None,
         ttl_sec: float = 600.0,
     ) -> None:
-        with self._lock:
-            eff_ids = (
-                list(active_shot_ids)
-                if active_shot_ids is not None
-                else list(self._desktop_meta.get("activeShotIds") or [])
-            )
-            self.record_heartbeat(
-                "desktop_coordinator",
-                "desktop",
-                busy=bool(eff_ids),
-                active_shot_ids=eff_ids,
-                ttl_sec=ttl_sec,
-            )
+        if active_shot_ids is not None:
+            eff_ids = list(active_shot_ids)
+        else:
+            with self._lock:
+                eff_ids = list(self._desktop_meta.get("activeShotIds") or [])
+        # Call outside self._lock so record_heartbeat / store never nest locks.
+        self.record_heartbeat(
+            "desktop_coordinator",
+            "desktop",
+            busy=bool(eff_ids),
+            active_shot_ids=eff_ids,
+            ttl_sec=ttl_sec,
+            return_snapshot=False,
+        )
 
     def record_heartbeat(
         self,
@@ -276,6 +284,7 @@ class AgentPresenceTracker:
         shot_workers: dict[str, dict[str, Any]] | None = None,
         watcher_token: str | None = None,
         replace_token: bool = False,
+        return_snapshot: bool = True,
     ) -> dict[str, Any]:
         clean_mode = "desktop" if str(mode or "").strip().lower() == "desktop" else "bridge"
         default_wid = "desktop_coordinator" if clean_mode == "desktop" else "agy_bridge"
@@ -285,6 +294,8 @@ class AgentPresenceTracker:
         now = time.monotonic()
         wall_now = time.time()
         active_clean = [str(x).strip() for x in (active_shot_ids or []) if str(x).strip()]
+        superseded = False
+        token_replaced = False
         with self._lock:
             self._prune_locked(now)
             prev = self._watchers.get(wid) or {}
@@ -292,50 +303,60 @@ class AgentPresenceTracker:
             eff_tok = ""
             if clean_mode == "desktop":
                 clean_tok = (watcher_token or "").strip()
-                if clean_tok:
-                    if replace_token or not self._active_desktop_token:
-                        self._active_desktop_token = clean_tok
-                    elif clean_tok != self._active_desktop_token:
-                        return self.snapshot()
-                eff_tok = clean_tok or str(prev.get("watcherToken") or self._active_desktop_token or "")
-            self._watchers[wid] = {
-                "watcherId": wid,
-                "mode": clean_mode,
-                "busy": bool(busy),
-                "activeShotIds": active_clean,
-                "pid": eff_pid,
-                "watcherToken": eff_tok,
-                "expiresAt": now + ttl,
-                "updatedAt": wall_now,
-            }
-            meta = self._desktop_meta if clean_mode == "desktop" else self._bridge_meta
-            meta["busy"] = bool(busy)
-            meta["activeShotIds"] = active_clean
-            if last_conversation_id is not None:
-                meta["lastConversationId"] = str(last_conversation_id).strip()
-            if last_run_at is not None:
-                meta["lastRunAt"] = str(last_run_at).strip()
-            if last_error is not None:
-                meta["lastError"] = str(last_error).strip()
-            if isinstance(shot_workers, dict):
-                next_workers = {
-                    sid: rec
-                    for sid, rec in self._shot_workers.items()
-                    if str(rec.get("surface") or "bridge") != clean_mode
+                with self._token_lock:
+                    cur_tok = self._active_desktop_token
+                    if clean_tok:
+                        if replace_token or not cur_tok:
+                            if cur_tok and cur_tok != clean_tok:
+                                token_replaced = True
+                            self._active_desktop_token = clean_tok
+                            cur_tok = clean_tok
+                        elif clean_tok != cur_tok:
+                            superseded = True
+                    eff_tok = clean_tok or str(prev.get("watcherToken") or cur_tok or "")
+            if not superseded:
+                self._watchers[wid] = {
+                    "watcherId": wid,
+                    "mode": clean_mode,
+                    "busy": bool(busy),
+                    "activeShotIds": active_clean,
+                    "pid": eff_pid,
+                    "watcherToken": eff_tok,
+                    "expiresAt": now + ttl,
+                    "updatedAt": wall_now,
                 }
-                for k, v in shot_workers.items():
-                    if not isinstance(v, dict):
-                        continue
-                    sid = str(v.get("shotId") or k).strip()
-                    if not sid:
-                        continue
-                    rec = dict(v)
-                    rec["shotId"] = sid
-                    rec["surface"] = clean_mode
-                    rec["heartbeatMono"] = now
-                    rec["heartbeatWall"] = wall_now
-                    next_workers[sid] = rec
-                self._shot_workers = next_workers
+                meta = self._desktop_meta if clean_mode == "desktop" else self._bridge_meta
+                meta["busy"] = bool(busy)
+                meta["activeShotIds"] = active_clean
+                if last_conversation_id is not None:
+                    meta["lastConversationId"] = str(last_conversation_id).strip()
+                if last_run_at is not None:
+                    meta["lastRunAt"] = str(last_run_at).strip()
+                if last_error is not None:
+                    meta["lastError"] = str(last_error).strip()
+                if isinstance(shot_workers, dict):
+                    next_workers = {
+                        sid: rec
+                        for sid, rec in self._shot_workers.items()
+                        if str(rec.get("surface") or "bridge") != clean_mode
+                    }
+                    for k, v in shot_workers.items():
+                        if not isinstance(v, dict):
+                            continue
+                        sid = str(v.get("shotId") or k).strip()
+                        if not sid:
+                            continue
+                        rec = dict(v)
+                        rec["shotId"] = sid
+                        rec["surface"] = clean_mode
+                        rec["heartbeatMono"] = now
+                        rec["heartbeatWall"] = wall_now
+                        next_workers[sid] = rec
+                    self._shot_workers = next_workers
+        if token_replaced:
+            store.notify_waiters()
+        if not return_snapshot:
+            return {}
         return self.snapshot()
 
     def clear_watcher(self, watcher_id: str) -> None:
@@ -645,7 +666,7 @@ class AgentPresenceTracker:
             "desktopCoordinatorOnline": desktop_online,
             "desktopActiveShotIds": desktop_active_ids,
             "desktopWatcherPid": next((w.get("pid") for w in desktop_watchers if w.get("pid")), None),
-            "desktopWatcherToken": self._active_desktop_token if desktop_online else "",
+            "desktopWatcherToken": self._get_active_desktop_token() if desktop_online else "",
             "desktopLastHeartbeatAt": max((float(w.get("updatedAt") or 0.0) for w in desktop_watchers), default=0.0),
             "aiPendingCount": ai_pending_count,
             "fastpathPendingCount": fastpath_pending_count,
@@ -1275,7 +1296,7 @@ def index() -> FileResponse:
 
 
 @app.get("/api/health")
-def health() -> dict[str, Any]:
+async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "version": update_manager.current_version(),
@@ -2623,6 +2644,7 @@ def wait_events(
             pid=pid or None,
             ttl_sec=max(float(timeout or 20.0) + 15.0, 35.0),
             watcher_token=clean_tok or None,
+            return_snapshot=False,
         )
     abort_fn = (
         (lambda: agent_presence.is_desktop_token_superseded(clean_tok))
