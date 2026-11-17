@@ -1092,6 +1092,13 @@ button {
   font-weight: 650;
 }
 
+.pill-passed-480 {
+  background: rgba(13, 148, 136, 0.14);
+  color: #0f766e;
+  border: 1px solid rgba(13, 148, 136, 0.36);
+  font-weight: 650;
+}
+
 .pill-ready {
   background: var(--ready-soft);
   color: var(--ready-text);
@@ -2484,6 +2491,18 @@ button {
   color: var(--green-text);
 }
 
+.video-ver-chip.is-passed-480 {
+  border-color: rgba(13, 148, 136, 0.48);
+  color: #0f766e;
+  background: rgba(13, 148, 136, 0.09);
+}
+
+.video-ver-chip.is-passed-480.is-active {
+  background: rgba(13, 148, 136, 0.16);
+  border-color: rgba(13, 148, 136, 0.72);
+  color: #0f766e;
+}
+
 .btn.is-passed-cta {
   background: #15803d;
   border-color: #15803d;
@@ -2694,6 +2713,12 @@ button {
   margin-top: 8px;
 }
 
+.passed-status-banner.is-480p {
+  color: #115e59;
+  background: rgba(13, 148, 136, 0.09);
+  border-color: rgba(13, 148, 136, 0.32);
+}
+
 .outdated-final-banner {
   font-size: 12.5px;
   line-height: 1.5;
@@ -2716,6 +2741,12 @@ button {
   color: #047857;
   background: rgba(16, 185, 129, 0.14);
   border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.passed-lock-badge.is-480p {
+  color: #0f766e;
+  background: rgba(13, 148, 136, 0.13);
+  border-color: rgba(13, 148, 136, 0.36);
 }
 
 .outdated-final-badge {
@@ -4135,6 +4166,12 @@ button {
 .history-mini-pill.is-passed {
   background: var(--green-soft);
   color: var(--green-text);
+  font-weight: 600;
+}
+
+.history-mini-pill.is-passed-480 {
+  background: rgba(13, 148, 136, 0.14);
+  color: #0f766e;
   font-weight: 600;
 }
 

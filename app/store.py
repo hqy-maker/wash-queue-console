@@ -3339,7 +3339,11 @@ class QueueStore:
                         old_sha = _file_sha256_hex(op)
 
                 short_ver = f"{eff_role.upper()}" + (f" · {dl_at_orig}" if dl_at_orig else "")
-                mark_summary = f"手动标记历史版本过条（{short_ver}）"
+                mark_summary = (
+                    f"手动标记 480P 版本「过未转正」（{short_ver}）"
+                    if eff_role == "480p"
+                    else f"手动标记历史版本过条（{short_ver}）"
+                )
 
                 if src_path != dest:
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -3410,7 +3414,11 @@ class QueueStore:
                 shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
                 shot["lastGeneratedAt"] = dl_at_orig or now_iso()
                 shot["updatedAt"] = now_iso()
-                shot["agentSummary"] = f"已选定版本「{short_ver}」标记为过条并定版。"
+                shot["agentSummary"] = (
+                    f"已选定 480P 版本「{short_ver}」标记为「过未转正」（尚未转为 1080P 正片）。"
+                    if eff_role == "480p"
+                    else f"已选定版本「{short_ver}」标记为过条并定版。"
+                )
                 shot["latestRevisionDirection"] = mark_summary
                 shot.setdefault("revisions", []).append(
                     {"at": now_iso(), "actor": "user", "summary": mark_summary}
@@ -3435,7 +3443,11 @@ class QueueStore:
                     shot,
                     kind="history_passed",
                     actor="user",
-                    title=f"标记版本过条（{short_ver}）",
+                    title=(
+                        f"标记过未转正（{short_ver}）"
+                        if eff_role == "480p"
+                        else f"标记版本过条（{short_ver}）"
+                    ),
                     prompt_text=(shot.get("promptText") or "").strip(),
                     revision_direction=mark_summary,
                     draft_video_url=to_media_url(dest),
