@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.8",
+  "version": "2026.11.17.9",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T13:13:26+08:00",
-  "changelog": "区分 480P 与 1080P 过条状态文案与样式：选定 480P 标记过条时统一显示「过未转正」，选定 1080P 时显示「已过条」",
+  "publishedAt": "2026-11-17T13:48:15+08:00",
+  "changelog": "新增桌面主控连接启动界面：未检测到桌面 Agent 时冷启动自动弹出（附操作步骤、动态适配环境的可复制启动词与一键打开 Antigravity），接入后 1~2 秒自动关闭；支持顶栏/状态弹窗一键重开桌面对话，并修复 wash-queue-console skill 对同事版 Python 路径的兼容",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",

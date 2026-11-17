@@ -261,6 +261,15 @@ const state = {
   aiStatusOpen: false,
   agentStatus: null,
   aiActionPending: false,
+  coordinatorGuide: {
+    open: false,
+    dismissedForSession: false,
+    coldStartEvaluated: false,
+    wasOfflineWhenOpened: false,
+    copiedKey: "",
+    copyTimer: null,
+    pollTimer: null,
+  },
   serverUnreachable: false,
   updateMenuOpen: false,
   updateInfo: null,
@@ -3041,23 +3050,227 @@ async function handoffShotToDesktopApp(shotId, note = "", triggerBtn = null) {
   }
 }
 
-async function launchForegroundAppWindow(target) {
+async function launchForegroundAppWindow(target, { customToast = "" } = {}) {
   if (state.aiActionPending) return;
   state.aiActionPending = true;
   renderAiStatusPopover();
+  renderCoordinatorGuideModal();
   try {
     await apiJson("/api/system/open-antigravity", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ target }),
     });
-    showToast(target === "terminal_agy" ? "已打开独立终端前台 agy 对话" : "已唤起 Antigravity 桌面端窗口");
+    showToast(
+      customToast ||
+        (target === "terminal_agy" ? "已打开独立终端前台 agy 对话" : "已唤起 Antigravity 桌面端窗口")
+    );
   } catch (err) {
     showToast(err.message || "唤起前台窗口失败");
   } finally {
     state.aiActionPending = false;
     renderAiStatusPill();
+    renderCoordinatorGuideModal();
   }
+}
+
+function getDesktopCoordinatorGuideData(st = getAgentStatusMeta()) {
+  const srvGuide = st?.desktopCoordinatorGuide;
+  if (srvGuide && typeof srvGuide === "object" && srvGuide.promptText) {
+    return srvGuide;
+  }
+  const baseUrl = window.location?.origin || "http://127.0.0.1:8787";
+  const waitCmd = "python3 scripts/wait_next_ai_task.py --timeout 3600";
+  return {
+    baseUrl,
+    workspaceRoot: "~/Documents/洗片控制台工作区",
+    pythonBin: "python3",
+    waitCommand: waitCmd,
+    promptText:
+      "请读取 wash-queue-console 协议，专职担任洗片控制台桌面主控：\n" +
+      `1. 调用 POST ${baseUrl}/api/config/ai-dispatch-mode 将模式设为 desktop_subagent；\n` +
+      `2. 挂起运行 ${waitCmd} 保持监听；\n` +
+      `3. 收到待办后按 1~2 路并发调用 ${baseUrl}/api/agent/coordinator-claim 领单，` +
+      `为每个镜头开专属 self 子对话并调用 ${baseUrl}/api/shots/{id}/bind-conversation 绑定，` +
+      "后续同镜返工用 send_message 续接；处理完成后立刻重启 wait_next_ai_task.py 继续监听。",
+    shortTrigger: "启动洗片监听",
+    antigravityInstalled: true,
+  };
+}
+
+function syncCoordinatorGuidePollTimer() {
+  const guide = state.coordinatorGuide;
+  if (guide.open && !guide.pollTimer) {
+    guide.pollTimer = setInterval(() => {
+      refreshAgentStatus();
+    }, 1500);
+  } else if (!guide.open && guide.pollTimer) {
+    clearInterval(guide.pollTimer);
+    guide.pollTimer = null;
+  }
+}
+
+function setCoordinatorCopiedFeedback(key) {
+  const guideState = state.coordinatorGuide;
+  clearTimeout(guideState.copyTimer);
+  guideState.copiedKey = key || "";
+  renderCoordinatorGuideModal();
+  if (guideState.copiedKey) {
+    guideState.copyTimer = setTimeout(() => {
+      guideState.copiedKey = "";
+      renderCoordinatorGuideModal();
+    }, 1800);
+  }
+}
+
+function renderCoordinatorGuideModal() {
+  const modal = document.getElementById("desktopCoordinatorModal");
+  if (!modal) return;
+  const open = Boolean(state.coordinatorGuide?.open);
+  modal.classList.toggle("hidden", !open);
+  if (!open) return;
+
+  const st = getAgentStatusMeta();
+  const guide = getDesktopCoordinatorGuideData(st);
+  const isDesktopMode = (st.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent") !== "cli_bridge";
+  const online = Boolean(!state.serverUnreachable && st.desktopCoordinatorOnline);
+
+  const badge = document.getElementById("coordinatorStatusBadge");
+  const badgeText = document.getElementById("coordinatorStatusBadgeText");
+  const titleEl = document.getElementById("coordinatorModalTitle");
+  const leadEl = document.getElementById("coordinatorLeadBanner");
+  const wsEl = document.getElementById("coordinatorWorkspaceCode");
+  const promptEl = document.getElementById("coordinatorPromptInput");
+  const baseUrlEl = document.getElementById("coordinatorBaseUrlText");
+  const pyEl = document.getElementById("coordinatorPythonText");
+  const liveConnEl = document.getElementById("coordinatorLiveConnText");
+  const pollHintEl = document.getElementById("coordinatorPollHint");
+  const copyWsBtn = document.getElementById("copyCoordinatorWorkspaceBtn");
+  const copyPromptBtn = document.getElementById("copyCoordinatorPromptBtn");
+  const copyShortBtn = document.getElementById("copyCoordinatorShortTriggerBtn");
+  const openAgyBtn = document.getElementById("openCoordinatorAntigravityBtn");
+  const copyOpenBtn = document.getElementById("copyAndOpenCoordinatorBtn");
+  const switchCliBtn = document.getElementById("coordinatorSwitchCliBtn");
+  const skipBtn = document.getElementById("coordinatorSkipBtn");
+
+  badge?.classList.toggle("is-online", online);
+  badge?.classList.toggle("is-waiting", !online);
+  if (badgeText) badgeText.textContent = online ? "当前桌面主控已在线" : "等待桌面 Agent 接入";
+  if (titleEl) titleEl.textContent = online ? "重开 Antigravity 桌面主控对话" : "连接 Antigravity 桌面主控";
+
+  if (leadEl) {
+    leadEl.classList.toggle("is-online", online);
+    leadEl.textContent = state.serverUnreachable
+      ? "当前未能连到本地控制台服务，请确认「洗片控制台.app」已启动后点下方「立即检测」。"
+      : online
+      ? "当前已有桌面主控保持监听。如需重开一个干净的新对话以释放上下文，请在 Antigravity 新建对话后粘贴发送下方主控词。"
+      : "正在自动监测桌面监听心跳… 在 Antigravity 中发送下方主控指令并挂载监听后，本界面会在 1~2 秒内自动关闭并进入控制台。";
+  }
+
+  const wsText = guide.workspaceRoot || "-";
+  if (wsEl && wsEl.textContent !== wsText) wsEl.textContent = wsText;
+  if (promptEl && promptEl.value !== (guide.promptText || "")) {
+    promptEl.value = guide.promptText || "";
+  }
+  if (baseUrlEl) baseUrlEl.textContent = guide.baseUrl || "http://127.0.0.1:8787";
+  if (pyEl) pyEl.textContent = guide.pythonBin || "-";
+  if (liveConnEl) {
+    liveConnEl.textContent = state.serverUnreachable
+      ? "本地控制台服务未连接"
+      : online
+      ? "🟢 在线（自动派单 · 1~2 并发）"
+      : "⏳ 尚未检测到桌面主控心跳";
+  }
+  if (pollHintEl) {
+    pollHintEl.classList.toggle("is-online", online);
+    pollHintEl.textContent = online
+      ? "监听心跳在线（新建对话重新挂载即可接续）"
+      : "每 1.5 秒自动检测中…";
+  }
+
+  const copiedKey = state.coordinatorGuide.copiedKey;
+  if (copyWsBtn) copyWsBtn.textContent = copiedKey === "workspace" ? "✓ 已复制路径" : "复制路径";
+  if (copyPromptBtn) copyPromptBtn.textContent = copiedKey === "prompt" ? "✓ 已复制启动词" : "📋 一键复制启动词";
+  if (copyShortBtn) {
+    const shortTxt = guide.shortTrigger || "启动洗片监听";
+    copyShortBtn.textContent = copiedKey === "short" ? `✓ 已复制「${shortTxt}」` : shortTxt;
+  }
+  if (openAgyBtn) openAgyBtn.disabled = Boolean(state.aiActionPending || state.serverUnreachable);
+  if (copyOpenBtn) {
+    copyOpenBtn.disabled = Boolean(state.aiActionPending || state.serverUnreachable);
+    copyOpenBtn.textContent = state.aiActionPending ? "正在打开…" : "📋+🚀 复制并打开";
+  }
+  if (switchCliBtn) {
+    switchCliBtn.classList.toggle(
+      "hidden",
+      Boolean(state.serverUnreachable || !isDesktopMode || st.agyInstalled !== true || online)
+    );
+    switchCliBtn.disabled = Boolean(state.aiActionPending);
+  }
+  if (skipBtn) {
+    skipBtn.textContent = online ? "完成并关闭" : "暂不接入，先进入控制台看片/改词";
+  }
+}
+
+function openCoordinatorGuide({ autoOpened = false } = {}) {
+  closeAiStatusPopover();
+  closeCanvasPopover();
+  closeUpdatePopover();
+  closeShotMoreMenu();
+  closeShotChatMenu();
+  const st = getAgentStatusMeta();
+  state.coordinatorGuide.open = true;
+  state.coordinatorGuide.wasOfflineWhenOpened = !Boolean(!state.serverUnreachable && st.desktopCoordinatorOnline);
+  renderCoordinatorGuideModal();
+  syncCoordinatorGuidePollTimer();
+  if (!autoOpened) {
+    refreshAgentStatus();
+  }
+}
+
+function closeCoordinatorGuide({ dismissed = false } = {}) {
+  const g = state.coordinatorGuide;
+  if (!g.open) return;
+  g.open = false;
+  if (dismissed) {
+    g.dismissedForSession = true;
+  }
+  clearTimeout(g.copyTimer);
+  g.copiedKey = "";
+  syncCoordinatorGuidePollTimer();
+  renderCoordinatorGuideModal();
+}
+
+function evaluateColdStartCoordinatorGate() {
+  const g = state.coordinatorGuide;
+  if (g.coldStartEvaluated) return;
+  if (state.serverUnreachable || !state.data) return;
+  g.coldStartEvaluated = true;
+  const st = getAgentStatusMeta();
+  const isDesktopMode = (st.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent") !== "cli_bridge";
+  if (isDesktopMode && !st.desktopCoordinatorOnline && !g.dismissedForSession) {
+    openCoordinatorGuide({ autoOpened: true });
+  }
+}
+
+function syncCoordinatorGuideWithStatus() {
+  const g = state.coordinatorGuide;
+  if (!g.open) return;
+  const st = getAgentStatusMeta();
+  const isDesktopMode = (st.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent") !== "cli_bridge";
+  if (!isDesktopMode) {
+    closeCoordinatorGuide({ dismissed: false });
+    return;
+  }
+  if (!state.serverUnreachable && !st.desktopCoordinatorOnline) {
+    g.wasOfflineWhenOpened = true;
+  }
+  if (!state.serverUnreachable && st.desktopCoordinatorOnline && g.wasOfflineWhenOpened) {
+    closeCoordinatorGuide({ dismissed: false });
+    showToast("桌面 Agent 已接管监听，已自动进入控制台");
+    return;
+  }
+  renderCoordinatorGuideModal();
 }
 
 function getAgentStatusMeta() {
@@ -3103,18 +3316,25 @@ function renderAiStatusPill() {
   const labelEl = document.getElementById("aiStatusLabel");
   if (!btn || !labelEl) return;
   const st = getAgentStatusMeta();
+  const isDesktopMode = (st.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent") !== "cli_bridge";
+  const awaitingDesktop = !state.serverUnreachable && isDesktopMode && !st.desktopCoordinatorOnline && !st.busy;
   const stateCls =
     st.state === "busy"
       ? "is-busy"
+      : awaitingDesktop
+      ? "is-awaiting-desktop"
       : st.state === "bridge_ready"
       ? "is-bridge-ready"
       : st.state === "paused"
       ? "is-paused"
       : "is-offline";
   btn.className = `ai-status-pill ${stateCls}${state.aiStatusOpen ? " is-open" : ""}`;
-  labelEl.textContent = st.label || "AI 状态";
+  labelEl.textContent = awaitingDesktop ? "⚠ 桌面未监听 · 点此唤起" : st.label || "AI 状态";
   if (state.aiStatusOpen) {
     renderAiStatusPopover();
+  }
+  if (state.coordinatorGuide?.open) {
+    syncCoordinatorGuideWithStatus();
   }
 }
 
@@ -3220,6 +3440,15 @@ function renderAiStatusPopover() {
 
   const launchHtml = !state.serverUnreachable
     ? `
+      ${
+        isDesktopMode
+          ? `<button id="openCoordinatorGuideBtn" data-ai-action="open-coordinator-guide" class="btn ${
+              st.desktopCoordinatorOnline ? "btn-secondary" : "btn-primary"
+            } btn-sm ai-popover-cta" type="button" ${pendingAttr}>${
+              st.desktopCoordinatorOnline ? "🔄 重开桌面对话 / 主控指令" : "💬 唤起桌面主控引导（复制指令）"
+            }</button>`
+          : ""
+      }
       <div class="ai-popover-launch">
         <button id="openTerminalAgyBtn" data-ai-action="open-terminal-agy" class="btn btn-secondary btn-sm" type="button" ${pendingAttr} title="在新终端窗口启动独立前台 agy 对话">💻 终端新开 agy</button>
         <button id="openAntigravityAppBtn" data-ai-action="open-antigravity" class="btn btn-secondary btn-sm" type="button" ${pendingAttr} title="唤起 Antigravity 桌面客户端">🚀 打开 Antigravity</button>
@@ -3268,6 +3497,9 @@ async function refreshAgentStatus() {
     state.serverUnreachable = false;
     state.agentStatus = res;
     if (state.data) state.data.agentStatus = res;
+    if (!state.coordinatorGuide.coldStartEvaluated && state.data) {
+      evaluateColdStartCoordinatorGate();
+    }
     renderAiStatusPill();
     if (state.view === "detail" && state.selectedShotId) {
       const curShot = (state.data?.shots || []).find((s) => s.id === state.selectedShotId);
@@ -3278,6 +3510,7 @@ async function refreshAgentStatus() {
   } catch {
     state.serverUnreachable = true;
     renderAiStatusPill();
+    renderCoordinatorGuideModal();
   }
 }
 
@@ -3488,6 +3721,9 @@ function buildRuntimeBannerInnerHtml(shot, rt) {
   const timerText = timerBits.join(" · ");
   const retryCls = isStalled ? "btn-primary" : "btn-secondary";
   const retryLabel = isProc ? "↻ 卡住刷新重试" : "↻ 刷新重试";
+  const agyMeta = getAgentStatusMeta();
+  const isDesktopMode = (agyMeta.aiDispatchMode || state.data?.aiDispatchMode || "desktop_subagent") !== "cli_bridge";
+  const showOpenCoordinator = !state.serverUnreachable && isDesktopMode && !agyMeta.desktopCoordinatorOnline;
 
   return `
     <div class="runtime-banner-top">
@@ -3496,6 +3732,7 @@ function buildRuntimeBannerInnerHtml(shot, rt) {
         ${timerText ? `<span class="runtime-timer-pill">${escapeHtml(timerText)}</span>` : ""}
       </div>
       <div class="runtime-banner-actions">
+        ${showOpenCoordinator ? `<button id="runtimeBannerOpenCoordinatorBtn" class="btn btn-primary btn-xs" type="button" title="打开桌面主控引导并复制监听指令">💬 唤起桌面主控</button>` : ""}
         <button id="runtimeBannerDetailBtn" class="btn btn-secondary btn-xs" type="button">📋 步骤与进程</button>
         <button id="runtimeBannerRefreshBtn" class="btn btn-secondary btn-xs" type="button">↻ 刷新状态</button>
         <button id="runtimeBannerRetryBtn" class="btn ${retryCls} btn-xs" type="button" ${state.runtimeBusy ? "disabled" : ""} title="立刻中止卡住的进程并把当前任务重新入队执行">${retryLabel}</button>
@@ -7316,6 +7553,8 @@ function bindGlobalEvents() {
       await launchForegroundAppWindow("terminal_agy");
     } else if (action === "open-antigravity") {
       await launchForegroundAppWindow("antigravity");
+    } else if (action === "open-coordinator-guide") {
+      openCoordinatorGuide({ autoOpened: false });
     }
   });
 
@@ -7654,6 +7893,12 @@ function bindGlobalEvents() {
     });
   };
   mainPaneEl.addEventListener("click", (e) => {
+    const rtOpenCoordinatorBtn = e.target.closest("#runtimeBannerOpenCoordinatorBtn");
+    if (rtOpenCoordinatorBtn) {
+      e.stopPropagation();
+      openCoordinatorGuide({ autoOpened: false });
+      return;
+    }
     const rtDetailBtn = e.target.closest("#openShotRuntimeBtn, #runtimeBannerDetailBtn");
     if (rtDetailBtn) {
       e.stopPropagation();
@@ -8065,10 +8310,92 @@ function bindGlobalEvents() {
       closeLightbox();
     }
   });
+  document.getElementById("closeCoordinatorModalBtn")?.addEventListener("click", () => {
+    closeCoordinatorGuide({ dismissed: true });
+  });
+  document.getElementById("coordinatorSkipBtn")?.addEventListener("click", () => {
+    closeCoordinatorGuide({ dismissed: true });
+  });
+  document.getElementById("desktopCoordinatorModal")?.addEventListener("click", (e) => {
+    if (e.target.id === "desktopCoordinatorModal") {
+      closeCoordinatorGuide({ dismissed: true });
+    }
+  });
+  document.getElementById("coordinatorPromptInput")?.addEventListener("click", (e) => {
+    e.currentTarget.select();
+  });
+  document.getElementById("copyCoordinatorWorkspaceBtn")?.addEventListener("click", async () => {
+    const guide = getDesktopCoordinatorGuideData();
+    const ok = await copyTextToClipboard(guide.workspaceRoot || "");
+    if (ok) {
+      setCoordinatorCopiedFeedback("workspace");
+      showToast("已复制工作区路径");
+    } else {
+      showToast("剪贴板不可用，请手动选中工作区路径复制");
+    }
+  });
+  document.getElementById("copyCoordinatorPromptBtn")?.addEventListener("click", async () => {
+    const guide = getDesktopCoordinatorGuideData();
+    const ok = await copyTextToClipboard(guide.promptText || "");
+    if (ok) {
+      setCoordinatorCopiedFeedback("prompt");
+      showToast("已复制桌面主控启动词，请切换到 Antigravity 粘贴发送（Cmd+V）");
+    } else {
+      document.getElementById("coordinatorPromptInput")?.select();
+      showToast("剪贴板不可用，已全选文本框，请按 Cmd+C 复制");
+    }
+  });
+  document.getElementById("copyCoordinatorShortTriggerBtn")?.addEventListener("click", async () => {
+    const guide = getDesktopCoordinatorGuideData();
+    const shortTxt = guide.shortTrigger || "启动洗片监听";
+    const ok = await copyTextToClipboard(shortTxt);
+    if (ok) {
+      setCoordinatorCopiedFeedback("short");
+      showToast(`已复制短口令「${shortTxt}」`);
+    } else {
+      showToast("剪贴板不可用");
+    }
+  });
+  document.getElementById("openCoordinatorAntigravityBtn")?.addEventListener("click", async () => {
+    await launchForegroundAppWindow("antigravity");
+  });
+  document.getElementById("copyAndOpenCoordinatorBtn")?.addEventListener("click", async () => {
+    const guide = getDesktopCoordinatorGuideData();
+    const copied = await copyTextToClipboard(guide.promptText || "");
+    if (copied) {
+      setCoordinatorCopiedFeedback("prompt");
+    } else {
+      document.getElementById("coordinatorPromptInput")?.select();
+    }
+    await launchForegroundAppWindow("antigravity", {
+      customToast: copied
+        ? "已复制主控启动词并打开 Antigravity，请直接 Cmd+V 发送"
+        : "已打开 Antigravity（若未复制成功请手动从弹窗复制）",
+    });
+  });
+  document.getElementById("coordinatorRefreshBtn")?.addEventListener("click", async () => {
+    await refreshAgentStatus();
+    const st = getAgentStatusMeta();
+    if (state.serverUnreachable) {
+      showToast("仍未连接到本地控制台服务");
+    } else if (st.desktopCoordinatorOnline) {
+      showToast("已检测到桌面 Agent 在线监听");
+    } else {
+      showToast("暂未检测到桌面监听心跳，请先在 Antigravity 中发送启动词");
+    }
+  });
+  document.getElementById("coordinatorSwitchCliBtn")?.addEventListener("click", async () => {
+    await switchAiDispatchMode("cli_bridge");
+  });
+
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       if (state.confirmDialog?.open) {
         closeConfirmModal();
+        return;
+      }
+      if (state.coordinatorGuide?.open) {
+        closeCoordinatorGuide({ dismissed: true });
         return;
       }
       if (state.renameModal?.open) {
@@ -8125,6 +8452,7 @@ async function init() {
   bindGlobalEvents();
   try {
     await refreshState();
+    evaluateColdStartCoordinatorGate();
     refreshUpdateStatus(false);
     setInterval(refreshAgentStatus, 4000);
     setInterval(() => refreshUpdateStatus(true), 20 * 60 * 1000);

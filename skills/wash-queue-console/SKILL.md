@@ -23,17 +23,24 @@ description: >-
 >    - **一镜一专属子对话**：若 `desktopConversationId` 已有且 `canResumeDesktopSubagent` 为 true，则直接用 `send_message` 唤醒该镜头专属子对话；否则用 `invoke_subagent`（`TypeName="self"`）开启全新专属子对话，并立即调用 `POST /api/shots/{shot_id}/bind-conversation` 绑定 `conversationId`；
 >    - 每个单镜子对话在完成后直接调用 `POST /api/shots/{shot_id}/agent-update` 回写 `desktopConversationId` 与成片/画布结果（**严禁**在任何单镜子对话内再递归挂起队列监听）。
 
-1. **检查服务与 Fast-Path 执行器是否在线**（优先使用工作区 `tools/wash_queue_app`，否则回退桌面/应用目录下的 `洗片控制台.app/Contents/Resources/app`）：
+1. **检查服务与 Fast-Path 执行器是否在线**（优先使用工作区 `tools/wash_queue_app`，否则自动匹配常见应用目录内的 `洗片控制台.app/Contents/Resources/app`；也可先读 `GET http://127.0.0.1:8787/api/agent/status` 的 `desktopCoordinatorGuide` 获取当前运行实例的精确 `pythonBin`/`waitScript`/`baseUrl`）：
    ```bash
    APP_DIR="$( [ -d ./tools/wash_queue_app ] && pwd )/tools/wash_queue_app"
+   [ -d "$APP_DIR" ] || APP_DIR="/Applications/洗片控制台.app/Contents/Resources/app"
+   [ -d "$APP_DIR" ] || APP_DIR="$HOME/Applications/洗片控制台.app/Contents/Resources/app"
    [ -d "$APP_DIR" ] || APP_DIR="$HOME/Desktop/洗片控制台.app/Contents/Resources/app"
    [ -d "$APP_DIR" ] || APP_DIR="$HOME/Desktop/洗片控制台-同事版/洗片控制台.app/Contents/Resources/app"
+   PY_BIN="$APP_DIR/.venv/bin/python"
+   [ -x "$PY_BIN" ] || PY_BIN="$APP_DIR/../runtime/bin/python3.12"
+   [ -x "$PY_BIN" ] || PY_BIN="$HOME/.wash_console/venv_x64/bin/python"
+   [ -x "$PY_BIN" ] || PY_BIN="python3"
    curl -sf http://127.0.0.1:8787/api/state >/dev/null || bash "$APP_DIR/launch.sh" --no-browser
    ```
 2. **桌面主控挂起响应式监听**：
+   - 将模式确认切为桌面主控：`POST http://127.0.0.1:8787/api/config/ai-dispatch-mode`（`{"mode":"desktop_subagent"}`）
    - 查看待办队列：`curl -sf http://127.0.0.1:8787/api/agent/pending`
    - 启动桌面心跳与待办阻塞等待（作为后台非守护命令 `WaitMsBeforeAsync=500`）：
-     `"$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/wait_next_ai_task.py" --timeout 3600`
+     `"$PY_BIN" "$APP_DIR/scripts/wait_next_ai_task.py" --timeout 3600`
    - 桌面主控领单：`POST http://127.0.0.1:8787/api/agent/coordinator-claim`（`{"workerId":"desktop_coordinator","limit":2}`）
    - 绑定单镜子对话：`POST http://127.0.0.1:8787/api/shots/{shot_id}/bind-conversation`（`{"conversationId":"<subagent_id>","surface":"desktop"}`）
 

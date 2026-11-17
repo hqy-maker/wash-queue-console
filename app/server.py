@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -111,6 +112,45 @@ def _tail_shot_bridge_logs(shot_id: str, limit: int = 8) -> list[str]:
         return matched[-limit:]
     except Exception:
         return []
+
+
+def _is_antigravity_app_installed() -> bool:
+    return any(
+        cand.exists()
+        for cand in (
+            Path("/Applications/Antigravity.app"),
+            HOME_DIR / "Applications" / "Antigravity.app",
+        )
+    )
+
+
+def _build_desktop_coordinator_guide() -> dict[str, Any]:
+    port = int(os.environ.get("WASH_APP_PORT", "8787"))
+    base_url = f"http://127.0.0.1:{port}"
+    py_bin = sys.executable or "python3"
+    wait_script = str((APP_ROOT / "scripts" / "wait_next_ai_task.py").resolve())
+    port_arg = f" --base-url {base_url}" if port != 8787 else ""
+    wait_cmd = f"{shlex.quote(py_bin)} {shlex.quote(wait_script)}{port_arg} --timeout 3600"
+    prompt_text = (
+        "请读取 wash-queue-console 协议，专职担任洗片控制台桌面主控：\n"
+        f"1. 调用 POST {base_url}/api/config/ai-dispatch-mode 将模式设为 desktop_subagent；\n"
+        f"2. 挂起运行 {wait_cmd} 保持监听；\n"
+        f"3. 收到待办后按 1~2 路并发调用 {base_url}/api/agent/coordinator-claim 领单，"
+        "为每个镜头开专属 self 子对话并调用 "
+        f"{base_url}/api/shots/{{id}}/bind-conversation 绑定，"
+        "后续同镜返工用 send_message 续接；处理完成后立刻重启 wait_next_ai_task.py 继续监听。"
+    )
+    return {
+        "baseUrl": base_url,
+        "workspaceRoot": str(WORKSPACE_ROOT),
+        "appRoot": str(APP_ROOT),
+        "pythonBin": py_bin,
+        "waitScript": wait_script,
+        "waitCommand": wait_cmd,
+        "promptText": prompt_text,
+        "shortTrigger": "启动洗片监听",
+        "antigravityInstalled": _is_antigravity_app_installed(),
+    }
 
 
 class AgentPresenceTracker:
@@ -576,6 +616,7 @@ class AgentPresenceTracker:
             "lastRunAt": desktop_meta.get("lastRunAt") or bridge_meta.get("lastRunAt", ""),
             "lastError": desktop_meta.get("lastError") or bridge_meta.get("lastError", ""),
             "shotWorkers": worker_summaries,
+            "desktopCoordinatorGuide": _build_desktop_coordinator_guide(),
         }
 
 
