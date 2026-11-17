@@ -197,6 +197,9 @@ function getDisplayStatusMeta(shot) {
     }
     return STATUS_META.final_ready;
   }
+  if (["final_ready", "final_done"].includes(shot.status)) {
+    return shot.draftVideo?.mediaUrl ? STATUS_META.draft_ready : STATUS_META.ready_on_canvas;
+  }
   return STATUS_META[shot.status] || { label: shot.status, cls: "pill-muted" };
 }
 
@@ -266,6 +269,8 @@ const state = {
     dismissedForSession: false,
     coldStartEvaluated: false,
     wasOfflineWhenOpened: false,
+    openedWatcherToken: "",
+    openedWatcherPid: null,
     copiedKey: "",
     copyTimer: null,
     pollTimer: null,
@@ -3219,8 +3224,11 @@ function openCoordinatorGuide({ autoOpened = false } = {}) {
   closeShotMoreMenu();
   closeShotChatMenu();
   const st = getAgentStatusMeta();
+  const curOnline = Boolean(!state.serverUnreachable && st.desktopCoordinatorOnline);
   state.coordinatorGuide.open = true;
-  state.coordinatorGuide.wasOfflineWhenOpened = !Boolean(!state.serverUnreachable && st.desktopCoordinatorOnline);
+  state.coordinatorGuide.wasOfflineWhenOpened = !curOnline;
+  state.coordinatorGuide.openedWatcherToken = curOnline ? String(st.desktopWatcherToken || "") : "";
+  state.coordinatorGuide.openedWatcherPid = curOnline ? st.desktopWatcherPid || null : null;
   renderCoordinatorGuideModal();
   syncCoordinatorGuidePollTimer();
   if (!autoOpened) {
@@ -3235,6 +3243,8 @@ function closeCoordinatorGuide({ dismissed = false } = {}) {
   if (dismissed) {
     g.dismissedForSession = true;
   }
+  g.openedWatcherToken = "";
+  g.openedWatcherPid = null;
   clearTimeout(g.copyTimer);
   g.copiedKey = "";
   syncCoordinatorGuidePollTimer();
@@ -3262,12 +3272,25 @@ function syncCoordinatorGuideWithStatus() {
     closeCoordinatorGuide({ dismissed: false });
     return;
   }
+  const online = Boolean(!state.serverUnreachable && st.desktopCoordinatorOnline);
   if (!state.serverUnreachable && !st.desktopCoordinatorOnline) {
     g.wasOfflineWhenOpened = true;
   }
-  if (!state.serverUnreachable && st.desktopCoordinatorOnline && g.wasOfflineWhenOpened) {
+  const curTok = String(st.desktopWatcherToken || "");
+  const curPid = st.desktopWatcherPid || null;
+  const replacedByNewWatcher = Boolean(
+    online &&
+      ((curTok && g.openedWatcherToken && curTok !== g.openedWatcherToken) ||
+        (!g.openedWatcherToken && curTok && !g.wasOfflineWhenOpened) ||
+        (curPid && g.openedWatcherPid && curPid !== g.openedWatcherPid))
+  );
+  if (online && (g.wasOfflineWhenOpened || replacedByNewWatcher)) {
     closeCoordinatorGuide({ dismissed: false });
-    showToast("桌面 Agent 已接管监听，已自动进入控制台");
+    showToast(
+      replacedByNewWatcher
+        ? "新桌面主控对话已接管监听，已自动进入控制台"
+        : "桌面 Agent 已接管监听，已自动进入控制台"
+    );
     return;
   }
   renderCoordinatorGuideModal();
@@ -5952,13 +5975,13 @@ function renderVideoReviewCard(shot) {
     activeVid?.isPassed ||
       (passed && passedRole !== "480p" && activeVid?.role === "1080p" && activeVid?.isCurrent)
   );
+  const isPassed480 = Boolean(passed && passedRole === "480p");
   const canApproveFinal = Boolean(
     draftVid &&
       isViewingCurrentDraft &&
       !draftInProgress &&
       !finalInProgress &&
-      !passed &&
-      (!finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)))
+      (isPassed480 || (!passed && (!finalVid || (outdatedFinal && (draftRefreshed || !changeInfo.hasChanges)))))
   );
   const showMarkPassedBtn = Boolean(
     activeVid && !draftInProgress && !finalInProgress && !isThisVerPassed
@@ -6037,8 +6060,12 @@ function renderVideoReviewCard(shot) {
           : "请先点上方「▶ 按新修改重新生成」产出新版 480P 样片，出片后即可重新转 1080P 正片。"
       }</div>`
     : "";
+  const passed480BadgeHtml =
+    isThisVerPassed && isPassed480
+      ? `<span class="passed-lock-badge is-480p" title="已选定此 480P 版本标记过条（过未转正）">✓ 过未转正 · 480P</span>`
+      : "";
   const approveOrBadgeHtml = canApproveFinal
-    ? `<button id="approveFinalBtn" class="btn btn-primary btn-sm" type="button">${
+    ? `${passed480BadgeHtml}<button id="approveFinalBtn" class="btn btn-primary btn-sm" type="button">${
         finalVid && outdatedFinal ? "✦ 重新转 1080P 正片" : "✦ 转 1080P 正片"
       }</button>`
     : finalInProgress
@@ -6509,7 +6536,8 @@ function bindDetailEvents(shot) {
       await refreshState();
     } catch (err) {
       showToast(err.message);
-      if (triggerBtn) {
+    } finally {
+      if (triggerBtn && triggerBtn.isConnected) {
         triggerBtn.disabled = false;
         triggerBtn.textContent = restoreLabel;
       }
@@ -6717,19 +6745,41 @@ function bindDetailEvents(shot) {
     confirmAndMarkVideoVersionPassed(shot, activeVid);
   });
 
-  document.getElementById("approveFinalBtn")?.addEventListener("click", async () => {
-    const btn = document.getElementById("approveFinalBtn");
-    btn.disabled = true;
-    btn.textContent = "提交正片中…";
-    try {
-      await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/approve-final`, { method: "POST" });
-      showToast("已提交转 1080P 正片队列");
-      await refreshState();
-    } catch (err) {
-      showToast(err.message);
-      btn.disabled = false;
-      btn.textContent = "✦ 转 1080P 正片";
+  document.getElementById("approveFinalBtn")?.addEventListener("click", () => {
+    const submitApproveFinal = async () => {
+      const btn = document.getElementById("approveFinalBtn");
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "提交正片中…";
+      }
+      try {
+        await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/approve-final`, { method: "POST" });
+        showToast("已提交转 1080P 正片队列");
+        await refreshState();
+      } catch (err) {
+        showToast(err.message);
+        if (btn && btn.isConnected) {
+          btn.disabled = false;
+          btn.textContent = "✦ 转 1080P 正片";
+        }
+      }
+    };
+    if (
+      shot.passedRole === "480p" &&
+      (shot.passedVersion?.fromArchivedHistory || shot.draftVideo?.source === "history_passed")
+    ) {
+      openConfirmModal({
+        title: "确认对「过未转正」的历史归档 480P 版本发起转正？",
+        message:
+          "当前「过未转正」选定的是历史归档 480P 版本。云端样片转 1080P 默认会将画布样片节点「当前最新激活版本」转为 1080P——若此后该节点重新生成过其他样片，请确认已在画布上切回对应版本后再继续，避免误扣积分。",
+        meta: `镜头：${shot.id} · 当前过未转正版本：${shot.passedVersion?.label || "历史 480P"}`,
+        okText: "确认继续转 1080P 正片",
+        cancelText: "取消",
+        onConfirm: submitApproveFinal,
+      });
+      return;
     }
+    submitApproveFinal();
   });
 
   document.getElementById("submitFeedbackBtn")?.addEventListener("click", () => {

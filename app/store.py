@@ -3410,6 +3410,7 @@ class QueueStore:
                     "resourceId": res_id_orig,
                     "markedAt": now_iso(),
                     "label": short_ver,
+                    "fromArchivedHistory": bool((not target.get("isCurrent")) and old_sha and old_sha != eff_sha),
                 }
                 shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
                 shot["lastGeneratedAt"] = dl_at_orig or now_iso()
@@ -3641,11 +3642,20 @@ class QueueStore:
 
     @staticmethod
     def _mark_final_reopened_if_needed(shot: dict[str, Any]) -> None:
-        """Unlock a passed 1080P shot when the user explicitly modifies/reruns it while preserving archived finalVideo."""
+        """Unlock a passed 1080P/480P shot when the user explicitly modifies/reruns it."""
         has_final = bool((shot.get("finalVideo") or {}).get("mediaUrl"))
-        if has_final or str(shot.get("status") or "") in {"final_ready", "final_done"}:
+        was_final_status = str(shot.get("status") or "") in {"final_ready", "final_done"}
+        shot.pop("passedVersion", None)
+        if has_final:
             shot["finalModifiedReopened"] = True
             shot["draftUpdatedSinceFinalReopen"] = False
+        elif was_final_status or shot.get("finalModifiedReopened"):
+            shot["finalModifiedReopened"] = False
+            shot["draftUpdatedSinceFinalReopen"] = False
+        if was_final_status:
+            shot["status"] = (
+                "draft_ready" if (shot.get("draftVideo") or {}).get("mediaUrl") else "ready_on_canvas"
+            )
 
     @staticmethod
     def _touch_input_modified(shot: dict[str, Any], ts_ms: int | None = None) -> int:
@@ -3669,7 +3679,11 @@ class QueueStore:
                     jm = shot.get("jimengMeta") or {}
                     if isinstance(jm, dict) and jm.get("pendingAction") == "promote_1080p":
                         jm["pendingAction"] = ""
-                    if (shot.get("finalVideo") or {}).get("mediaUrl") and not shot.get("finalModifiedReopened"):
+                    has_passed_lock = (
+                        bool((shot.get("finalVideo") or {}).get("mediaUrl"))
+                        or isinstance(shot.get("passedVersion"), dict)
+                    ) and not shot.get("finalModifiedReopened")
+                    if has_passed_lock:
                         target_status = "final_ready"
                     elif (shot.get("draftVideo") or {}).get("mediaUrl"):
                         target_status = "draft_ready"
@@ -3743,7 +3757,11 @@ class QueueStore:
                 if clean_mode == "restore":
                     if isinstance(jm, dict) and jm.get("pendingAction") == "promote_1080p":
                         jm["pendingAction"] = ""
-                    if (shot.get("finalVideo") or {}).get("mediaUrl") and not shot.get("finalModifiedReopened"):
+                    has_passed_lock = (
+                        bool((shot.get("finalVideo") or {}).get("mediaUrl"))
+                        or isinstance(shot.get("passedVersion"), dict)
+                    ) and not shot.get("finalModifiedReopened")
+                    if has_passed_lock:
                         target_status = "final_ready"
                     elif (shot.get("draftVideo") or {}).get("mediaUrl"):
                         target_status = "draft_ready"
@@ -4854,7 +4872,13 @@ class QueueStore:
                 self._mark_final_reopened_if_needed(shot)
 
                 plat_label = get_platform_label(shot.get("platform"))
-                has_canvas_node = bool(shot.get("libtvSampleNodeKey") or shot.get("libtvGroupKey"))
+                jm = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
+                has_canvas_node = bool(
+                    shot.get("libtvSampleNodeKey")
+                    or shot.get("libtvGroupKey")
+                    or jm.get("sampleNodeId")
+                    or jm.get("nodeId")
+                )
                 if sync_to_canvas and has_canvas_node:
                     if not shot.get("promptUpdatePrevStatus") and cur_status not in {
                         "prompt_update_requested",
@@ -5013,6 +5037,10 @@ class QueueStore:
                 )
         return "\n".join(lines)
 
+    def notify_waiters(self) -> None:
+        with self._cv:
+            self._cv.notify_all()
+
     def wait_for_events(
         self,
         since_seq: int,
@@ -5020,10 +5048,22 @@ class QueueStore:
         only_actionable: bool = False,
         ai_only: bool = False,
         fastpath_only: bool = False,
+        abort_check: Any = None,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + max(0.5, min(timeout, 30.0))
         with self._cv:
             while True:
+                if callable(abort_check) and abort_check():
+                    q_now = self._load_queue()
+                    return {
+                        "timedOut": True,
+                        "superseded": True,
+                        "eventSeq": int(q_now.get("eventSeq", 1)),
+                        "pendingCount": 0,
+                        "processingCount": 0,
+                        "processingShotIds": [],
+                        "pending": [],
+                    }
                 q = self._load_queue()
                 cur_seq = int(q.get("eventSeq", 1))
                 queue_ai_mode = normalize_ai_dispatch_mode(q.get("aiDispatchMode"))

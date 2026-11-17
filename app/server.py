@@ -159,6 +159,7 @@ class AgentPresenceTracker:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._watchers: dict[str, dict[str, Any]] = {}
+        self._active_desktop_token: str = ""
         self._shot_workers: dict[str, dict[str, Any]] = {}
         self._cancel_tokens: dict[str, float] = {}
         self._bridge_meta: dict[str, Any] = {
@@ -233,6 +234,33 @@ class AgentPresenceTracker:
             self._prune_locked(now)
             return list(self._cancel_tokens.keys())
 
+    def is_desktop_token_superseded(self, token: str) -> bool:
+        clean = (token or "").strip()
+        if not clean:
+            return False
+        with self._lock:
+            return bool(self._active_desktop_token and clean != self._active_desktop_token)
+
+    def touch_desktop_activity(
+        self,
+        *,
+        active_shot_ids: list[str] | None = None,
+        ttl_sec: float = 600.0,
+    ) -> None:
+        with self._lock:
+            eff_ids = (
+                list(active_shot_ids)
+                if active_shot_ids is not None
+                else list(self._desktop_meta.get("activeShotIds") or [])
+            )
+            self.record_heartbeat(
+                "desktop_coordinator",
+                "desktop",
+                busy=bool(eff_ids),
+                active_shot_ids=eff_ids,
+                ttl_sec=ttl_sec,
+            )
+
     def record_heartbeat(
         self,
         watcher_id: str,
@@ -246,22 +274,37 @@ class AgentPresenceTracker:
         last_run_at: str | None = None,
         last_error: str | None = None,
         shot_workers: dict[str, dict[str, Any]] | None = None,
+        watcher_token: str | None = None,
+        replace_token: bool = False,
     ) -> dict[str, Any]:
         clean_mode = "desktop" if str(mode or "").strip().lower() == "desktop" else "bridge"
         default_wid = "desktop_coordinator" if clean_mode == "desktop" else "agy_bridge"
         wid = (watcher_id or default_wid).strip()[:80] or default_wid
-        ttl = max(5.0, min(float(ttl_sec or 40.0), 180.0))
+        max_ttl = 900.0 if clean_mode == "desktop" else 180.0
+        ttl = max(5.0, min(float(ttl_sec or 40.0), max_ttl))
         now = time.monotonic()
         wall_now = time.time()
         active_clean = [str(x).strip() for x in (active_shot_ids or []) if str(x).strip()]
         with self._lock:
             self._prune_locked(now)
+            prev = self._watchers.get(wid) or {}
+            eff_pid = int(pid) if pid else prev.get("pid")
+            eff_tok = ""
+            if clean_mode == "desktop":
+                clean_tok = (watcher_token or "").strip()
+                if clean_tok:
+                    if replace_token or not self._active_desktop_token:
+                        self._active_desktop_token = clean_tok
+                    elif clean_tok != self._active_desktop_token:
+                        return self.snapshot()
+                eff_tok = clean_tok or str(prev.get("watcherToken") or self._active_desktop_token or "")
             self._watchers[wid] = {
                 "watcherId": wid,
                 "mode": clean_mode,
                 "busy": bool(busy),
                 "activeShotIds": active_clean,
-                "pid": int(pid) if pid else None,
+                "pid": eff_pid,
+                "watcherToken": eff_tok,
                 "expiresAt": now + ttl,
                 "updatedAt": wall_now,
             }
@@ -601,6 +644,9 @@ class AgentPresenceTracker:
             "aiDispatchMode": ai_mode,
             "desktopCoordinatorOnline": desktop_online,
             "desktopActiveShotIds": desktop_active_ids,
+            "desktopWatcherPid": next((w.get("pid") for w in desktop_watchers if w.get("pid")), None),
+            "desktopWatcherToken": self._active_desktop_token if desktop_online else "",
+            "desktopLastHeartbeatAt": max((float(w.get("updatedAt") or 0.0) for w in desktop_watchers), default=0.0),
             "aiPendingCount": ai_pending_count,
             "fastpathPendingCount": fastpath_pending_count,
             "agyInstalled": agy_installed,
@@ -1202,6 +1248,8 @@ class HeartbeatReq(BaseModel):
     lastRunAt: str | None = None
     lastError: str | None = None
     shotWorkers: dict[str, dict[str, Any]] | None = None
+    watcherToken: str = ""
+    replaceToken: bool = False
 
 
 class RetryProcessingReq(BaseModel):
@@ -1588,6 +1636,8 @@ def set_ai_dispatch_mode_config(req: AiDispatchModeReq) -> dict[str, Any]:
         updated = store.set_ai_dispatch_mode(req.mode)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if updated.get("aiDispatchMode") == "cli_bridge":
+        ensure_bridge_running(clear_paused=True)
     snap = agent_presence.snapshot(store.get_state())
     return {
         "ok": True,
@@ -2287,7 +2337,24 @@ def sync_libtv(shot_id: str) -> dict[str, Any]:
 @app.post("/api/shots/{shot_id}/agent-update")
 def agent_update(shot_id: str, req: AgentUpdateReq) -> dict[str, Any]:
     try:
+        before_shot: dict[str, Any] | None = None
+        try:
+            before_shot = store.get_shot(shot_id)
+        except KeyError:
+            before_shot = None
         shot = store.agent_update_shot(shot_id, req.model_dump(exclude_unset=True))
+        if (
+            (before_shot and before_shot.get("claimedBy") == "desktop_coordinator")
+            or shot.get("claimedBy") == "desktop_coordinator"
+            or (
+                store.get_ai_dispatch_mode() == "desktop_subagent"
+                and (before_shot or {}).get("claimedBy") != "agy_bridge"
+                and bool(shot.get("desktopConversationId") or req.desktopConversationId)
+            )
+        ):
+            agent_presence.touch_desktop_activity(
+                ttl_sec=600.0 if shot.get("status") == "processing" else 120.0
+            )
         return {"ok": True, "shot": shot}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2388,7 +2455,15 @@ def post_agent_heartbeat(req: HeartbeatReq) -> dict[str, Any]:
         last_run_at=req.lastRunAt,
         last_error=req.lastError,
         shot_workers=req.shotWorkers,
+        watcher_token=req.watcherToken,
+        replace_token=req.replaceToken,
     )
+    if (
+        str(req.mode or "").strip().lower() == "desktop"
+        and req.replaceToken
+        and req.watcherToken.strip()
+    ):
+        store.notify_waiters()
     return {"ok": True, "agentStatus": snap, "cancelTokens": agent_presence.get_active_cancel_tokens()}
 
 
@@ -2435,6 +2510,8 @@ def release_fastpath_shot(shot_id: str, req: ReleaseFastpathReq) -> dict[str, An
 def bind_shot_conversation_endpoint(shot_id: str, req: BindConvReq) -> dict[str, Any]:
     try:
         shot = store.bind_shot_conversation(shot_id, conversation_id=req.conversationId, surface=req.surface)
+        if str(req.surface or "desktop").strip().lower() != "cli":
+            agent_presence.touch_desktop_activity(ttl_sec=600.0)
         return {"ok": True, "shot": shot}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2463,6 +2540,15 @@ def claim_coordinator_pending(req: CoordinatorClaimReq | None = None) -> dict[st
         limit=max(1, min(int(body.limit or 2), 4)),
         shot_ids=body.shotIds,
         ai_only=True,
+    )
+    claimed_ids = [
+        str(s.get("id"))
+        for s in (res.get("claimed") or [])
+        if isinstance(s, dict) and s.get("id")
+    ]
+    agent_presence.touch_desktop_activity(
+        active_shot_ids=claimed_ids,
+        ttl_sec=600.0 if claimed_ids else 120.0,
     )
     return {"ok": True, **res}
 
@@ -2515,20 +2601,41 @@ def wait_events(
     fastpath_only: bool = Query(default=False),
     watcher: str = Query(default=""),
     mode: str = Query(default=""),
+    watcher_token: str = Query(default=""),
+    pid: int = Query(default=0),
 ) -> dict[str, Any]:
     clean_mode = mode.strip()
+    clean_tok = watcher_token.strip()
+    if clean_mode == "desktop" and clean_tok and agent_presence.is_desktop_token_superseded(clean_tok):
+        return {
+            "timedOut": True,
+            "superseded": True,
+            "eventSeq": since,
+            "pendingCount": 0,
+            "processingCount": 0,
+            "processingShotIds": [],
+            "pending": [],
+        }
     if watcher.strip() and clean_mode in {"bridge", "desktop"}:
         agent_presence.record_heartbeat(
             watcher.strip(),
             clean_mode,
+            pid=pid or None,
             ttl_sec=max(float(timeout or 20.0) + 15.0, 35.0),
+            watcher_token=clean_tok or None,
         )
+    abort_fn = (
+        (lambda: agent_presence.is_desktop_token_superseded(clean_tok))
+        if (clean_mode == "desktop" and clean_tok)
+        else None
+    )
     return store.wait_for_events(
         since_seq=since,
         timeout=timeout,
         only_actionable=actionable,
         ai_only=ai_only,
         fastpath_only=fastpath_only,
+        abort_check=abort_fn,
     )
 
 
