@@ -484,44 +484,297 @@ def download_resource(resource_id: str, dest_file: Path, project_uuid: str | Non
         return dest_file
 
 
-def _inspect_dreamina_node_raw(node_id: str, project_uuid: str) -> dict[str, Any]:
-    proc = _run_dreamina(["node", "show", "--node-id", node_id, "--project-id", project_uuid], timeout=25)
+_TERMINAL_SUCCEEDED = {"succeeded", "success", "completed"}
+
+
+def _resource_created_ms(res: dict[str, Any] | None) -> int:
+    if not isinstance(res, dict):
+        return 0
     try:
-        payload = _extract_json(proc)
-    except Exception:
-        payload = None
+        return int(res.get("createdAt") or 0)
+    except (TypeError, ValueError):
+        return 0
 
-    if proc.returncode != 0 or not (isinstance(payload, dict) and payload.get("ok")):
-        if _is_auth_error(proc, payload):
-            invalidate_auth_cache()
-            raise JimengAuthRequiredError("即梦官网尚未登录授权")
-        raise RuntimeError(_extract_error_msg(payload, proc.stderr.strip() or f"读取即梦节点失败: {node_id}"))
 
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    nodes = data.get("nodes") or []
-    first_item = nodes[0] if nodes and isinstance(nodes[0], dict) else {}
-    node = first_item.get("node") if isinstance(first_item.get("node"), dict) else {}
+def _pick_latest_succeeded_resource(resources: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Return newest succeeded resource by `createdAt` descending (list order tie-breaker)."""
+    succeeded = [
+        r
+        for r in (resources or [])
+        if isinstance(r, dict) and str(r.get("status") or "").lower() in _TERMINAL_SUCCEEDED
+    ]
+    if not succeeded:
+        return None
+    return max(enumerate(succeeded), key=lambda pair: (_resource_created_ms(pair[1]), -pair[0]))[1]
+
+
+def find_project_video_nodes(project_uuid: str, name_filter: str = "") -> list[dict[str, Any]]:
+    """List video nodes on a Dreamina canvas project (handles 50-item pagination)."""
+    proj = str(project_uuid or "").strip()
+    if not proj:
+        return []
+    items: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(12):
+        args = [
+            "node",
+            "find",
+            "--project-id",
+            proj,
+            "--type",
+            "video",
+            "--limit",
+            "50",
+            "--offset",
+            str(offset),
+        ]
+        if name_filter.strip():
+            args.extend(["--name", name_filter.strip()])
+        proc = _run_dreamina(args, timeout=25)
+        try:
+            payload = _extract_json(proc)
+        except Exception:
+            payload = None
+        if proc.returncode != 0 or not (isinstance(payload, dict) and payload.get("ok")):
+            if _is_auth_error(proc, payload):
+                invalidate_auth_cache()
+                raise JimengAuthRequiredError("即梦官网尚未登录授权")
+            raise RuntimeError(_extract_error_msg(payload, proc.stderr.strip() or f"扫描即梦画布视频节点失败: {proj}"))
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        page = [it for it in (data.get("items") or []) if isinstance(it, dict)]
+        items.extend(page)
+        if not data.get("hasMore") or not page:
+            break
+        offset += len(page)
+    return items
+
+
+def _classify_shot_canvas_nodes(
+    shot_id: str,
+    project_videos: list[dict[str, Any]] | None,
+) -> tuple[list[str], list[str]]:
+    """Return `(sample_node_ids, final_node_ids)` matching `shot_id` on Dreamina canvas."""
+    sid_upper = str(shot_id or "").strip().upper()
+    if not sid_upper or not project_videos:
+        return [], []
+    samples: list[str] = []
+    finals: list[str] = []
+    seen_s: set[str] = set()
+    seen_f: set[str] = set()
+    for it in project_videos:
+        nid = str(it.get("nodeId") or it.get("id") or "").strip()
+        if not nid.startswith("node_"):
+            continue
+        title = str(it.get("title") or "").strip()
+        t_up = title.upper()
+        if not (t_up == sid_upper or t_up.startswith(f"{sid_upper}-") or t_up.startswith(f"{sid_upper}_")):
+            continue
+        if any(skip in title for skip in ("原片", "深度", "景深")):
+            continue
+        if "1080" in title or "正片" in title:
+            if nid not in seen_f:
+                seen_f.add(nid)
+                finals.append(nid)
+        elif "样片" in title:
+            if nid not in seen_s:
+                seen_s.add(nid)
+                samples.append(nid)
+    return samples, finals
+
+
+def _inspect_dreamina_nodes_batch(node_ids: list[str], project_uuid: str) -> dict[str, dict[str, Any]]:
+    clean_ids: list[str] = []
+    seen: set[str] = set()
+    for nid in node_ids:
+        s = str(nid or "").strip()
+        if s.startswith("node_") and s not in seen:
+            seen.add(s)
+            clean_ids.append(s)
+    out: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(clean_ids), 20):
+        chunk = clean_ids[i : i + 20]
+        proc = _run_dreamina(
+            ["node", "show", "--node-id", ",".join(chunk), "--project-id", project_uuid],
+            timeout=30,
+        )
+        try:
+            payload = _extract_json(proc)
+        except Exception:
+            payload = None
+        if proc.returncode != 0 or not (isinstance(payload, dict) and payload.get("ok")):
+            if _is_auth_error(proc, payload):
+                invalidate_auth_cache()
+                raise JimengAuthRequiredError("即梦官网尚未登录授权")
+            raise RuntimeError(
+                _extract_error_msg(payload, proc.stderr.strip() or f"读取即梦节点失败: {','.join(chunk)}")
+            )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        for row in data.get("nodes") or []:
+            if not isinstance(row, dict):
+                continue
+            node = row.get("node")
+            if isinstance(node, dict) and node.get("nodeId"):
+                out[str(node["nodeId"])] = node
+    return out
+
+
+def _inspect_dreamina_node_raw(node_id: str, project_uuid: str) -> dict[str, Any]:
+    found = _inspect_dreamina_nodes_batch([node_id], project_uuid)
+    node = found.get(str(node_id).strip())
     if not node:
-        raise RuntimeError(f"即梦画布中未找到节点 {node_id}（result={first_item.get('result') or 'unknown'}）")
+        raise RuntimeError(f"即梦画布中未找到节点 {node_id}")
     return node
 
 
-def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
-    """Inspect a Dreamina Canvas node (sample & optional 1080P final) and pull latest completed assets."""
-    node_ref = str(shot.get("libtvSampleNodeKey") or "").strip()
-    project_uuid = str(shot.get("projectUuid") or "").strip()
-    if not node_ref or not project_uuid:
-        raise ValueError("当前镜头尚未绑定即梦画布或视频节点 ID，无法拉取节点状态")
+def _is_final_1080_node(node: dict[str, Any] | None) -> bool:
+    if not isinstance(node, dict):
+        return False
+    title = str(node.get("title") or "")
+    if "1080" in title or "正片" in title:
+        return True
+    for r in node.get("resources") or []:
+        if not isinstance(r, dict):
+            continue
+        vid = r.get("video") if isinstance(r.get("video"), dict) else {}
+        res_str = str(vid.get("resolution") or "").lower()
+        w = int(vid.get("width") or 0)
+        if "1080" in res_str or w >= 1920:
+            return True
+    return False
 
-    node = _inspect_dreamina_node_raw(node_ref, project_uuid)
 
+def _node_latest_resource_ms(node: dict[str, Any] | None) -> tuple[int, int]:
+    if not isinstance(node, dict):
+        return (0, 0)
+    best = _pick_latest_succeeded_resource(node.get("resources"))
+    if best is not None:
+        return (1, _resource_created_ms(best))
+    return (0, 0)
+
+
+def prefetch_canvas_sync_context(
+    shots: list[dict[str, Any]],
+    fallback_project_uuid: str = "",
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, dict[str, Any]]]]:
+    """Batch-fetch Dreamina project video lists & node details once per project for rapid sync-all."""
+    proj_ids: list[str] = []
+    seen_p: set[str] = set()
+    for p in [fallback_project_uuid] + [str(s.get("projectUuid") or "").strip() for s in shots]:
+        if p and p not in seen_p:
+            seen_p.add(p)
+            proj_ids.append(p)
+
+    videos_by_proj: dict[str, list[dict[str, Any]]] = {}
+    nodes_by_proj: dict[str, dict[str, dict[str, Any]]] = {}
+    for p_uuid in proj_ids:
+        vlist = find_project_video_nodes(p_uuid)
+        videos_by_proj[p_uuid] = vlist
+        cand_ids: list[str] = []
+        for s in shots:
+            s_proj = str(s.get("projectUuid") or "").strip()
+            if s_proj != p_uuid and fallback_project_uuid != p_uuid:
+                continue
+            jm = s.get("jimengMeta") if isinstance(s.get("jimengMeta"), dict) else {}
+            for k in (jm.get("sampleNodeId"), jm.get("nodeId"), s.get("libtvSampleNodeKey"), jm.get("finalNodeId"), jm.get("upscaleNodeId"), s.get("libtvFinalNodeKey")):
+                ks = str(k or "").strip()
+                if ks.startswith("node_"):
+                    cand_ids.append(ks)
+            disc_s, disc_f = _classify_shot_canvas_nodes(str(s.get("id") or ""), vlist)
+            cand_ids.extend(disc_s)
+            cand_ids.extend(disc_f)
+        node_map = _inspect_dreamina_nodes_batch(cand_ids, p_uuid) if cand_ids else {}
+        # Second tiny batch for any downstream 1080P nodes not yet inspected
+        extra_downstream: list[str] = []
+        for nd in node_map.values():
+            for dnid in nd.get("downstreamNodeIds") or []:
+                ds = str(dnid or "").strip()
+                if ds.startswith("node_") and ds not in node_map:
+                    extra_downstream.append(ds)
+        if extra_downstream:
+            node_map.update(_inspect_dreamina_nodes_batch(extra_downstream, p_uuid))
+        nodes_by_proj[p_uuid] = node_map
+    return videos_by_proj, nodes_by_proj
+
+
+def sync_shot_node(
+    shot: dict[str, Any],
+    shot_dir: Path,
+    *,
+    fallback_project_uuid: str = "",
+    prefetched_videos_by_proj: dict[str, list[dict[str, Any]]] | None = None,
+    prefetched_nodes_by_proj: dict[str, dict[str, dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Inspect Dreamina sample & 1080P final nodes (including newly promoted/duplicated canvas nodes) and pull latest outputs."""
+    sid = str(shot.get("id") or "").strip()
+    jm = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
+    orig_proj = str(shot.get("projectUuid") or jm.get("projectId") or "").strip()
+    fb_proj = str(fallback_project_uuid or "").strip()
+    if not orig_proj and not fb_proj:
+        raise ValueError("当前镜头尚未绑定即梦画布，无法拉取节点状态")
+
+    # Prioritize genuine Dreamina node_* IDs over stale LibTV v-* keys
+    raw_sample_refs = [jm.get("sampleNodeId"), jm.get("nodeId"), shot.get("libtvSampleNodeKey")]
+    bound_sample_id = next((str(x).strip() for x in raw_sample_refs if str(x or "").strip().startswith("node_")), "")
+    raw_final_refs = [jm.get("finalNodeId"), jm.get("upscaleNodeId"), shot.get("libtvFinalNodeKey")]
+    bound_final_id = next((str(x).strip() for x in raw_final_refs if str(x or "").strip().startswith("node_")), "")
+
+    proj_candidates: list[str] = []
+    for p in (orig_proj, fb_proj):
+        if p and p not in proj_candidates:
+            proj_candidates.append(p)
+
+    resolved_proj = orig_proj or fb_proj
+    sample_node: dict[str, Any] | None = None
+    node_cache: dict[str, dict[str, Any]] = {}
+    disc_samples: list[str] = []
+    disc_finals: list[str] = []
+
+    for p_uuid in proj_candidates:
+        if prefetched_videos_by_proj is not None and p_uuid in prefetched_videos_by_proj:
+            vlist = prefetched_videos_by_proj[p_uuid]
+        else:
+            vlist = find_project_video_nodes(p_uuid, name_filter=f"{sid}-") if sid else []
+        p_cache = (prefetched_nodes_by_proj or {}).get(p_uuid)
+        local_cache: dict[str, dict[str, Any]] = dict(p_cache) if isinstance(p_cache, dict) else {}
+
+        ds, df = _classify_shot_canvas_nodes(sid, vlist)
+        to_fetch: list[str] = []
+        for cid in [bound_sample_id, bound_final_id, *ds, *df]:
+            if cid and cid not in local_cache and cid not in to_fetch:
+                to_fetch.append(cid)
+        if to_fetch:
+            local_cache.update(_inspect_dreamina_nodes_batch(to_fetch, p_uuid))
+
+        sample_cands = []
+        for cid in [bound_sample_id, *ds]:
+            if cid and cid in local_cache and cid not in sample_cands:
+                sample_cands.append(cid)
+        if sample_cands or df or (bound_final_id and bound_final_id in local_cache):
+            resolved_proj = p_uuid
+            node_cache = local_cache
+            disc_samples = ds
+            disc_finals = df
+            if sample_cands:
+                # Choose sample node with the newest succeeded resource (prefer bound_sample_id on ties)
+                best_sid = max(
+                    sample_cands,
+                    key=lambda cid: (_node_latest_resource_ms(node_cache.get(cid)), 1 if cid == bound_sample_id else 0),
+                )
+                sample_node = node_cache[best_sid]
+            break
+
+    if sample_node is None and not disc_finals and not (bound_final_id and bound_final_id in node_cache):
+        raise ValueError(f"在即梦画布上未找到 {sid} 对应的视频节点")
+
+    node = sample_node or {}
+    node_ref = str(node.get("nodeId") or bound_sample_id or "").strip()
     gen = node.get("generation") if isinstance(node.get("generation"), dict) else {}
     resources = [r for r in (node.get("resources") or []) if isinstance(r, dict)]
     node_status = str(node.get("status") or "").lower()
 
-    succeeded = [r for r in resources if str(r.get("status") or "").lower() in {"succeeded", "success", "completed"}]
-    chosen_res = succeeded[0] if succeeded else (resources[0] if resources else None)
+    chosen_res = _pick_latest_succeeded_resource(resources)
     resource_id = str((chosen_res or {}).get("resourceId") or "").strip()
+    draft_created_ms = _resource_created_ms(chosen_res)
 
     mixed_order = []
     for idx, ref in enumerate(gen.get("references") or [], start=1):
@@ -538,13 +791,12 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
 
     draft_path: Path | None = None
     download_warning = ""
-    jm = shot.get("jimengMeta") or {}
-    existing_dl_res = str(jm.get("downloadedResourceId") or "").strip()
+    existing_dl_res = str(jm.get("downloadedResourceId") or (shot.get("draftVideo") or {}).get("resourceId") or "").strip()
     target = shot_dir / "draft_480p.mp4"
-    if resource_id and succeeded:
+    if resource_id:
         if not target.is_file() or existing_dl_res != resource_id:
             try:
-                draft_path = download_resource(resource_id, target, project_uuid=project_uuid)
+                draft_path = download_resource(resource_id, target, project_uuid=resolved_proj)
             except JimengAuthRequiredError:
                 raise
             except Exception as dl_exc:
@@ -554,42 +806,75 @@ def sync_shot_node(shot: dict[str, Any], shot_dir: Path) -> dict[str, Any]:
         else:
             draft_path = target
 
-    final_path: Path | None = None
-    final_res_id = ""
-    final_node_key = str(jm.get("finalNodeId") or jm.get("upscaleNodeId") or shot.get("libtvFinalNodeKey") or "").strip()
-    if final_node_key:
+    # Discover & check 1080P final nodes (bound + downstream of sample + title-matched `{sid}-*正片/1080*`)
+    downstream_ids = [str(x).strip() for x in (node.get("downstreamNodeIds") or []) if str(x or "").strip().startswith("node_")]
+    missing_down = [x for x in downstream_ids if x not in node_cache]
+    if missing_down:
         try:
-            fnode = _inspect_dreamina_node_raw(final_node_key, project_uuid)
-            fresources = [r for r in (fnode.get("resources") or []) if isinstance(r, dict)]
-            fsuc = [r for r in fresources if str(r.get("status") or "").lower() in {"succeeded", "success", "completed"}]
-            if fsuc:
-                final_res_id = str(fsuc[0].get("resourceId") or "").strip()
-            existing_final_res = str(jm.get("downloadedFinalResourceId") or "").strip()
-            ftarget = shot_dir / "final_1080p.mp4"
-            if final_res_id and fsuc:
-                if not ftarget.is_file() or existing_final_res != final_res_id:
-                    final_path = download_resource(final_res_id, ftarget, project_uuid=project_uuid)
-                else:
-                    final_path = ftarget
-            final_node_key = str(fnode.get("nodeId") or final_node_key)
+            node_cache.update(_inspect_dreamina_nodes_batch(missing_down, resolved_proj))
         except JimengAuthRequiredError:
             raise
-        except Exception as fin_exc:
-            if not download_warning:
-                download_warning = str(fin_exc)
+        except Exception:
+            pass
+
+    final_cands: list[str] = []
+    for cid in [bound_final_id, *disc_finals, *[d for d in downstream_ids if _is_final_1080_node(node_cache.get(d))]]:
+        if cid and cid in node_cache and cid not in final_cands:
+            if cid in {bound_final_id, *disc_finals} or _is_final_1080_node(node_cache.get(cid)):
+                final_cands.append(cid)
+
+    final_path: Path | None = None
+    final_res_id = ""
+    final_created_ms = 0
+    final_node_key = bound_final_id
+    if final_cands:
+        best_fid = max(
+            final_cands,
+            key=lambda cid: (_node_latest_resource_ms(node_cache.get(cid)), 1 if cid == bound_final_id else 0),
+        )
+        fnode = node_cache.get(best_fid) or {}
+        fresources = [r for r in (fnode.get("resources") or []) if isinstance(r, dict)]
+        chosen_fres = _pick_latest_succeeded_resource(fresources)
+        if chosen_fres:
+            final_res_id = str(chosen_fres.get("resourceId") or "").strip()
+            final_created_ms = _resource_created_ms(chosen_fres)
+        final_node_key = str(fnode.get("nodeId") or best_fid)
+        existing_final_res = str(
+            jm.get("downloadedFinalResourceId")
+            or (shot.get("finalVideo") or {}).get("resourceId")
+            or ""
+        ).strip()
+        ftarget = shot_dir / "final_1080p.mp4"
+        if final_res_id:
+            if not ftarget.is_file() or existing_final_res != final_res_id:
+                try:
+                    final_path = download_resource(final_res_id, ftarget, project_uuid=resolved_proj)
+                except JimengAuthRequiredError:
+                    raise
+                except Exception as fin_exc:
+                    if not download_warning:
+                        download_warning = str(fin_exc)
+                    if ftarget.is_file():
+                        final_path = ftarget
+            else:
+                final_path = ftarget
 
     return {
-        "nodeKey": str(node.get("nodeId") or node_ref),
+        "projectUuid": resolved_proj,
+        "nodeKey": node_ref,
         "loading": node_status in {"running", "pending", "queued", "generating", "processing"},
-        "taskStatus": 2 if succeeded else 1,
+        "taskStatus": 2 if (chosen_res is not None or final_res_id) else 1,
         "remoteUrl": "",
         "resourceId": resource_id,
+        "draftCreatedAtMs": draft_created_ms,
         "promptText": str(gen.get("prompt") or ""),
         "mixedOrder": mixed_order or None,
         "draftPath": draft_path,
         "watermark": False,
         "downloadWarning": download_warning,
         "finalPath": final_path,
+        "finalWatermark": False,
         "finalResourceId": final_res_id,
+        "finalCreatedAtMs": final_created_ms,
         "finalNodeKey": final_node_key,
     }

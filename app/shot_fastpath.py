@@ -1159,11 +1159,18 @@ def _extract_resource_id_from_op(data: dict[str, Any]) -> tuple[str, str]:
             if not msg and isinstance(res.get("diagnostics"), list) and res["diagnostics"]:
                 msg = str((res["diagnostics"][0] or {}).get("detail") or "")
             return "", msg or "即梦云端生成失败"
-    for res in resources:
+    suc_cands: list[tuple[int, int, str]] = []
+    fallback_rid = ""
+    for idx, res in enumerate(resources):
         rid = str(res.get("resourceId") or "").strip()
-        st = str(res.get("state") or "").lower()
+        st = str(res.get("state") or res.get("status") or "").lower()
         if rid and st in {"success", "succeeded", "completed", ""}:
-            return rid, ""
+            suc_cands.append((int(res.get("createdAt") or 0), -idx, rid))
+            if not fallback_rid:
+                fallback_rid = rid
+    if suc_cands:
+        suc_cands.sort(reverse=True)
+        return suc_cands[0][2], ""
     top_rid = str(data.get("resourceId") or "").strip()
     top_state = str(data.get("state") or "").lower()
     if top_state in {"failed", "error", "rejected"}:
@@ -1179,6 +1186,8 @@ def _wait_dreamina_operation_resource(
     *,
     target_node_id: str = "",
     prev_resource_id: str = "",
+    known_prev_resource_ids: set[str] | None = None,
+    submit_started_ms: int | None = None,
     base_url: str = "",
     shot_id: str = "",
     claim_token: str = "",
@@ -1186,6 +1195,9 @@ def _wait_dreamina_operation_resource(
     check_cancelled: Any = None,
 ) -> tuple[str, str, str]:
     """Wait in cancellable 75s chunks; returns `(status, resource_id, error_msg)` where status in ok/failed/conflict/timeout."""
+    prev_ids = {str(x).strip() for x in (known_prev_resource_ids or set()) if str(x).strip()}
+    if prev_resource_id:
+        prev_ids.add(str(prev_resource_id).strip())
     deadline = time.monotonic() + max_wait_sec
     while time.monotonic() < deadline:
         if check_cancelled and check_cancelled():
@@ -1214,7 +1226,7 @@ def _wait_dreamina_operation_resource(
                 return "failed", "", ferr
             if rid:
                 return "ok", rid, ""
-        # Check node directly between wait chunks
+        # Check node directly between wait chunks (strictly match current submitId or post-submit createdAt)
         if target_node_id:
             try:
                 sres = _run_dreamina_json(["node", "show", "--project-id", project_uuid, "--node-id", target_node_id], timeout=20)
@@ -1222,11 +1234,38 @@ def _wait_dreamina_operation_resource(
                 node = (nodes[0] or {}).get("node") if nodes and isinstance(nodes[0], dict) else None
                 if isinstance(node, dict):
                     nst = str(node.get("status") or "").lower()
-                    for res in reversed(node.get("resources") or []):
-                        if isinstance(res, dict) and str(res.get("status") or "").lower() == "success":
+                    node_res = [r for r in (node.get("resources") or []) if isinstance(r, dict)]
+                    # 1. Exact submitId match
+                    for res in node_res:
+                        if str(res.get("submitId") or "").strip() != submit_id:
+                            continue
+                        rst = str(res.get("status") or "").lower()
+                        if rst in {"failed", "error", "rejected"}:
+                            msg = str(res.get("message") or "").strip()
+                            return "failed", "", msg or f"节点 {target_node_id} 云端生成失败"
+                        if rst in {"success", "succeeded", "completed"}:
                             cand_rid = str(res.get("resourceId") or "").strip()
-                            if cand_rid and cand_rid != prev_resource_id:
+                            if cand_rid:
                                 return "ok", cand_rid, ""
+                    # 2. Fallback only when resource lacks submitId and clearly post-dates submit_started_ms
+                    if submit_started_ms is not None:
+                        recent: list[tuple[int, int, str]] = []
+                        for idx, res in enumerate(node_res):
+                            if str(res.get("submitId") or "").strip():
+                                continue
+                            rst = str(res.get("status") or "").lower()
+                            cand_rid = str(res.get("resourceId") or "").strip()
+                            created_ms = int(res.get("createdAt") or 0)
+                            if (
+                                rst in {"success", "succeeded", "completed"}
+                                and cand_rid
+                                and cand_rid not in prev_ids
+                                and created_ms >= submit_started_ms - 15000
+                            ):
+                                recent.append((created_ms, -idx, cand_rid))
+                        if recent:
+                            recent.sort(reverse=True)
+                            return "ok", recent[0][2], ""
                     if nst in {"failed", "error"}:
                         return "failed", "", f"节点 {target_node_id} 云端生成失败"
             except Exception:
@@ -1392,6 +1431,7 @@ def try_fastpath_jimeng_run(
             run_cmd.append("--yes")
 
         _note("提交云端生成", f"提交 480P 样片生成（submitId: {submit_id[:8]}…）…")
+        submit_started_ms = int(time.time() * 1000)
         rc, rpayload, rraw = _run_dreamina_json_raw(run_cmd, timeout=45)
         if rc != 0 or not rpayload.get("ok"):
             return {"handled": False, "reason": f"node_run_fallback rc={rc}: {rraw[:180]}"}
@@ -1427,11 +1467,22 @@ def try_fastpath_jimeng_run(
 
     _note("等待 480P 出片", f"等待即梦云端出片（submitId: {submit_id[:8]}…）…")
     prev_res_id = str(jm.get("downloadedResourceId") or jm.get("selectedResourceId") or "").strip()
+    known_prev_ids = {
+        str(x).strip()
+        for x in (
+            jm.get("downloadedResourceId"),
+            jm.get("selectedResourceId"),
+            (shot.get("draftVideo") or {}).get("resourceId"),
+        )
+        if str(x or "").strip()
+    }
     wstatus, res_id, werr = _wait_dreamina_operation_resource(
         project_uuid,
         submit_id,
         target_node_id=sample_node_id,
         prev_resource_id=prev_res_id,
+        known_prev_resource_ids=known_prev_ids,
+        submit_started_ms=submit_started_ms,
         base_url=base_url,
         shot_id=sid,
         claim_token=claim_token,
@@ -1476,6 +1527,7 @@ def try_fastpath_jimeng_run(
     h = int(meta.get("height") or 0)
     dur = float(meta.get("durationSec") or 0.0)
     done_meta = {
+        "sampleNodeId": sample_node_id,
         "submitId": submit_id,
         "operationRef": submit_id,
         "selectedResourceId": res_id,
@@ -1513,6 +1565,7 @@ def try_fastpath_jimeng_run(
         upd_body: dict[str, Any] = {
             "claimToken": claim_token,
             "status": "draft_ready",
+            "libtvSampleNodeKey": sample_node_id,
             "draftVideo": draft_vid_obj,
             "jimengMeta": done_meta,
             "resolveFeedbacks": True,
@@ -1533,6 +1586,7 @@ def try_fastpath_jimeng_run(
         {
             "claimToken": claim_token,
             "status": "processing",
+            "libtvSampleNodeKey": sample_node_id,
             "draftVideo": draft_vid_obj,
             "jimengMeta": done_meta,
             "agentSummary": "480P 样片已下载到本地，正在唤醒轻量 AI 进行视听自检…",
@@ -1585,6 +1639,7 @@ def try_fastpath_jimeng_final(
             progress_cb(phase, msg)
 
     promote_submit_id = str(uuid.uuid4())
+    submit_started_ms = int(time.time() * 1000)
     try:
         _note("提交 1080P 转正", f"按 {credit_ceiling} 积分上限提交 {sample_node_id} 转 1080P…")
         rc, payload, raw = _run_dreamina_json_raw(
@@ -1637,12 +1692,13 @@ def try_fastpath_jimeng_final(
         return {"handled": True, "conflict": True, "summary": "409 claimToken conflict"}
 
     _note("等待 1080P 出片", f"等待即梦 1080P 转正完成（submitId: {promote_submit_id[:8]}…）…")
-    prev_fin_res_id = str(jm.get("finalResourceId") or "").strip()
+    prev_fin_res_id = str(jm.get("downloadedFinalResourceId") or jm.get("finalResourceId") or "").strip()
     wstatus, final_res_id, werr = _wait_dreamina_operation_resource(
         project_uuid,
         promote_submit_id,
         target_node_id=final_nid,
         prev_resource_id=prev_fin_res_id,
+        submit_started_ms=submit_started_ms,
         base_url=base_url,
         shot_id=sid,
         claim_token=claim_token,
@@ -1690,6 +1746,7 @@ def try_fastpath_jimeng_final(
         "finalNodeId": final_nid,
         "promoteSubmitId": promote_submit_id,
         "finalResourceId": final_res_id,
+        "downloadedFinalResourceId": final_res_id,
         "pendingAction": "",
         "confirmationState": "completed",
     }

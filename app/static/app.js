@@ -5306,7 +5306,12 @@ function renderShotActionBarHtml(shot) {
   const st = shot.status;
   const info = getEffectiveShotChangeInfo(shot);
   const verCount = (shot.versionHistory || []).length;
-  const hasNode = Boolean(shot.libtvSampleNodeKey);
+  const hasNode = Boolean(
+    shot.libtvSampleNodeKey ||
+      shot.jimengMeta?.sampleNodeId ||
+      shot.jimengMeta?.finalNodeId ||
+      (shot.projectUuid && !["draft", "drafting"].includes(st))
+  );
   const platLabel = getPlatformLabel(shot.platform);
 
   const historyBtn = `
@@ -5560,6 +5565,10 @@ function renderVideoReviewCard(shot) {
       ? `<div class="video-review-summary">${escapeHtml(shot.agentSummary)}</div>`
       : "";
 
+  const reviewSyncBtnHtml = !["draft", "drafting"].includes(shot.status)
+    ? `<button id="reviewSyncCanvasBtn" class="btn btn-secondary btn-xs" type="button" title="从 ${escapeHtml(getPlatformLabel(shot.platform))} 画布刷新同步最新 480P 样片、1080P 正片与节点状态">↻ 刷新同步</button>`
+    : "";
+
   if (!activeVid) {
     const platLabel = getPlatformLabel(shot.platform);
     let hintText = "点击上方「▶ 生成样片」后，成片会自动下载到这里供看片。";
@@ -5577,6 +5586,7 @@ function renderVideoReviewCard(shot) {
             <h2 class="card-title">成片看片</h2>
             ${draftInProgress ? `<span class="pill pill-purple">⏳ 生成样片中</span>` : ""}
           </div>
+          ${reviewSyncBtnHtml ? `<div class="card-head-actions">${reviewSyncBtnHtml}</div>` : ""}
         </div>
         <div style="font-size:12.5px;color:var(--text-secondary);line-height:1.55;">${escapeHtml(hintText)}</div>
         ${summaryHtml}
@@ -5683,7 +5693,10 @@ function renderVideoReviewCard(shot) {
           <h2 class="card-title">成片看片</h2>
           ${headerStatusPill}
         </div>
-        ${versionTabsHtml}
+        <div class="card-head-actions">
+          ${versionTabsHtml}
+          ${reviewSyncBtnHtml}
+        </div>
       </div>
 
       ${draftProgressBannerHtml}
@@ -6061,7 +6074,7 @@ function bindDetailEvents(shot) {
     executeRunShot();
   });
 
-  const handleSyncLibtv = async (triggerBtn) => {
+  const handleSyncLibtv = async (triggerBtn, restoreLabel = "↓ 同步成片") => {
     if (triggerBtn) {
       triggerBtn.disabled = true;
       triggerBtn.textContent = "同步中…";
@@ -6069,10 +6082,18 @@ function bindDetailEvents(shot) {
     try {
       const platLabel = getPlatformLabel(shot.platform);
       const res = await apiJson(`/api/shots/${encodeURIComponent(shot.id)}/sync-canvas`, { method: "POST" });
-      if (res.libtv?.hasRemoteFinal) {
-        showToast(`已从 ${platLabel} 同步最新 1080P 正片并更新本地状态`);
-      } else if (res.libtv?.hasRemoteDraft) {
-        showToast(`已将 ${platLabel} 成片下载到本地，可在右侧直接观看`);
+      if (res.syncDelta?.finalUpdated || res.libtv?.hasRemoteFinal) {
+        showToast(
+          res.syncDelta?.finalUpdated
+            ? `已从 ${platLabel} 拉取更新最新 1080P 正片并同步状态`
+            : `已核对 ${platLabel} 最新 1080P 正片与节点状态`
+        );
+      } else if (res.syncDelta?.draftUpdated || res.libtv?.hasRemoteDraft) {
+        showToast(
+          res.syncDelta?.draftUpdated
+            ? `已从 ${platLabel} 拉取更新最新 480P 样片到本地`
+            : `已核对 ${platLabel} 样片与节点状态（当前已是最新）`
+        );
       } else if (res.libtv?.loading) {
         showToast(`${platLabel} 云端仍在生成中，请稍后再拉取`);
       } else {
@@ -6083,11 +6104,12 @@ function bindDetailEvents(shot) {
       showToast(err.message);
       if (triggerBtn) {
         triggerBtn.disabled = false;
-        triggerBtn.textContent = "↓ 同步成片";
+        triggerBtn.textContent = restoreLabel;
       }
     }
   };
-  document.getElementById("syncLibtvBtn")?.addEventListener("click", (e) => handleSyncLibtv(e.currentTarget));
+  document.getElementById("syncLibtvBtn")?.addEventListener("click", (e) => handleSyncLibtv(e.currentTarget, "↓ 同步成片"));
+  document.getElementById("reviewSyncCanvasBtn")?.addEventListener("click", (e) => handleSyncLibtv(e.currentTarget, "↻ 刷新同步"));
 
   document.getElementById("renameDownloadShotBtn")?.addEventListener("click", (e) => {
     const ver = e.currentTarget.dataset.downloadVer || "final";
@@ -7140,6 +7162,30 @@ function bindGlobalEvents() {
     renderActiveView();
     const pane = document.getElementById("mainPane");
     if (pane) pane.scrollTop = 0;
+  });
+
+  document.getElementById("batchSyncCanvasBtn")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    if (!btn || btn.disabled) return;
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "同步中…";
+    try {
+      const res = await apiJson("/api/shots/sync-all-canvas", { method: "POST" });
+      const parts = [];
+      if (res.draftUpdatedIds?.length) parts.push(`更新样片 ${res.draftUpdatedIds.length} 个（${res.draftUpdatedIds.join(", ")}）`);
+      if (res.finalUpdatedIds?.length) parts.push(`更新正片 ${res.finalUpdatedIds.length} 个（${res.finalUpdatedIds.join(", ")}）`);
+      if (res.relinkedIds?.length) parts.push(`对齐节点 ${res.relinkedIds.length} 个`);
+      const detailMsg = parts.length ? parts.join(" · ") : `全部 ${res.checkedCount || 0} 个镜头已与画布一致`;
+      const errSuffix = res.errors?.length ? `（${res.errors.length} 个失败）` : "";
+      showToast(`刷新同步完成：${detailMsg}${errSuffix}`);
+      await refreshState();
+    } catch (err) {
+      showToast(err.message || "批量刷新同步失败");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = prevText;
+    }
   });
 
   document.getElementById("exportSettingsNavBtn")?.addEventListener("click", () => {

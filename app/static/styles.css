@@ -3355,13 +3355,13 @@ button {
 .sidebar-head-actions {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   flex-shrink: 0;
 }
 
 .sidebar-head-actions .btn {
   white-space: nowrap;
-  padding: 3px 7px;
+  padding: 3px 6px;
   font-size: 11px;
 }
 

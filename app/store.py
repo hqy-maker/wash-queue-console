@@ -3676,6 +3676,15 @@ class QueueStore:
                     if key in payload and payload[key] is not None:
                         shot[key] = payload[key]
 
+                if shot.get("platform") == "jimeng":
+                    jm_cur = shot.get("jimengMeta") if isinstance(shot.get("jimengMeta"), dict) else {}
+                    jm_sample = str(jm_cur.get("sampleNodeId") or jm_cur.get("nodeId") or "").strip()
+                    if jm_sample.startswith("node_") and not str(payload.get("libtvSampleNodeKey") or "").strip():
+                        shot["libtvSampleNodeKey"] = jm_sample
+                    jm_final = str(jm_cur.get("finalNodeId") or "").strip()
+                    if jm_final.startswith("node_") and not str(payload.get("libtvFinalNodeKey") or "").strip():
+                        shot["libtvFinalNodeKey"] = jm_final
+
                 if "sourceLibtvNodeKey" in payload and payload["sourceLibtvNodeKey"] is not None and isinstance(shot.get("sourceVideo"), dict):
                     shot["sourceVideo"]["libtvNodeKey"] = payload["sourceLibtvNodeKey"]
                 if "depthLibtvNodeKey" in payload and payload["depthLibtvNodeKey"] is not None and isinstance(shot.get("sourceVideo"), dict):
@@ -4023,11 +4032,14 @@ class QueueStore:
         watermark: bool | None = None,
         node_key: str | None = None,
         resource_id: str = "",
+        draft_created_ms: int = 0,
         final_path: Path | None = None,
         remote_final_url: str = "",
         final_watermark: bool | None = None,
         final_node_key: str | None = None,
         final_resource_id: str = "",
+        final_created_ms: int = 0,
+        project_uuid: str | None = None,
     ) -> dict[str, Any]:
         sid = sanitize_shot_id(shot_id)
         with self._lock:
@@ -4037,75 +4049,145 @@ class QueueStore:
                 if shot["id"] != sid:
                     continue
                 plat_label = get_platform_label(shot.get("platform"))
+                is_jimeng = shot.get("platform") == "jimeng"
+                metadata_changed = False
+
+                if project_uuid and project_uuid.strip() and project_uuid.strip() != str(shot.get("projectUuid") or "").strip():
+                    shot["projectUuid"] = project_uuid.strip()
+                    shot["canvasUrl"] = build_canvas_url(shot["projectUuid"], platform=shot.get("platform"))
+                    metadata_changed = True
+
                 prev_prompt = (shot.get("promptText") or "").strip()
-                if prompt_text:
+                prompt_updated = False
+                if prompt_text and not prev_prompt:
                     shot["promptText"] = prompt_text
-                if mixed_order is not None:
+                    prompt_updated = True
+                if mixed_order is not None and mixed_order != shot.get("libtvMixedOrder"):
                     shot["libtvMixedOrder"] = mixed_order
-                if node_key:
+                    metadata_changed = True
+                if node_key and node_key != shot.get("libtvSampleNodeKey"):
                     shot["libtvSampleNodeKey"] = node_key
-                if final_node_key:
+                    metadata_changed = True
+                if final_node_key and final_node_key != shot.get("libtvFinalNodeKey"):
                     shot["libtvFinalNodeKey"] = final_node_key
+                    metadata_changed = True
+
+                jm = shot.setdefault("jimengMeta", {}) if is_jimeng else {}
+                if is_jimeng and isinstance(jm, dict):
+                    if node_key and str(node_key).startswith("node_") and jm.get("sampleNodeId") != node_key:
+                        jm["sampleNodeId"] = node_key
+                        metadata_changed = True
+                    if final_node_key and str(final_node_key).startswith("node_") and jm.get("finalNodeId") != final_node_key:
+                        jm["finalNodeId"] = final_node_key
+                        metadata_changed = True
+
+                draft_synced_new = False
                 new_media_url = ""
                 if draft_path is not None and draft_path.is_file():
                     old_dv = copy.deepcopy(shot.get("draftVideo")) if isinstance(shot.get("draftVideo"), dict) else None
                     new_media_url = to_media_url(draft_path)
-                    if resource_id:
-                        jm = shot.setdefault("jimengMeta", {})
-                        if isinstance(jm, dict):
+                    new_dv_sha = _file_sha256_hex(draft_path)
+                    old_dv_sha = str((old_dv or {}).get("sha256") or "")
+                    if not old_dv_sha and old_dv and old_dv.get("filePath"):
+                        old_p = resolve_media_path(str(old_dv["filePath"]))
+                        if old_p.is_file():
+                            old_dv_sha = _file_sha256_hex(old_p)
+                    url_changed = bool(remote_draft_url and remote_draft_url != str((old_dv or {}).get("remoteUrl") or ""))
+                    draft_synced_new = bool((not old_dv) or (new_dv_sha and new_dv_sha != old_dv_sha) or url_changed)
+
+                    if is_jimeng and isinstance(jm, dict) and resource_id:
+                        if jm.get("downloadedResourceId") != resource_id or jm.get("selectedResourceId") != resource_id:
                             jm["downloadedResourceId"] = resource_id
-                    new_dv_obj = {
-                        "filePath": str(draft_path),
-                        "mediaUrl": new_media_url,
-                        "remoteUrl": remote_draft_url,
-                        "watermark": watermark,
-                        "resourceId": resource_id,
-                        "sha256": _file_sha256_hex(draft_path),
-                        "meta": run_preflight(draft_path),
-                        "downloadedAt": now_iso(),
-                    }
-                    self._record_video_history_locked(
-                        shot,
-                        role="480p",
-                        prev_video=old_dv,
-                        new_video=new_dv_obj,
-                        revision_direction=f"从 {plat_label} 同步 480P 样片",
-                    )
-                    shot["draftVideo"] = new_dv_obj
-                    if shot["status"] in {"ready_on_canvas", "run_requested", "processing", "queued", "feedback_queued", "final_ready", "final_done"}:
-                        self._clear_claim_fields(shot)
-                        shot["status"] = "draft_ready"
-                        shot["agentSummary"] = f"已从 {plat_label} 下载 480P 样片到本地，可在右侧预览看片或对比原片。"
-                    if (shot.get("finalVideo") or {}).get("mediaUrl") or shot.get("finalModifiedReopened"):
-                        shot["finalModifiedReopened"] = True
-                        shot["draftUpdatedSinceFinalReopen"] = True
-                    shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
-                    shot["lastGeneratedAt"] = now_iso()
-                    shot.setdefault("revisions", []).append(
-                        {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布拉取 480P 样片完成"}
-                    )
+                            jm["selectedResourceId"] = resource_id
+                            metadata_changed = True
+
+                    if draft_synced_new:
+                        new_dv_obj = {
+                            "filePath": str(draft_path),
+                            "mediaUrl": new_media_url,
+                            "remoteUrl": remote_draft_url,
+                            "watermark": watermark,
+                            "resourceId": resource_id,
+                            "sha256": new_dv_sha,
+                            "meta": run_preflight(draft_path),
+                            "downloadedAt": now_iso(),
+                        }
+                        self._record_video_history_locked(
+                            shot,
+                            role="480p",
+                            prev_video=old_dv,
+                            new_video=new_dv_obj,
+                            revision_direction=f"从 {plat_label} 同步 480P 样片",
+                        )
+                        shot["draftVideo"] = new_dv_obj
+                        has_final_on_canvas = bool(final_path is not None and final_path.is_file())
+                        draft_newer_than_final = bool(draft_created_ms and final_created_ms and draft_created_ms > final_created_ms)
+                        keep_passed_final = bool(
+                            shot.get("status") in {"final_ready", "final_done"}
+                            and not shot.get("finalModifiedReopened")
+                            and has_final_on_canvas
+                            and not draft_newer_than_final
+                        )
+                        if not keep_passed_final and shot["status"] in {
+                            "ready_on_canvas",
+                            "run_requested",
+                            "processing",
+                            "queued",
+                            "feedback_queued",
+                            "final_ready",
+                            "final_done",
+                        }:
+                            self._clear_claim_fields(shot)
+                            shot["status"] = "draft_ready"
+                            shot["agentSummary"] = f"已从 {plat_label} 同步最新 480P 样片到本地，可在右侧预览看片或对比原片。"
+                        if not keep_passed_final and ((shot.get("finalVideo") or {}).get("mediaUrl") or shot.get("finalModifiedReopened")):
+                            shot["finalModifiedReopened"] = True
+                            shot["draftUpdatedSinceFinalReopen"] = True
+                        if not keep_passed_final:
+                            shot["lastGeneratedFingerprint"] = compute_generation_fingerprint(shot)
+                            shot["lastGeneratedAt"] = now_iso()
+                        shot.setdefault("revisions", []).append(
+                            {"at": now_iso(), "actor": "sync", "summary": f"从 {plat_label} 画布拉取更新 480P 样片完成"}
+                        )
+                    elif isinstance(shot.get("draftVideo"), dict):
+                        cur_dv = shot["draftVideo"]
+                        if resource_id and cur_dv.get("resourceId") != resource_id:
+                            cur_dv["resourceId"] = resource_id
+                            metadata_changed = True
+                        if new_dv_sha and cur_dv.get("sha256") != new_dv_sha:
+                            cur_dv["sha256"] = new_dv_sha
+                            metadata_changed = True
 
                 final_synced_new = False
                 if final_path is not None and final_path.is_file():
                     old_fv = shot.get("finalVideo") if isinstance(shot.get("finalVideo"), dict) else {}
                     old_fv_sig = str(old_fv.get("sourceSig") or _file_stat_sig(old_fv.get("filePath")))
                     new_fv_sig = _file_stat_sig(str(final_path))
+                    new_fv_sha = _file_sha256_hex(final_path)
+                    old_fv_sha = str(old_fv.get("sha256") or "")
+                    if not old_fv_sha and old_fv.get("filePath"):
+                        old_fp = resolve_media_path(str(old_fv["filePath"]))
+                        if old_fp.is_file():
+                            old_fv_sha = _file_sha256_hex(old_fp)
                     url_changed = bool(remote_final_url and remote_final_url != old_fv.get("remoteUrl"))
-                    res_changed = bool(final_resource_id and final_resource_id != (shot.get("jimengMeta") or {}).get("downloadedFinalResourceId"))
-                    if not old_fv or new_fv_sig != old_fv_sig or url_changed or res_changed:
-                        final_synced_new = True
+                    same_sha = bool(old_fv and old_fv_sha and new_fv_sha and old_fv_sha == new_fv_sha)
+                    final_synced_new = bool((not old_fv) or (not same_sha and new_fv_sig != old_fv_sig) or (new_fv_sha and old_fv_sha and new_fv_sha != old_fv_sha) or url_changed)
+
+                    if is_jimeng and isinstance(jm, dict) and final_resource_id:
+                        if jm.get("downloadedFinalResourceId") != final_resource_id or jm.get("finalResourceId") != final_resource_id:
+                            jm["downloadedFinalResourceId"] = final_resource_id
+                            jm["finalResourceId"] = final_resource_id
+                            metadata_changed = True
+
+                    if final_synced_new:
                         prev_fv_copy = copy.deepcopy(old_fv) if old_fv else None
-                        if final_resource_id:
-                            jm = shot.setdefault("jimengMeta", {})
-                            if isinstance(jm, dict):
-                                jm["downloadedFinalResourceId"] = final_resource_id
                         new_fv_obj = {
                             "filePath": str(final_path),
                             "mediaUrl": to_media_url(final_path),
                             "remoteUrl": remote_final_url,
                             "watermark": final_watermark,
                             "resourceId": final_resource_id,
-                            "sha256": _file_sha256_hex(final_path),
+                            "sha256": new_fv_sha,
                             "meta": run_preflight(final_path),
                             "downloadedAt": now_iso(),
                             "sourceSig": new_fv_sig,
@@ -4142,6 +4224,21 @@ class QueueStore:
                                     )
                             except (OSError, ValueError):
                                 pass
+                    else:
+                        if isinstance(old_fv, dict):
+                            if final_resource_id and old_fv.get("resourceId") != final_resource_id:
+                                old_fv["resourceId"] = final_resource_id
+                                metadata_changed = True
+                            if new_fv_sha and old_fv.get("sha256") != new_fv_sha:
+                                old_fv["sha256"] = new_fv_sha
+                                metadata_changed = True
+                            if old_fv.get("sourceSig") != new_fv_sig:
+                                old_fv["sourceSig"] = new_fv_sig
+                                metadata_changed = True
+                        if shot.get("status") in {"ready_on_canvas", "draft_ready"} and not shot.get("finalModifiedReopened"):
+                            self._clear_claim_fields(shot)
+                            shot["status"] = "final_ready"
+                            metadata_changed = True
 
                 cur_prompt = (shot.get("promptText") or "").strip()
                 last_snap = (shot.get("versionHistory") or [{}])[-1]
@@ -4157,7 +4254,7 @@ class QueueStore:
                         draft_video_url=str(fv_now.get("mediaUrl") or ""),
                         draft_downloaded_at=str(fv_now.get("downloadedAt") or now_iso()),
                     )
-                elif new_media_url and last_snap.get("draftVideoUrl") != new_media_url:
+                elif draft_synced_new and new_media_url:
                     self._append_version_snapshot(
                         shot,
                         kind="run_completed",
@@ -4166,21 +4263,31 @@ class QueueStore:
                         prompt_text=cur_prompt,
                         revision_direction=str(shot.get("latestRevisionDirection") or "从画布同步最新样片成片").strip(),
                         draft_video_url=new_media_url,
-                        draft_downloaded_at=shot["lastGeneratedAt"],
+                        draft_downloaded_at=shot.get("lastGeneratedAt") or now_iso(),
                     )
-                elif prompt_text and prompt_text.strip() != prev_prompt:
+                elif prompt_updated:
                     self._append_version_snapshot(
                         shot,
                         kind="agent_prompt",
                         actor="sync",
-                        title="从 LibTV 画布同步提示词",
+                        title=f"从 {plat_label} 画布同步提示词",
                         prompt_text=cur_prompt,
                         previous_prompt_text=prev_prompt,
-                        revision_direction="从 LibTV 画布节点拉取并对齐当前提示词。",
+                        revision_direction=f"从 {plat_label} 画布节点拉取并对齐当前提示词。",
                     )
-                shot["updatedAt"] = now_iso()
-                self._save_queue(q, {"type": "libtv_synced", "shotId": sid, "status": shot["status"]})
-                return self._decorate_shot(q, shot)
+
+                any_change = bool(draft_synced_new or final_synced_new or metadata_changed or prompt_updated)
+                if any_change:
+                    shot["updatedAt"] = now_iso()
+                    self._save_queue(q, {"type": "libtv_synced", "shotId": sid, "status": shot["status"]})
+                out = self._decorate_shot(q, shot)
+                out["_syncDelta"] = {
+                    "changed": any_change,
+                    "draftUpdated": draft_synced_new,
+                    "finalUpdated": final_synced_new,
+                    "metadataUpdated": metadata_changed,
+                }
+                return out
         raise KeyError(f"镜头不存在: {shot_id}")
 
     def rollback_shot(self, shot_id: str, version_id: str, sync_to_canvas: bool = True) -> dict[str, Any]:

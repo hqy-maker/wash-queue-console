@@ -2046,26 +2046,32 @@ def delete_scene(name: str = Query(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/shots/{shot_id}/sync-canvas")
-@app.post("/api/shots/{shot_id}/sync-libtv")
-def sync_libtv(shot_id: str) -> dict[str, Any]:
-    try:
-        shot = store.get_shot(shot_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+def _resolve_jimeng_default_project(state_data: dict[str, Any] | None = None) -> str:
+    st = state_data or store.get_state()
+    pdefs = st.get("platformDefaults") if isinstance(st.get("platformDefaults"), dict) else {}
+    jm_def = pdefs.get("jimeng") if isinstance(pdefs.get("jimeng"), dict) else {}
+    return str(jm_def.get("defaultProjectUuid") or st.get("defaultProjectUuid") or "").strip()
 
+
+def _sync_one_shot_with_canvas(
+    shot: dict[str, Any],
+    *,
+    fallback_project_uuid: str = "",
+    prefetched_videos_by_proj: dict[str, list[dict[str, Any]]] | None = None,
+    prefetched_nodes_by_proj: dict[str, dict[str, dict[str, Any]]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
     plat = normalize_platform(shot.get("platform"))
-    plat_label = get_platform_label(plat)
     shot_dir = SHOTS_DIR / shot["id"]
-    try:
-        if plat == "jimeng":
-            info = jimeng_bridge.sync_shot_node(shot, shot_dir)
-        else:
-            info = libtv_bridge.sync_shot_node(shot, shot_dir)
-    except (jimeng_bridge.JimengAuthRequiredError, libtv_bridge.LibtvAuthRequiredError) as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"查询或下载 {plat_label} 节点失败: {exc}") from exc
+    if plat == "jimeng":
+        info = jimeng_bridge.sync_shot_node(
+            shot,
+            shot_dir,
+            fallback_project_uuid=fallback_project_uuid,
+            prefetched_videos_by_proj=prefetched_videos_by_proj,
+            prefetched_nodes_by_proj=prefetched_nodes_by_proj,
+        )
+    else:
+        info = libtv_bridge.sync_shot_node(shot, shot_dir)
 
     updated = store.update_shot_from_libtv_sync(
         shot["id"],
@@ -2076,16 +2082,117 @@ def sync_libtv(shot_id: str) -> dict[str, Any]:
         watermark=info.get("watermark"),
         node_key=info.get("nodeKey"),
         resource_id=str(info.get("resourceId") or ""),
+        draft_created_ms=int(info.get("draftCreatedAtMs") or 0),
         final_path=info.get("finalPath"),
         remote_final_url=info.get("finalRemoteUrl") or "",
         final_watermark=info.get("finalWatermark"),
         final_node_key=info.get("finalNodeKey"),
         final_resource_id=str(info.get("finalResourceId") or ""),
+        final_created_ms=int(info.get("finalCreatedAtMs") or 0),
+        project_uuid=info.get("projectUuid") or None,
     )
+    return updated, info, plat
+
+
+@app.post("/api/shots/sync-all-canvas")
+def sync_all_shots_canvas() -> dict[str, Any]:
+    state = store.get_state()
+    shots = list(state.get("shots") or [])
+    fallback_proj = _resolve_jimeng_default_project(state)
+
+    eligible = [
+        s
+        for s in shots
+        if str(s.get("status") or "") not in {"draft", "drafting", "processing"}
+    ]
+    jimeng_shots = [s for s in eligible if normalize_platform(s.get("platform")) == "jimeng"]
+    prefetched_videos: dict[str, list[dict[str, Any]]] | None = None
+    prefetched_nodes: dict[str, dict[str, dict[str, Any]]] | None = None
+    if jimeng_shots:
+        try:
+            prefetched_videos, prefetched_nodes = jimeng_bridge.prefetch_canvas_sync_context(
+                jimeng_shots,
+                fallback_project_uuid=fallback_proj,
+            )
+        except jimeng_bridge.JimengAuthRequiredError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"扫描即梦画布失败: {exc}") from exc
+
+    checked_count = 0
+    updated_ids: list[str] = []
+    draft_updated_ids: list[str] = []
+    final_updated_ids: list[str] = []
+    relinked_ids: list[str] = []
+    skipped_ids: list[str] = []
+    errors: list[dict[str, str]] = []
+
+    for s in eligible:
+        sid = str(s.get("id") or "")
+        checked_count += 1
+        try:
+            updated, _info, _plat = _sync_one_shot_with_canvas(
+                s,
+                fallback_project_uuid=fallback_proj,
+                prefetched_videos_by_proj=prefetched_videos,
+                prefetched_nodes_by_proj=prefetched_nodes,
+            )
+            delta = updated.pop("_syncDelta", {}) if isinstance(updated, dict) else {}
+            if delta.get("changed"):
+                updated_ids.append(sid)
+            if delta.get("draftUpdated"):
+                draft_updated_ids.append(sid)
+            if delta.get("finalUpdated"):
+                final_updated_ids.append(sid)
+            if delta.get("metadataUpdated") and not delta.get("draftUpdated") and not delta.get("finalUpdated"):
+                relinked_ids.append(sid)
+        except (jimeng_bridge.JimengAuthRequiredError, libtv_bridge.LibtvAuthRequiredError) as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except ValueError:
+            skipped_ids.append(sid)
+        except Exception as exc:
+            errors.append({"shotId": sid, "error": str(exc)})
+
+    return {
+        "ok": True,
+        "checkedCount": checked_count,
+        "updatedCount": len(updated_ids),
+        "updatedShotIds": updated_ids,
+        "draftUpdatedIds": draft_updated_ids,
+        "finalUpdatedIds": final_updated_ids,
+        "relinkedIds": relinked_ids,
+        "skippedIds": skipped_ids,
+        "errors": errors,
+    }
+
+
+@app.post("/api/shots/{shot_id}/sync-canvas")
+@app.post("/api/shots/{shot_id}/sync-libtv")
+def sync_libtv(shot_id: str) -> dict[str, Any]:
+    try:
+        shot = store.get_shot(shot_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    plat = normalize_platform(shot.get("platform"))
+    plat_label = get_platform_label(plat)
+    fallback_proj = _resolve_jimeng_default_project() if plat == "jimeng" else ""
+    try:
+        updated, info, plat = _sync_one_shot_with_canvas(
+            shot,
+            fallback_project_uuid=fallback_proj,
+        )
+    except (jimeng_bridge.JimengAuthRequiredError, libtv_bridge.LibtvAuthRequiredError) as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"查询或下载 {plat_label} 节点失败: {exc}") from exc
+
+    delta = updated.pop("_syncDelta", {}) if isinstance(updated, dict) else {}
     return {
         "ok": True,
         "platform": plat,
         "shot": updated,
+        "syncDelta": delta,
         "libtv": {
             "nodeKey": info.get("nodeKey"),
             "finalNodeKey": info.get("finalNodeKey"),

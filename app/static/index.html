@@ -12,7 +12,7 @@
     <link rel="manifest" href="/static/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/static/icon-192.png" />
     <link rel="icon" type="image/png" href="/static/icon-192.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=34" />
+    <link rel="stylesheet" href="/static/styles.css?v=35" />
   </head>
   <body>
     <div class="app-shell">
@@ -31,6 +31,7 @@
         <div class="sidebar-section-head">
           <span class="sidebar-section-label">镜头列表</span>
           <div class="sidebar-head-actions">
+            <button id="batchSyncCanvasBtn" class="btn btn-secondary btn-xs" type="button" title="从画布一键刷新同步全部镜头的最新 480P 样片、1080P 正片与节点状态">↻ 同步</button>
             <button id="exportSettingsNavBtn" class="btn btn-secondary btn-xs" type="button" title="设置本地成片同步目录与一键导出">📁 目录</button>
             <button id="newSceneBtn" class="btn btn-secondary btn-xs" type="button" title="新建一个场次文件夹">+ 新建场</button>
           </div>
@@ -351,6 +352,6 @@
     <datalist id="sceneDatalist"></datalist>
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=34" type="module"></script>
+    <script src="/static/app.js?v=35" type="module"></script>
   </body>
 </html>

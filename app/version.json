@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.17.4",
+  "version": "2026.11.17.5",
   "repo": "hqy-maker/wash-queue-console",
   "branch": "main",
-  "publishedAt": "2026-11-17T11:46:22+08:00",
-  "changelog": "修改意见新增新图支持双击手涂涂白与对象选择；彻底移除已废弃的 zdepth-video Skill（含热更新与同事版同步清理）",
+  "publishedAt": "2026-11-17T12:02:39+08:00",
+  "changelog": "修复即梦多资源排序、旧节点绑定覆盖、1080P 自动发现与防状态误回退等画布同步 bug；新增侧栏批量「↻ 同步」与看片区「↻ 刷新同步」按钮",
   "skillsIncluded": [
     "wash-queue-console",
     "dreamina-canvas-cli",
